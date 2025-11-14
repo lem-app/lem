@@ -308,10 +308,7 @@ AGPL is internationally recognized, but:
 
 ### I have a specific licensing question
 
-We're happy to help! Contact us at:
-- **General inquiries**: blake@lem.gg
-- **Licensing questions**: blake@lem.gg
-- **Commercial licensing**: blake@lem.gg
+We're happy to help! Contact us at: blake@lem.gg
 
 ### Do you offer commercial licenses?
 
