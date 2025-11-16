@@ -2,7 +2,7 @@
 
 **Purpose**: Essential coding standards for AI assistants and developers. Keep this concise for context efficiency.
 
-**Last updated**: 2025-10-24 (PT)
+**Last updated**: 2025-11-15 (PT)
 
 ---
 
@@ -40,6 +40,72 @@ yarn add react
 ```
 
 **Install**: `npm install -g pnpm` or `brew install pnpm`
+
+---
+
+## 📜 License Headers (Required for All New Files)
+
+**IMPORTANT**: Every new source file MUST include an SPDX license header at the top.
+
+### Python Files (.py)
+
+```python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+#
+# This file is part of Lem.
+#
+# Lem is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Lem is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
+# Public License for more details.
+
+"""
+Module docstring goes here.
+"""
+import os
+```
+
+**Note**: If file has a shebang (`#!/usr/bin/env python3`), place it first, then the license header.
+
+---
+
+### TypeScript/JavaScript Files (.ts, .tsx, .js, .jsx)
+
+```typescript
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2025 Lem
+//
+// This file is part of Lem.
+//
+// Lem is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Lem is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+// or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
+// Public License for more details.
+
+import React from "react";
+```
+
+---
+
+### Configuration Files (YAML, JSON, TOML, etc.)
+
+Configuration files generally do NOT need license headers (they're not code), but if you're creating a significant/complex config:
+
+```yaml
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+```
 
 ---
 
@@ -272,6 +338,7 @@ pnpm dlx shadcn-ui@latest add button card
 
 Before submitting code:
 
+- [ ] **License headers**: All new files have SPDX headers (see License Headers section)
 - [ ] Types: All functions have type annotations
 - [ ] Tests: New code has tests (>80% coverage)
 - [ ] Linting: `ruff check` / `eslint` passes
@@ -360,11 +427,11 @@ env = {"DOCKER_HOST": "unix:///var/run/docker.sock"}  # Linux only
 
 ## 🔗 Related Docs
 
-- **Implementation guide**: [`docs/implementation_plan.md`](./docs/implementation_plan.md)
-- **API contracts**: [`docs/api.md`](./docs/api.md)
-- **Architecture**: [`docs/architecture.md`](./docs/architecture.md)
-- **Platform guide**: [`docs/platform.md`](./docs/platform.md)
-- **Testing**: [`docs/testing_checklist.md`](./docs/testing_checklist.md)
+- **Implementation guide**: [`../docs/implementation_plan.md`](./docs/implementation_plan.md)
+- **API contracts**: [`../docs/api.md`](./docs/api.md)
+- **Architecture**: [`../docs/architecture.md`](./docs/architecture.md)
+- **Platform guide**: [`../docs/platform.md`](./docs/platform.md)
+- **Testing**: [`../docs/testing_checklist.md`](./docs/testing_checklist.md)
 
 ---
 
