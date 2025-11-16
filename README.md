@@ -32,7 +32,7 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 
 ```bash
 # Clone the repository
-git clone https://github.com/lem-gg/lem.git
+git clone https://github.com/lem-app/lem.git
 cd lem/lem-app
 
 # Start the local server
@@ -57,7 +57,6 @@ Lem consists of four main components:
 3. **Cloud Signaling** (`/cloud/signaling`): WebRTC signaling for P2P connections
 4. **Cloud Relay** (`/cloud/relay`): Fallback relay for restricted networks
 
-See [docs/architecture.md](./docs/architecture.md) for detailed architecture information.
 
 ## 🔐 Security
 
@@ -69,11 +68,6 @@ See [docs/architecture.md](./docs/architecture.md) for detailed architecture inf
 
 ## 📖 Documentation
 
-- [Architecture Overview](./docs/architecture.md)
-- [Implementation Plan](./docs/implementation_plan.md)
-- [API Reference](./docs/api.md)
-- [Platform Guide](./docs/platform.md)
-- [Contributing Guide](./CONTRIBUTING.md)
 - [Coding Standards](./CLAUDE.md)
 
 ## 🤝 Contributing
@@ -114,7 +108,7 @@ Need a different license for embedded use or commercial distribution? Contact us
 
 ### More Information
 
-- [License FAQ](./LICENSE-FAQ.md)
+- [License FAQ](./AGPL-FAQ.md)
 - [Full License Text](./LICENSE)
 - [Copyright Notice](./NOTICE)
 
@@ -131,7 +125,6 @@ lem-app/
 ├── web/
 │   ├── local/        # Local dashboard (React + TypeScript)
 │   └── remote/       # Remote web app (React + TypeScript)
-├── docs/             # Architecture and implementation docs
 └── CLAUDE.md         # Coding standards
 ```
 
@@ -185,11 +178,10 @@ pnpm tsc --noEmit
 - [ ] Mobile app (iOS/Android)
 - [ ] Browser extension
 
-See [docs/implementation_plan.md](./docs/implementation_plan.md) for detailed roadmap.
 
 ## 🐛 Bug Reports & Feature Requests
 
-Please use [GitHub Issues](https://github.com/lem-gg/lem/issues) to report bugs or request features.
+Please use [GitHub Issues](https://github.com/lem-app/lem/issues) to report bugs or request features.
 
 For security vulnerabilities, please email: **blake@lem.gg**
 
