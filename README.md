@@ -195,9 +195,7 @@ For security vulnerabilities, please email: **blake@lem.gg**
 
 ## 💬 Community
 
-- **GitHub Discussions**: [Coming soon]
-- **Discord**: [Coming soon]
-- **Twitter/X**: [Coming soon]
+- **Discord**: [Join our Discord](https://discord.gg/xY4XXKJDZZ)
 
 ## 🙏 Acknowledgments
 
