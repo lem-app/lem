@@ -38,5 +38,8 @@ class Settings(BaseSettings):
     # Rate limiting
     max_connections_per_second: int = 5
 
+    # Relay server
+    relay_url: str = "ws://localhost:8001"
+
 
 settings = Settings()

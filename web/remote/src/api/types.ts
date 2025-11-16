@@ -60,6 +60,10 @@ export type SignalingMessageType =
   | 'connected'
   | 'ack'
   | 'error'
+  | 'connect-request'
+  | 'connect-request-received'
+  | 'connect-ack'
+  | 'connect-ack-received'
 
 /**
  * Base signaling message structure.
@@ -138,6 +142,49 @@ export interface ErrorMessage extends BaseSignalingMessage {
 }
 
 /**
+ * Connection request message (browser → signaling).
+ */
+export interface ConnectRequestMessage extends BaseSignalingMessage {
+  type: 'connect-request'
+  target_device_id: string
+  preferred_transport?: 'webrtc' | 'relay' | 'auto'
+  relay_session_id?: string
+}
+
+/**
+ * Connection request notification (signaling → server).
+ */
+export interface ConnectRequestReceivedMessage extends BaseSignalingMessage {
+  type: 'connect-request-received'
+  from_device_id: string
+  preferred_transport: 'webrtc' | 'relay' | 'auto'
+  relay_session_id?: string
+  relay_url?: string
+}
+
+/**
+ * Connection acknowledgment (server → signaling).
+ */
+export interface ConnectAckMessage extends BaseSignalingMessage {
+  type: 'connect-ack'
+  target_device_id: string
+  transport: 'webrtc' | 'relay'
+  relay_session_id?: string
+  status: 'connecting' | 'connected' | 'failed'
+}
+
+/**
+ * Connection acknowledgment notification (signaling → browser).
+ */
+export interface ConnectAckReceivedMessage extends BaseSignalingMessage {
+  type: 'connect-ack-received'
+  from_device_id: string
+  transport: 'webrtc' | 'relay'
+  relay_session_id?: string
+  status: 'connecting' | 'connected' | 'failed'
+}
+
+/**
  * Received signaling message (includes sender info).
  */
 export interface ReceivedOfferMessage extends OfferMessage {
@@ -162,6 +209,8 @@ export type SignalingMessage =
   | ConnectedMessage
   | AckMessage
   | ErrorMessage
+  | ConnectRequestMessage
+  | ConnectAckMessage
 
 /**
  * Union type for received signaling messages.
@@ -173,6 +222,8 @@ export type ReceivedSignalingMessage =
   | ConnectedMessage
   | AckMessage
   | ErrorMessage
+  | ConnectRequestReceivedMessage
+  | ConnectAckReceivedMessage
 
 /**
  * WebRTC connection state.

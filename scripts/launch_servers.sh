@@ -12,20 +12,20 @@ trap cleanup EXIT INT TERM
 echo "Starting services..."
 echo ""
 
-# Start signaling server
-echo "→ Signaling Server (port 8000)"
-(cd cloud/signaling && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000) &
-sleep 2
+# # Start signaling server
+# echo "→ Signaling Server (port 8000)"
+# (cd cloud/signaling && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000) &
+# sleep 2
 
-# Start relay server
-echo "→ Relay Server (port 8001)"
-(cd cloud/relay && uv run uvicorn app.main:app --host 0.0.0.0 --port 8001) &
-sleep 2
+# # Start relay server
+# echo "→ Relay Server (port 8001)"
+# (cd cloud/relay && uv run uvicorn app.main:app --host 0.0.0.0 --port 8001) &
+# sleep 2
 
-# Start Lem server
-echo "→ Local Lem Server (port 5142)"
-(cd server && uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
-sleep 2
+# # Start Lem server
+# echo "→ Local Lem Server (port 5142)"
+# (cd server && uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
+# sleep 2
 
 # Start browser remote app
 echo "→ Browser Remote App (port 5173)"

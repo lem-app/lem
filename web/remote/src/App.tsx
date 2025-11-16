@@ -138,7 +138,7 @@ function App(): ReactElement {
   }
 
   // Authenticated and device selected - check if viewing a client
-  if (selectedClientId && connectionState === 'connected' && dataChannelState === 'open') {
+  if (selectedClientId && connectionState === 'connected' && (connectionMode === 'relay' || dataChannelState === 'open')) {
     return (
       <ClientViewer
         clientId={selectedClientId}
@@ -185,7 +185,7 @@ function App(): ReactElement {
           onDisconnect={disconnect}
         />
 
-        {connectionState === 'connected' && dataChannelState === 'open' && (
+        {connectionState === 'connected' && (connectionMode === 'relay' || dataChannelState === 'open') && (
           <>
             <ClientSelector proxyFetch={proxyFetch} onSelectClient={handleSelectClient} />
             <APITester proxyFetch={proxyFetch} isConnected={true} />

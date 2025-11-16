@@ -124,6 +124,27 @@ export class RelayClient {
   }
 
   /**
+   * Get DataChannel state (for compatibility with WebSocket proxy).
+   * Returns "open" when relay is connected, otherwise returns the connection state.
+   */
+  getDataChannelState(): 'connecting' | 'open' | 'closing' | 'closed' | 'none' {
+    if (!this.ws) return 'none'
+
+    switch (this.ws.readyState) {
+      case WebSocket.CONNECTING:
+        return 'connecting'
+      case WebSocket.OPEN:
+        return 'open'
+      case WebSocket.CLOSING:
+        return 'closing'
+      case WebSocket.CLOSED:
+        return 'closed'
+      default:
+        return 'none'
+    }
+  }
+
+  /**
    * Connect to relay server.
    */
   private async connectRelay(): Promise<void> {

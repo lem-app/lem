@@ -27,6 +27,8 @@ import type {
   OfferMessage,
   AnswerMessage,
   ICECandidateMessage,
+  ConnectRequestMessage,
+  ConnectAckReceivedMessage,
 } from '../api/types'
 
 /**
@@ -82,6 +84,13 @@ export class WebRTCConnectionManager {
   private connectionTimeout: number | null = null
   private readonly CONNECTION_TIMEOUT_MS = 15000
 
+  // Connection request/ack handling
+  private connectAckPromise: {
+    resolve: (ack: ConnectAckReceivedMessage) => void
+    reject: (error: Error) => void
+  } | null = null
+  private readonly CONNECT_ACK_TIMEOUT_MS = 30000 // 30s timeout for connect-ack
+
   constructor(config: WebRTCConfig) {
     this.signalUrl = config.signalUrl
     this.token = config.token
@@ -100,6 +109,11 @@ export class WebRTCConnectionManager {
     this.setState('connecting')
 
     try {
+      // Check if RTCPeerConnection is available (can be blocked by extensions)
+      if (typeof RTCPeerConnection === 'undefined') {
+        throw new Error('RTCPeerConnection not available (WebRTC may be blocked)')
+      }
+
       // Create RTCPeerConnection
       this.pc = new RTCPeerConnection({
         iceServers: this.iceServers,
@@ -178,6 +192,50 @@ export class WebRTCConnectionManager {
   }
 
   /**
+   * Connect to signaling server only (without starting WebRTC).
+   * Use this when WebRTC is unavailable and we're going straight to relay mode.
+   */
+  async connectSignalingOnly(): Promise<void> {
+    this.setState('connecting')
+    try {
+      await this.connectSignaling()
+      console.log('[WebRTC] Connected to signaling server only (no WebRTC)')
+    } catch (error) {
+      this.setState('failed')
+      const err = error instanceof Error ? error : new Error(String(error))
+      this.onError?.(err)
+      throw err
+    }
+  }
+
+  /**
+   * Stop WebRTC reconnection without closing the signaling WebSocket.
+   * Use this when falling back to relay - we need the signaling connection
+   * to send connect-request messages.
+   */
+  stopReconnection(): void {
+    this.shouldReconnect = false
+
+    // Clear connection timeout
+    this.clearConnectionTimeout()
+
+    // Close DataChannel
+    if (this.dataChannel) {
+      this.dataChannel.close()
+      this.dataChannel = null
+    }
+
+    // Close peer connection
+    if (this.pc) {
+      this.pc.close()
+      this.pc = null
+    }
+
+    // Don't close WebSocket - we still need it for signaling
+    console.log('[WebRTC] Stopped reconnection (keeping signaling WebSocket open)')
+  }
+
+  /**
    * Disconnect and clean up resources.
    */
   disconnect(): void {
@@ -237,6 +295,67 @@ export class WebRTCConnectionManager {
   getDataChannelState(): DataChannelState {
     if (!this.dataChannel) return 'none'
     return this.dataChannel.readyState as DataChannelState
+  }
+
+  /**
+   * Send connect-request and wait for acknowledgment.
+   *
+   * @param preferredTransport Transport preference ("webrtc", "relay", or "auto")
+   * @param relaySessionId Relay session ID if using relay transport
+   * @returns Promise that resolves with the connect-ack message
+   */
+  async sendConnectRequest(
+    preferredTransport: 'webrtc' | 'relay' | 'auto' = 'auto',
+    relaySessionId?: string
+  ): Promise<ConnectAckReceivedMessage> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected')
+    }
+
+    return new Promise<ConnectAckReceivedMessage>((resolve, reject) => {
+      // Store promise handlers
+      this.connectAckPromise = { resolve, reject }
+
+      // Set timeout
+      const timeout = setTimeout(() => {
+        if (this.connectAckPromise) {
+          this.connectAckPromise.reject(new Error('Connect-ack timeout (30s)'))
+          this.connectAckPromise = null
+        }
+      }, this.CONNECT_ACK_TIMEOUT_MS)
+
+      // Send connect-request
+      const message: ConnectRequestMessage = {
+        type: 'connect-request',
+        target_device_id: this.targetDeviceId,
+        preferred_transport: preferredTransport,
+        relay_session_id: relaySessionId,
+      }
+
+      console.log('[WebRTC] Sending connect-request:', preferredTransport, relaySessionId)
+      this.sendSignalingMessage(message)
+
+      // Clear timeout when promise settles
+      Promise.race([
+        new Promise<ConnectAckReceivedMessage>((res, rej) => {
+          if (this.connectAckPromise) {
+            const original = this.connectAckPromise
+            this.connectAckPromise = {
+              resolve: (msg) => {
+                clearTimeout(timeout)
+                res(msg)
+                original.resolve(msg)
+              },
+              reject: (err) => {
+                clearTimeout(timeout)
+                rej(err)
+                original.reject(err)
+              },
+            }
+          }
+        }),
+      ])
+    })
   }
 
   /**
@@ -333,6 +452,15 @@ export class WebRTCConnectionManager {
 
         case 'ack':
           console.log('[Signaling] Ack:', message.message)
+          break
+
+        case 'connect-ack-received':
+          // Received acknowledgment for connection request
+          console.log('[Signaling] Received connect-ack:', message)
+          if (this.connectAckPromise) {
+            this.connectAckPromise.resolve(message)
+            this.connectAckPromise = null
+          }
           break
 
         default:

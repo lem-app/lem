@@ -95,6 +95,10 @@ class TunnelAgent:
         self.relay_url: str = relay_url
         self.relay_client: RelayClient | None = None
 
+        # Relay session tracking for incoming connections
+        # Maps session_id -> RelayClient for on-demand relay connections
+        self.relay_sessions: dict[str, RelayClient] = {}
+
         # Connection mode tracking
         self.connection_mode: str = "webrtc"  # "webrtc" or "relay"
         self.webrtc_attempts: int = 0
@@ -390,6 +394,14 @@ class TunnelAgent:
             await self.relay_client.disconnect()
             self.relay_client = None
 
+        # Close all relay sessions
+        for session_id, relay_client in self.relay_sessions.items():
+            try:
+                await relay_client.disconnect()
+            except Exception as e:
+                logger.warning(f"Error closing relay session {session_id}: {e}")
+        self.relay_sessions.clear()
+
         # Close DataChannel
         if self.data_channel:
             self.data_channel.close()
@@ -523,6 +535,109 @@ class TunnelAgent:
 
         elif msg_type == "ack":
             logger.debug(f"Signaling ack: {message.get('message')}")
+
+        elif msg_type == "connect-request-received":
+            # Handle incoming connection request with transport preference
+            await self._handle_connect_request(message)
+
+    async def _handle_connect_request(self, message: dict[str, Any]) -> None:
+        """Handle incoming connection request with transport preference.
+
+        Args:
+            message: connect-request-received message
+        """
+        from_device_id: str | None = message.get("from_device_id")
+        if not from_device_id:
+            logger.warning("Received connect-request without from_device_id")
+            return
+
+        preferred_transport = message.get("preferred_transport", "auto")
+        relay_session_id = message.get("relay_session_id")
+        relay_url = message.get("relay_url", self.relay_url)
+
+        logger.info(
+            f"Received connection request from {from_device_id}, "
+            f"transport: {preferred_transport}, session: {relay_session_id}"
+        )
+
+        if preferred_transport == "relay" and relay_session_id:
+            # Start relay client for this session
+            try:
+                # Create relay client for this specific session
+                relay_client = RelayClient(
+                    local_server_url=self.http_proxy.local_server_url
+                )
+
+                # Connect to relay server with the specified session ID
+                await relay_client.connect(
+                    relay_url=relay_url,
+                    session_id=relay_session_id,
+                    token=self.token or "",
+                )
+
+                # Track this relay session
+                self.relay_sessions[relay_session_id] = relay_client
+
+                logger.info(
+                    f"✓ Relay session established for {from_device_id}: {relay_session_id}"
+                )
+
+                # Send acknowledgment
+                await self._send_connect_ack(
+                    target_device_id=from_device_id,
+                    transport="relay",
+                    relay_session_id=relay_session_id,
+                    status="connected",
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to establish relay session: {e}")
+                # Send failure acknowledgment
+                await self._send_connect_ack(
+                    target_device_id=from_device_id,
+                    transport="relay",
+                    relay_session_id=relay_session_id,
+                    status="failed",
+                )
+
+        elif preferred_transport == "webrtc" or preferred_transport == "auto":
+            # WebRTC mode - normal flow will handle this
+            # Send acknowledgment for WebRTC
+            await self._send_connect_ack(
+                target_device_id=from_device_id,
+                transport="webrtc",
+                relay_session_id=None,
+                status="connecting",
+            )
+            logger.info(f"WebRTC mode acknowledged for {from_device_id}")
+
+    async def _send_connect_ack(
+        self,
+        target_device_id: str,
+        transport: str,
+        relay_session_id: str | None,
+        status: str,
+    ) -> None:
+        """Send connection acknowledgment to requesting device.
+
+        Args:
+            target_device_id: Device to send ack to
+            transport: Transport mode ("webrtc" or "relay")
+            relay_session_id: Relay session ID if using relay
+            status: Connection status ("connecting", "connected", "failed")
+        """
+        await self._send_signaling_message(
+            {
+                "type": "connect-ack",
+                "target_device_id": target_device_id,
+                "transport": transport,
+                "relay_session_id": relay_session_id,
+                "status": status,
+            }
+        )
+        logger.info(
+            f"Sent connect-ack to {target_device_id}: {transport}, {status}"
+        )
 
     async def _send_signaling_message(self, message: dict[str, Any]) -> None:
         """Send message to signaling server.

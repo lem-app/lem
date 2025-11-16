@@ -23,6 +23,7 @@ import aiosqlite
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
 
+from ..core.config import settings
 from ..core.security import decode_access_token
 from ..db import get_db
 
@@ -194,12 +195,37 @@ async def websocket_signal_endpoint(
                     continue
 
                 target_device_id: str = message["target_device_id"]
+                msg_type: str = message["type"]
 
-                # Add sender information
-                message["sender_device_id"] = verified_device_id
+                # Handle relay coordination messages
+                if msg_type == "connect-request":
+                    # Transform to connect-request-received
+                    notification = {
+                        "type": "connect-request-received",
+                        "from_device_id": verified_device_id,
+                        "preferred_transport": message.get("preferred_transport", "auto"),
+                        "relay_session_id": message.get("relay_session_id"),
+                        "relay_url": settings.relay_url,
+                    }
+                    success = await manager.send_message(target_device_id, notification)
 
-                # Route message to target device
-                success = await manager.send_message(target_device_id, message)
+                elif msg_type == "connect-ack":
+                    # Transform to connect-ack-received
+                    notification = {
+                        "type": "connect-ack-received",
+                        "from_device_id": verified_device_id,
+                        "transport": message.get("transport"),
+                        "relay_session_id": message.get("relay_session_id"),
+                        "status": message.get("status"),
+                    }
+                    success = await manager.send_message(target_device_id, notification)
+
+                else:
+                    # Generic message routing (WebRTC signaling, etc.)
+                    # Add sender information
+                    message["sender_device_id"] = verified_device_id
+                    # Route message to target device
+                    success = await manager.send_message(target_device_id, message)
 
                 if success:
                     logger.info(

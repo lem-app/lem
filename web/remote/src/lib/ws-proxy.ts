@@ -21,6 +21,7 @@
  */
 
 import type { WebRTCConnectionManager } from './webrtc'
+import type { RelayClient } from './relay-client'
 import {
   serializeWSConnect,
   serializeWSData,
@@ -366,6 +367,21 @@ export class WSProxyManager {
 
   constructor(webrtc: WebRTCConnectionManager) {
     this.webrtc = webrtc
+  }
+
+  /**
+   * Update the connection manager (for relay fallback).
+   * This updates the manager for all future connections AND existing connections.
+   */
+  updateConnectionManager(manager: WebRTCConnectionManager | RelayClient): void {
+    // @ts-expect-error - RelayClient is compatible with WebRTCConnectionManager for proxy purposes
+    this.webrtc = manager
+    // Update existing connections
+    this.connections.forEach((connection) => {
+      // @ts-expect-error - updating private property for relay fallback
+      connection.webrtc = manager
+    })
+    console.log('[WSProxyManager] Updated connection manager for relay fallback')
   }
 
   /**

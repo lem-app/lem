@@ -16,6 +16,7 @@
 """Pydantic models for API requests and responses."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -71,3 +72,65 @@ class HealthResponse(BaseModel):
 
     status: str
     timestamp: datetime
+
+
+# Relay Coordination Messages
+
+
+class ConnectRequest(BaseModel):
+    """Connection request with transport preference."""
+
+    type: Literal["connect-request"]
+    target_device_id: str = Field(description="Target device ID")
+    preferred_transport: Literal["webrtc", "relay", "auto"] = Field(
+        default="auto", description="Preferred transport mode"
+    )
+    relay_session_id: str | None = Field(
+        default=None, description="Relay session ID if using relay transport"
+    )
+
+
+class ConnectRequestReceived(BaseModel):
+    """Notification sent to target device about connection request."""
+
+    type: Literal["connect-request-received"]
+    from_device_id: str = Field(description="Requesting device ID")
+    preferred_transport: Literal["webrtc", "relay", "auto"] = Field(
+        description="Preferred transport mode"
+    )
+    relay_session_id: str | None = Field(
+        default=None, description="Relay session ID if using relay transport"
+    )
+    relay_url: str | None = Field(
+        default=None, description="Relay server WebSocket URL"
+    )
+
+
+class ConnectAck(BaseModel):
+    """Connection acknowledgment from target device."""
+
+    type: Literal["connect-ack"]
+    target_device_id: str = Field(description="Requesting device ID to ack")
+    transport: Literal["webrtc", "relay"] = Field(
+        description="Confirmed transport mode"
+    )
+    relay_session_id: str | None = Field(
+        default=None, description="Relay session ID if using relay"
+    )
+    status: Literal["connecting", "connected", "failed"] = Field(
+        description="Connection status"
+    )
+
+
+class ConnectAckReceived(BaseModel):
+    """Acknowledgment notification sent back to requesting device."""
+
+    type: Literal["connect-ack-received"]
+    from_device_id: str = Field(description="Target device ID that acknowledged")
+    transport: Literal["webrtc", "relay"] = Field(description="Confirmed transport mode")
+    relay_session_id: str | None = Field(
+        default=None, description="Relay session ID if using relay"
+    )
+    status: Literal["connecting", "connected", "failed"] = Field(
+        description="Connection status"
+    )
