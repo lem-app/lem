@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8001  # Different from signaling (8000)
 
+    # CORS - comma-separated list of allowed origins
+    cors_origins: str = "*"  # Use "*" for dev, specific origins for production
+
     # Session timeout (seconds)
     session_timeout: int = 300  # 5 minutes idle timeout
 

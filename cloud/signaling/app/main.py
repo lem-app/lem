@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import auth, devices, health, signal
+from .core.config import settings
 from .db import init_db
 
 # Configure logging
@@ -38,10 +39,15 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# Parse CORS origins from settings
+cors_origins = (
+    ["*"] if settings.cors_origins == "*" else settings.cors_origins.split(",")
+)
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

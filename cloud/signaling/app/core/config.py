@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # CORS - comma-separated list of allowed origins
+    cors_origins: str = "*"  # Use "*" for dev, specific origins for production
+
     # Rate limiting
     max_connections_per_second: int = 5
 
