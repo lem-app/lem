@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+
+# Docker Compose for local development and testing
+# Mimics AWS ECS environment as closely as possible
+
+version: '3.8'
+
+services:
+  # PostgreSQL database (mimics RDS)
+  postgres:
+    image: postgres:16-alpine
+    container_name: lem-postgres
+    environment:
+      POSTGRES_DB: signaling
+      POSTGRES_USER: lemadmin
+      POSTGRES_PASSWORD: dev-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lemadmin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lem-network
+
+  # Signaling server
+  signaling:
+    build:
+      context: ../../cloud/signaling
+      dockerfile: Dockerfile
+    container_name: lem-signaling
+    environment:
+      # Server config
+      HOST: 0.0.0.0
+      PORT: 8000
+
+      # JWT settings
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
+
+      # Database
+      DATABASE_URL: postgresql+asyncpg://lemadmin:dev-password@postgres:5432/signaling
+
+      # CORS
+      CORS_ORIGINS: "*"
+
+      # Relay URL
+      RELAY_URL: ws://relay:8001
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - lem-network
+    restart: unless-stopped
+
+  # Relay server
+  relay:
+    build:
+      context: ../../cloud/relay
+      dockerfile: Dockerfile
+    container_name: lem-relay
+    environment:
+      # Server config
+      HOST: 0.0.0.0
+      PORT: 8001
+
+      # JWT settings (must match signaling)
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+
+      # CORS
+      CORS_ORIGINS: "*"
+
+      # Session settings
+      SESSION_TIMEOUT: 300
+      WS_PING_INTERVAL: 20
+      WS_PING_TIMEOUT: 10
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - lem-network
+    restart: unless-stopped
+
+  # Nginx (mimics ALB/NLB)
+  nginx:
+    image: nginx:alpine
+    container_name: lem-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - signaling
+      - relay
+    networks:
+      - lem-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  lem-network:
+    driver: bridge
