@@ -1,0 +1,45 @@
+[Unit]
+Description=Lem Relay Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lem
+Group=lem
+WorkingDirectory=/opt/lem/cloud/relay
+
+# Environment
+Environment="PATH=/opt/lem/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/opt/lem/cloud/relay/.env
+
+# Start command using uvicorn with uv
+ExecStart=/opt/lem/.local/bin/uv run uvicorn app.main:app \
+    --host ${HOST} \
+    --port ${PORT} \
+    --workers 2 \
+    --loop uvloop \
+    --log-level info
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+# Resource limits (relay needs more connections)
+LimitNOFILE=131072
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/lem/cloud/relay
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lem-relay
+
+[Install]
+WantedBy=multi-user.target
