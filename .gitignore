@@ -207,6 +207,8 @@ dist/
 # Environment files
 .env.local
 .env.*.local
+.env.production
+web/remote/.env.production
 
 # Test results
 playwright-report/
