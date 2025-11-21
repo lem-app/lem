@@ -30,11 +30,13 @@ Choose your deployment method:
 ```
 
 **What you get:**
-- Signaling server (FastAPI)
+- Signaling server (FastAPI + asyncpg)
 - Relay server (WebSocket)
-- PostgreSQL database
-- Nginx reverse proxy
+- PostgreSQL database (mimics AWS RDS)
+- Nginx reverse proxy (mimics AWS ALB)
 - All services networked together
+
+**Note:** The signaling server auto-detects `DATABASE_URL` to use PostgreSQL (Docker/AWS) or SQLite (standalone dev).
 
 **[Get Started →](./docker/)**
 
@@ -194,4 +196,4 @@ Plus optional:
 
 ---
 
-**Last updated:** 2025-11-16
+**Last updated:** 2025-11-20
