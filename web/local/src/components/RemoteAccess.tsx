@@ -38,7 +38,9 @@ export function RemoteAccess(): ReactElement {
   const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [signalingUrl, setSignalingUrl] = useState('http://localhost:8000');
+  const [signalingUrl, setSignalingUrl] = useState(
+    import.meta.env.VITE_DEFAULT_SIGNALING_URL || 'http://localhost:8000'
+  );
 
   const { data: authStatus, isLoading: authLoading } = useQuery({
     queryKey: ['auth', 'status'],
