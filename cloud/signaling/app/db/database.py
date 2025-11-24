@@ -45,16 +45,25 @@ def _parse_postgres_url(url: str) -> dict[str, Any]:
     # Handle both postgresql:// and postgresql+asyncpg://
     url = url.replace("postgresql+asyncpg://", "postgresql://")
 
-    from urllib.parse import urlparse
+    from urllib.parse import parse_qs, urlparse
     parsed = urlparse(url)
 
-    return {
+    params: dict[str, Any] = {
         "user": parsed.username,
         "password": parsed.password,
         "host": parsed.hostname,
         "port": parsed.port or 5432,
         "database": parsed.path.lstrip("/"),
     }
+
+    # Handle SSL mode from query string
+    query_params = parse_qs(parsed.query)
+    if "sslmode" in query_params:
+        sslmode = query_params["sslmode"][0]
+        if sslmode in ("require", "verify-ca", "verify-full"):
+            params["ssl"] = "require"
+
+    return params
 
 
 async def _get_pg_pool() -> Any:
@@ -85,10 +94,17 @@ async def get_db() -> AsyncIterator[Any]:
 
 async def init_db() -> None:
     """Initialize the database with required tables."""
+    import logging
+    logger = logging.getLogger(__name__)
+
     if USE_POSTGRES:
+        logger.info(f"Initializing PostgreSQL database: {DATABASE_URL[:50]}...")
         await _init_postgres()
+        logger.info("PostgreSQL tables created successfully")
     else:
+        logger.info("Initializing SQLite database: signaling.db")
         await _init_sqlite()
+        logger.info("SQLite tables created successfully")
 
 
 async def _init_sqlite() -> None:
