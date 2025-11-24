@@ -119,10 +119,22 @@ export function setupWebSocketIntercept(wsProxyManager: WSProxyManager): void {
   } as unknown as typeof WebSocket
 
   // Copy static properties from original WebSocket
-  ProxiedWebSocketConstructor.CONNECTING = OriginalWebSocket.CONNECTING
-  ProxiedWebSocketConstructor.OPEN = OriginalWebSocket.OPEN
-  ProxiedWebSocketConstructor.CLOSING = OriginalWebSocket.CLOSING
-  ProxiedWebSocketConstructor.CLOSED = OriginalWebSocket.CLOSED
+  Object.defineProperty(ProxiedWebSocketConstructor, 'CONNECTING', {
+    value: OriginalWebSocket.CONNECTING,
+    writable: false,
+  })
+  Object.defineProperty(ProxiedWebSocketConstructor, 'OPEN', {
+    value: OriginalWebSocket.OPEN,
+    writable: false,
+  })
+  Object.defineProperty(ProxiedWebSocketConstructor, 'CLOSING', {
+    value: OriginalWebSocket.CLOSING,
+    writable: false,
+  })
+  Object.defineProperty(ProxiedWebSocketConstructor, 'CLOSED', {
+    value: OriginalWebSocket.CLOSED,
+    writable: false,
+  })
 
   // Replace window.WebSocket
   window.WebSocket = ProxiedWebSocketConstructor

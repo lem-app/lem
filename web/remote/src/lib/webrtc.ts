@@ -548,7 +548,7 @@ export class WebRTCConnectionManager {
   /**
    * Send message to signaling server.
    */
-  private sendSignalingMessage(message: OfferMessage | AnswerMessage | ICECandidateMessage): void {
+  private sendSignalingMessage(message: OfferMessage | AnswerMessage | ICECandidateMessage | ConnectRequestMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket not connected')
     }
