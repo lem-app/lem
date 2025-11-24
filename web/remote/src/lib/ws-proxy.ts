@@ -29,6 +29,7 @@ import {
   deserializeWSData,
   deserializeWSClose,
   WSOpcode,
+  type WSOpcodeValue,
   type WSDataFrame,
   type WSCloseFrame,
 } from './ws-frame'
@@ -36,12 +37,14 @@ import {
 /**
  * WebSocket connection state.
  */
-export enum ProxiedWSState {
-  CONNECTING = 0,
-  OPEN = 1,
-  CLOSING = 2,
-  CLOSED = 3,
-}
+export const ProxiedWSState = {
+  CONNECTING: 0,
+  OPEN: 1,
+  CLOSING: 2,
+  CLOSED: 3,
+} as const
+
+export type ProxiedWSStateValue = (typeof ProxiedWSState)[keyof typeof ProxiedWSState]
 
 /**
  * Proxied WebSocket connection.
@@ -57,7 +60,7 @@ export class ProxiedWebSocket implements EventTarget {
 
   // State
   private connectionId: number
-  private _readyState: ProxiedWSState = ProxiedWSState.CONNECTING
+  private _readyState: ProxiedWSStateValue = ProxiedWSState.CONNECTING
   private _url: string
   private _protocol: string = ''
   private _extensions: string = ''
@@ -177,14 +180,15 @@ export class ProxiedWebSocket implements EventTarget {
     } else {
       // ArrayBufferView (TypedArray, DataView)
       const view = data as ArrayBufferView
-      this.sendDataFrame(WSOpcode.BINARY, view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength))
+      const buffer = view.buffer as ArrayBuffer
+      this.sendDataFrame(WSOpcode.BINARY, buffer.slice(view.byteOffset, view.byteOffset + view.byteLength))
     }
   }
 
   /**
    * Send WS_DATA frame.
    */
-  private sendDataFrame(opcode: number, payload: ArrayBuffer): void {
+  private sendDataFrame(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
     try {
       const frame = serializeWSData({
         connectionId: this.connectionId,

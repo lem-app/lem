@@ -44,7 +44,11 @@ export interface Transport {
  * WebRTC DataChannel transport adapter.
  */
 export class WebRTCTransport implements Transport {
-  constructor(private webrtc: WebRTCConnectionManager) {}
+  private webrtc: WebRTCConnectionManager
+
+  constructor(webrtc: WebRTCConnectionManager) {
+    this.webrtc = webrtc
+  }
 
   sendData(data: ArrayBuffer): void {
     this.webrtc.sendData(data)
@@ -59,7 +63,11 @@ export class WebRTCTransport implements Transport {
  * Relay WebSocket transport adapter.
  */
 export class RelayTransport implements Transport {
-  constructor(private relay: RelayClient) {}
+  private relay: RelayClient
+
+  constructor(relay: RelayClient) {
+    this.relay = relay
+  }
 
   sendData(data: ArrayBuffer): void {
     this.relay.sendData(data)

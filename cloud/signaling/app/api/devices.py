@@ -21,7 +21,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
 from ..core.security import decode_access_token
-from ..db import get_db
+from ..db import USE_POSTGRES, get_db
 from ..models import DeviceRegister, DeviceResponse
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -80,49 +80,81 @@ async def register_device(
     Raises:
         HTTPException: If device is owned by another user.
     """
-    # Check if device exists and belongs to a different user
-    async with db.execute(
-        "SELECT user_id FROM devices WHERE id = ?", (device_data.device_id,)
-    ) as cursor:
-        existing_device = await cursor.fetchone()
+    if USE_POSTGRES:
+        # PostgreSQL syntax
+        existing_device = await db.fetchrow(
+            "SELECT user_id FROM devices WHERE id = $1", device_data.device_id
+        )
         if existing_device and existing_device["user_id"] != user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Device ID belongs to another user",
             )
 
-    # Atomic upsert: create or update device
-    await db.execute(
-        """
-        INSERT INTO devices (id, user_id, pubkey, created_at, last_seen)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(id) DO UPDATE SET
-            pubkey = excluded.pubkey,
-            last_seen = CURRENT_TIMESTAMP
-        """,
-        (device_data.device_id, user_id, device_data.pubkey),
-    )
-    await db.commit()
-
-    # Fetch and return the device
-    async with db.execute(
-        "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE id = ?",
-        (device_data.device_id,),
-    ) as cursor:
-        device = await cursor.fetchone()
-        if not device:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create device",
-            )
-
-        return DeviceResponse(
-            id=device["id"],
-            user_id=device["user_id"],
-            pubkey=device["pubkey"],
-            created_at=device["created_at"],
-            last_seen=device["last_seen"],
+        # Atomic upsert: create or update device
+        await db.execute(
+            """
+            INSERT INTO devices (id, user_id, pubkey, created_at, last_seen)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                pubkey = excluded.pubkey,
+                last_seen = CURRENT_TIMESTAMP
+            """,
+            device_data.device_id,
+            user_id,
+            device_data.pubkey,
         )
+
+        # Fetch and return the device
+        device = await db.fetchrow(
+            "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE id = $1",
+            device_data.device_id,
+        )
+    else:
+        # SQLite syntax
+        async with db.execute(
+            "SELECT user_id FROM devices WHERE id = ?", (device_data.device_id,)
+        ) as cursor:
+            existing_device = await cursor.fetchone()
+            if existing_device and existing_device["user_id"] != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Device ID belongs to another user",
+                )
+
+        # Atomic upsert: create or update device
+        await db.execute(
+            """
+            INSERT INTO devices (id, user_id, pubkey, created_at, last_seen)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                pubkey = excluded.pubkey,
+                last_seen = CURRENT_TIMESTAMP
+            """,
+            (device_data.device_id, user_id, device_data.pubkey),
+        )
+        await db.commit()
+
+        # Fetch and return the device
+        async with db.execute(
+            "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE id = ?",
+            (device_data.device_id,),
+        ) as cursor:
+            device = await cursor.fetchone()
+
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create device",
+        )
+
+    return DeviceResponse(
+        id=device["id"],
+        user_id=device["user_id"],
+        pubkey=device["pubkey"],
+        created_at=device["created_at"],
+        last_seen=device["last_seen"],
+    )
 
 
 @router.get("/", response_model=list[DeviceResponse])
@@ -139,18 +171,27 @@ async def list_devices(
     Returns:
         List of user's devices.
     """
-    async with db.execute(
-        "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE user_id = ?",
-        (user_id,),
-    ) as cursor:
-        devices = await cursor.fetchall()
-        return [
-            DeviceResponse(
-                id=device["id"],
-                user_id=device["user_id"],
-                pubkey=device["pubkey"],
-                created_at=device["created_at"],
-                last_seen=device["last_seen"],
-            )
-            for device in devices
-        ]
+    if USE_POSTGRES:
+        # PostgreSQL syntax
+        devices = await db.fetch(
+            "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE user_id = $1",
+            user_id,
+        )
+    else:
+        # SQLite syntax
+        async with db.execute(
+            "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            devices = await cursor.fetchall()
+
+    return [
+        DeviceResponse(
+            id=device["id"],
+            user_id=device["user_id"],
+            pubkey=device["pubkey"],
+            created_at=device["created_at"],
+            last_seen=device["last_seen"],
+        )
+        for device in devices
+    ]

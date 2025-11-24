@@ -19,7 +19,7 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..core.security import create_access_token, get_password_hash, verify_password
-from ..db import get_db
+from ..db import USE_POSTGRES, get_db
 from ..models import Token, UserCreate, UserLogin
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -41,24 +41,46 @@ async def register(
     Raises:
         HTTPException: If user already exists.
     """
-    # Check if user already exists
-    async with db.execute("SELECT id FROM users WHERE email = ?", (user_data.email,)) as cursor:
-        existing_user = await cursor.fetchone()
+    if USE_POSTGRES:
+        # PostgreSQL syntax
+        existing_user = await db.fetchrow(
+            "SELECT id FROM users WHERE email = $1", user_data.email
+        )
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered",
             )
 
-    # Create new user
-    hashed_password = get_password_hash(user_data.password)
-    async with db.execute(
-        "INSERT INTO users (email, hashed_password) VALUES (?, ?)",
-        (user_data.email, hashed_password),
-    ) as cursor:
-        user_id = cursor.lastrowid
+        # Create new user with RETURNING
+        hashed_password = get_password_hash(user_data.password)
+        row = await db.fetchrow(
+            "INSERT INTO users (email, hashed_password) VALUES ($1, $2) RETURNING id",
+            user_data.email,
+            hashed_password,
+        )
+        user_id = row["id"]
+    else:
+        # SQLite syntax
+        async with db.execute(
+            "SELECT id FROM users WHERE email = ?", (user_data.email,)
+        ) as cursor:
+            existing_user = await cursor.fetchone()
+            if existing_user:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already registered",
+                )
 
-    await db.commit()
+        # Create new user
+        hashed_password = get_password_hash(user_data.password)
+        async with db.execute(
+            "INSERT INTO users (email, hashed_password) VALUES (?, ?)",
+            (user_data.email, hashed_password),
+        ) as cursor:
+            user_id = cursor.lastrowid
+
+        await db.commit()
 
     # Create access token
     access_token = create_access_token(data={"sub": user_data.email, "user_id": user_id})
@@ -80,12 +102,19 @@ async def login(credentials: UserLogin, db: aiosqlite.Connection = Depends(get_d
     Raises:
         HTTPException: If credentials are invalid.
     """
-    # Get user from database
-    async with db.execute(
-        "SELECT id, email, hashed_password FROM users WHERE email = ?",
-        (credentials.email,),
-    ) as cursor:
-        user = await cursor.fetchone()
+    if USE_POSTGRES:
+        # PostgreSQL syntax
+        user = await db.fetchrow(
+            "SELECT id, email, hashed_password FROM users WHERE email = $1",
+            credentials.email,
+        )
+    else:
+        # SQLite syntax
+        async with db.execute(
+            "SELECT id, email, hashed_password FROM users WHERE email = ?",
+            (credentials.email,),
+        ) as cursor:
+            user = await cursor.fetchone()
 
     if not user or not verify_password(credentials.password, user["hashed_password"]):
         raise HTTPException(

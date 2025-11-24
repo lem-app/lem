@@ -15,6 +15,6 @@
 
 """Database module."""
 
-from .database import get_db, init_db
+from .database import USE_POSTGRES, get_db, init_db
 
-__all__ = ["get_db", "init_db"]
+__all__ = ["get_db", "init_db", "USE_POSTGRES"]
