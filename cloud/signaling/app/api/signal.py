@@ -25,7 +25,7 @@ from jose import JWTError
 
 from ..core.config import settings
 from ..core.security import decode_access_token
-from ..db import get_db
+from ..db import USE_POSTGRES, get_db
 
 router = APIRouter(tags=["signaling"])
 logger = logging.getLogger(__name__)
@@ -112,13 +112,19 @@ async def verify_token_and_device(
             raise ValueError("Invalid token: missing user_id")
 
         # Verify device belongs to user
-        async with db.execute(
-            "SELECT id FROM devices WHERE id = ? AND user_id = ?",
-            (device_id, user_id),
-        ) as cursor:
-            device = await cursor.fetchone()
-            if not device:
-                raise ValueError(f"Device {device_id} not found for user {user_id}")
+        if USE_POSTGRES:
+            device = await db.fetchrow(
+                "SELECT id FROM devices WHERE id = $1 AND user_id = $2",
+                device_id, user_id
+            )
+        else:
+            async with db.execute(
+                "SELECT id FROM devices WHERE id = ? AND user_id = ?",
+                (device_id, user_id),
+            ) as cursor:
+                device = await cursor.fetchone()
+        if not device:
+            raise ValueError(f"Device {device_id} not found for user {user_id}")
 
         return user_id, device_id
 
