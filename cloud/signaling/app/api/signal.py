@@ -15,6 +15,7 @@
 
 """WebSocket signaling endpoint for WebRTC peer connection establishment."""
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -38,6 +39,8 @@ class ConnectionManager:
         """Initialize connection manager."""
         # Map device_id -> WebSocket
         self.active_connections: dict[str, WebSocket] = {}
+        # Lock to prevent race conditions during connect/disconnect
+        self._lock = asyncio.Lock()
 
     async def connect(self, device_id: str, websocket: WebSocket) -> None:
         """Connect a device.
@@ -46,28 +49,30 @@ class ConnectionManager:
             device_id: Device identifier.
             websocket: WebSocket connection.
         """
-        # Close existing connection if any
-        if device_id in self.active_connections:
-            old_ws = self.active_connections[device_id]
-            logger.info(f"Closing existing connection for device {device_id}")
-            try:
-                await old_ws.close(code=status.WS_1008_POLICY_VIOLATION)
-            except Exception as e:
-                logger.warning(f"Error closing old connection: {e}")
+        async with self._lock:
+            # Close existing connection if any
+            if device_id in self.active_connections:
+                old_ws = self.active_connections[device_id]
+                logger.info(f"Closing existing connection for device {device_id}")
+                try:
+                    await old_ws.close(code=status.WS_1008_POLICY_VIOLATION)
+                except Exception as e:
+                    logger.warning(f"Error closing old connection: {e}")
 
-        await websocket.accept()
-        self.active_connections[device_id] = websocket
-        logger.info(f"Device {device_id} connected to signaling server")
+            await websocket.accept()
+            self.active_connections[device_id] = websocket
+            logger.info(f"Device {device_id} connected to signaling server")
 
-    def disconnect(self, device_id: str) -> None:
+    async def disconnect(self, device_id: str) -> None:
         """Disconnect a device.
 
         Args:
             device_id: Device identifier.
         """
-        if device_id in self.active_connections:
-            del self.active_connections[device_id]
-            logger.info(f"Device {device_id} disconnected from signaling server")
+        async with self._lock:
+            if device_id in self.active_connections:
+                del self.active_connections[device_id]
+                logger.info(f"Device {device_id} disconnected from signaling server")
 
     async def send_message(self, device_id: str, message: dict[str, Any]) -> bool:
         """Send a message to a specific device.
@@ -77,12 +82,21 @@ class ConnectionManager:
             message: Message to send.
 
         Returns:
-            True if message was sent, False if device not connected.
+            True if message was sent, False if device not connected or send failed.
         """
-        if device_id in self.active_connections:
-            websocket = self.active_connections[device_id]
-            await websocket.send_json(message)
-            return True
+        websocket: WebSocket | None = None
+        async with self._lock:
+            websocket = self.active_connections.get(device_id)
+
+        if websocket is not None:
+            try:
+                await websocket.send_json(message)
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to send message to {device_id}: {e}")
+                # Remove disconnected device from active connections
+                await self.disconnect(device_id)
+                return False
         return False
 
 
@@ -167,12 +181,13 @@ async def websocket_signal_endpoint(
         # Connect the device
         await manager.connect(verified_device_id, websocket)
 
-        # Send connection confirmation
+        # Send connection confirmation with ICE servers configuration
         await websocket.send_json(
             {
                 "type": "connected",
                 "device_id": verified_device_id,
                 "message": "Connected to signaling server",
+                "ice_servers": settings.ice_servers,
             }
         )
 
@@ -269,6 +284,6 @@ async def websocket_signal_endpoint(
         logger.error(f"Unexpected error in WebSocket handler: {e}")
     finally:
         # Clean up
-        manager.disconnect(device_id)
+        await manager.disconnect(device_id)
         if db_conn:
             await db_conn.close()

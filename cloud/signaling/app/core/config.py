@@ -15,6 +15,9 @@
 
 """Configuration settings for the signaling server."""
 
+import json
+from typing import Any
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +46,20 @@ class Settings(BaseSettings):
 
     # Relay server
     relay_url: str = "ws://localhost:8001"
+
+    # ICE servers configuration (JSON string)
+    # Format: [{"urls": "stun:stun.l.google.com:19302"}, {"urls": "turn:...", "username": "...", "credential": "..."}]
+    # Default: Google's public STUN server
+    ice_servers_json: str = '[{"urls": "stun:stun.l.google.com:19302"}]'
+
+    @property
+    def ice_servers(self) -> list[dict[str, Any]]:
+        """Parse ICE servers from JSON string."""
+        try:
+            return json.loads(self.ice_servers_json)
+        except json.JSONDecodeError:
+            # Fall back to default STUN server on parse error
+            return [{"urls": "stun:stun.l.google.com:19302"}]
 
 
 settings = Settings()
