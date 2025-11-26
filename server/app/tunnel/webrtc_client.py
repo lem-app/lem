@@ -127,6 +127,7 @@ class TunnelAgent:
         self.should_reconnect: bool = True
         self.reconnect_delay: float = 2.0
         self.max_reconnect_delay: float = 60.0
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
 
     async def connect(
         self,
@@ -677,53 +678,62 @@ class TunnelAgent:
         if not self.should_reconnect:
             return
 
-        if not immediate:
-            logger.info(f"Attempting reconnect in {self.reconnect_delay}s...")
-            await asyncio.sleep(self.reconnect_delay)
-            # Exponential backoff
-            self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-        else:
-            logger.info("Attempting immediate reconnect...")
+        # Prevent concurrent reconnection attempts
+        if self._reconnect_lock.locked():
+            logger.debug("Reconnection already in progress, skipping")
+            return
 
-        try:
-            # Decide whether to try WebRTC or fall back to relay
-            if self.webrtc_attempts < self.max_webrtc_attempts:
-                logger.info(
-                    f"Attempting WebRTC connection "
-                    f"(attempt {self.webrtc_attempts + 1}/{self.max_webrtc_attempts})"
-                )
-                self.webrtc_attempts += 1
-
-                # Clean up old WebRTC state (but preserve connection parameters)
-                await self._reset_webrtc_state()
-
-                # Try WebRTC with timeout
-                try:
-                    await asyncio.wait_for(
-                        self._reconnect_full(),
-                        timeout=self.webrtc_timeout
-                    )
-
-                    # Reset attempts on successful WebRTC connection
-                    self.webrtc_attempts = 0
-                    self.connection_mode = "webrtc"
-
-                    # Reset delay on successful reconnect
-                    self.reconnect_delay = 2.0
-
-                except TimeoutError:
-                    logger.warning(f"WebRTC connection timeout after {self.webrtc_timeout}s")
-                    # Will retry or fall back to relay
-                    await self._handle_reconnect(immediate=False)
-
+        async with self._reconnect_lock:
+            if not immediate:
+                logger.info(f"Attempting reconnect in {self.reconnect_delay}s...")
+                await asyncio.sleep(self.reconnect_delay)
+                # Exponential backoff
+                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
             else:
-                # Fall back to relay after max WebRTC attempts
-                logger.info("Max WebRTC attempts reached, falling back to relay")
-                await self._try_relay_fallback()
+                logger.info("Attempting immediate reconnect...")
 
-        except Exception as e:
-            logger.error(f"Reconnect failed: {e}")
-            await self._handle_reconnect(immediate=False)
+            try:
+                # Decide whether to try WebRTC or fall back to relay
+                if self.webrtc_attempts < self.max_webrtc_attempts:
+                    logger.info(
+                        f"Attempting WebRTC connection "
+                        f"(attempt {self.webrtc_attempts + 1}/{self.max_webrtc_attempts})"
+                    )
+                    self.webrtc_attempts += 1
+
+                    # Clean up old WebRTC state (but preserve connection parameters)
+                    await self._reset_webrtc_state()
+
+                    # Try WebRTC with timeout
+                    try:
+                        await asyncio.wait_for(
+                            self._reconnect_full(),
+                            timeout=self.webrtc_timeout
+                        )
+
+                        # Reset attempts on successful WebRTC connection
+                        self.webrtc_attempts = 0
+                        self.connection_mode = "webrtc"
+
+                        # Reset delay on successful reconnect
+                        self.reconnect_delay = 2.0
+
+                    except TimeoutError:
+                        logger.warning(f"WebRTC connection timeout after {self.webrtc_timeout}s")
+                        # Will retry or fall back to relay (release lock first via recursion guard)
+
+                else:
+                    # Fall back to relay after max WebRTC attempts
+                    logger.info("Max WebRTC attempts reached, falling back to relay")
+                    await self._try_relay_fallback()
+
+            except Exception as e:
+                logger.error(f"Reconnect failed: {e}")
+
+        # Handle retry outside the lock to avoid deadlock
+        if self.webrtc_attempts > 0 and self.webrtc_attempts < self.max_webrtc_attempts:
+            # Schedule next retry if we haven't exhausted attempts
+            asyncio.create_task(self._handle_reconnect(immediate=False))
 
     async def _reset_webrtc_state(self) -> None:
         """Reset WebRTC state (PeerConnection, DataChannel) without disconnecting signaling.

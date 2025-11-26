@@ -33,6 +33,7 @@ interface UseWebRTCOptions {
   targetDeviceId: string
   autoConnect?: boolean
   relayUrl?: string
+  iceServers?: RTCIceServer[]
 }
 
 /**
@@ -96,16 +97,17 @@ export function useWebRTC(options: UseWebRTCOptions) {
       token: options.token,
       deviceId: options.deviceId,
       targetDeviceId: options.targetDeviceId,
+      iceServers: options.iceServers,
       onStateChange: (state) => {
         setConnectionState(state)
 
-        // Handle WebRTC failure - fall back to relay after 3 attempts
+        // Handle WebRTC failure - fall back to relay after 2 attempts (faster fallback)
         if (state === 'failed' && !isRelayFallbackRef.current) {
           webrtcFailureCountRef.current++
           console.log(`[useWebRTC] WebRTC failure count: ${webrtcFailureCountRef.current}`)
 
-          if (webrtcFailureCountRef.current >= 3) {
-            console.log('[useWebRTC] WebRTC failed 3 times, falling back to relay')
+          if (webrtcFailureCountRef.current >= 2) {
+            console.log('[useWebRTC] WebRTC failed 2 times, falling back to relay')
             isRelayFallbackRef.current = true
 
             // Stop WebRTC reconnection but keep signaling WebSocket open
@@ -267,7 +269,7 @@ export function useWebRTC(options: UseWebRTCOptions) {
         relayClientRef.current.disconnect()
       }
     }
-  }, [options.signalUrl, options.token, options.deviceId, options.targetDeviceId, options.relayUrl])
+  }, [options.signalUrl, options.token, options.deviceId, options.targetDeviceId, options.relayUrl, options.iceServers])
 
   // Auto-connect if enabled
   useEffect(() => {

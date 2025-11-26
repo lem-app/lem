@@ -117,12 +117,22 @@ export interface ICECandidateMessage extends BaseSignalingMessage {
 }
 
 /**
+ * ICE server configuration from signaling server.
+ */
+export interface ICEServerConfig {
+  urls: string | string[]
+  username?: string
+  credential?: string
+}
+
+/**
  * Connection confirmation message.
  */
 export interface ConnectedMessage extends BaseSignalingMessage {
   type: 'connected'
   device_id: string
   message: string
+  ice_servers?: ICEServerConfig[]
 }
 
 /**

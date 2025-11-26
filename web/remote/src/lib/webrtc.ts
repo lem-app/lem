@@ -80,9 +80,12 @@ export class WebRTCConnectionManager {
   private reconnectDelay = 2000
   private maxReconnectDelay = 60000
 
-  // Connection timeout (15s as per spec)
+  // Connection timeout (10s for faster relay fallback)
   private connectionTimeout: number | null = null
-  private readonly CONNECTION_TIMEOUT_MS = 15000
+  private readonly CONNECTION_TIMEOUT_MS = 10000
+
+  // ICE restart tracking (prevent infinite restart loops)
+  private iceRestartAttempted = false
 
   // Connection request/ack handling
   private connectAckPromise: {
@@ -114,9 +117,16 @@ export class WebRTCConnectionManager {
         throw new Error('RTCPeerConnection not available (WebRTC may be blocked)')
       }
 
-      // Create RTCPeerConnection
+      // Connect to signaling server first to receive ICE servers
+      const serverIceServers = await this.connectSignaling()
+
+      // Use server-provided ICE servers if available, otherwise use configured/default
+      const effectiveIceServers = serverIceServers.length > 0 ? serverIceServers : this.iceServers
+      console.log('[WebRTC] Using ICE servers:', effectiveIceServers)
+
+      // Create RTCPeerConnection with effective ICE servers
       this.pc = new RTCPeerConnection({
-        iceServers: this.iceServers,
+        iceServers: effectiveIceServers,
       })
 
       // Set up connection state handler
@@ -129,6 +139,8 @@ export class WebRTCConnectionManager {
           case 'connected':
             this.clearConnectionTimeout()
             this.setState('connected')
+            // Reset ICE restart flag on successful connection
+            this.iceRestartAttempted = false
             break
           case 'failed':
             this.clearConnectionTimeout()
@@ -142,6 +154,19 @@ export class WebRTCConnectionManager {
           case 'disconnected':
             this.setState('disconnected')
             break
+        }
+      }
+
+      // Set up ICE connection state handler for better diagnostics
+      this.pc.oniceconnectionstatechange = () => {
+        if (!this.pc) return
+
+        console.log('[WebRTC] ICE connection state:', this.pc.iceConnectionState)
+
+        // If ICE specifically fails but connection hasn't failed yet, try ICE restart
+        if (this.pc.iceConnectionState === 'failed' && !this.iceRestartAttempted) {
+          console.log('[WebRTC] ICE connection failed, attempting ICE restart')
+          this.attemptIceRestart()
         }
       }
 
@@ -174,13 +199,10 @@ export class WebRTCConnectionManager {
       this.dataChannel = this.pc.createDataChannel('http-proxy')
       this.setupDataChannel(this.dataChannel)
 
-      // Connect to signaling server
-      await this.connectSignaling()
-
       // Create and send offer
       await this.createAndSendOffer()
 
-      // Start connection timeout (15s)
+      // Start connection timeout (10s)
       this.startConnectionTimeout()
     } catch (error) {
       this.clearConnectionTimeout()
@@ -198,6 +220,7 @@ export class WebRTCConnectionManager {
   async connectSignalingOnly(): Promise<void> {
     this.setState('connecting')
     try {
+      // We don't use ICE servers in signaling-only mode (relay fallback)
       await this.connectSignaling()
       console.log('[WebRTC] Connected to signaling server only (no WebRTC)')
     } catch (error) {
@@ -360,30 +383,59 @@ export class WebRTCConnectionManager {
 
   /**
    * Connect to signaling server via WebSocket.
+   * @returns ICE servers from the connected message (empty array if not provided)
    */
-  private async connectSignaling(): Promise<void> {
+  private async connectSignaling(): Promise<RTCIceServer[]> {
     return new Promise((resolve, reject) => {
       const wsUrl = `${this.signalUrl}?token=${this.token}&device_id=${this.deviceId}`
       this.ws = new WebSocket(wsUrl)
+      let resolved = false
 
       this.ws.onopen = () => {
         console.log('[Signaling] Connected to signaling server')
-        resolve()
+        // Don't resolve yet - wait for "connected" message with ICE servers
       }
 
       this.ws.onerror = (event) => {
         console.error('[Signaling] WebSocket error:', event)
-        reject(new Error('WebSocket connection failed'))
+        if (!resolved) {
+          resolved = true
+          reject(new Error('WebSocket connection failed'))
+        }
       }
 
       this.ws.onclose = () => {
         console.log('[Signaling] WebSocket closed')
+        if (!resolved) {
+          resolved = true
+          reject(new Error('WebSocket closed before connected'))
+        }
         this.handleReconnect()
       }
 
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as ReceivedSignalingMessage
+
+          // Check for "connected" message to extract ICE servers
+          if (message.type === 'connected' && !resolved) {
+            resolved = true
+            const iceServers: RTCIceServer[] = []
+
+            // Extract ICE servers from the connected message if available
+            if ('ice_servers' in message && Array.isArray(message.ice_servers)) {
+              for (const server of message.ice_servers) {
+                if (server && typeof server === 'object' && 'urls' in server) {
+                  iceServers.push(server as RTCIceServer)
+                }
+              }
+            }
+
+            console.log('[Signaling] Received ICE servers from server:', iceServers.length)
+            resolve(iceServers)
+          }
+
+          // Process all messages (including the connected one for logging)
           this.processSignalingMessage(message)
         } catch (error) {
           console.error('[Signaling] Failed to parse message:', error)
@@ -532,17 +584,24 @@ export class WebRTCConnectionManager {
     sdpMLineIndex: number | null
   }): Promise<void> {
     if (!this.pc) {
-      throw new Error('Peer connection not initialized')
+      console.warn('[WebRTC] Cannot add ICE candidate: no peer connection')
+      return
     }
 
-    const candidate = new RTCIceCandidate({
-      candidate: payload.candidate,
-      sdpMid: payload.sdpMid,
-      sdpMLineIndex: payload.sdpMLineIndex,
-    })
+    try {
+      const candidate = new RTCIceCandidate({
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid,
+        sdpMLineIndex: payload.sdpMLineIndex,
+      })
 
-    await this.pc.addIceCandidate(candidate)
-    console.log('[WebRTC] Added ICE candidate')
+      await this.pc.addIceCandidate(candidate)
+      console.log('[WebRTC] Added ICE candidate')
+    } catch (error) {
+      // Don't throw - bad candidates shouldn't crash the connection
+      // This can happen with malformed SDP or candidates arriving after connection is closed
+      console.warn('[WebRTC] Failed to add ICE candidate:', error)
+    }
   }
 
   /**
@@ -630,11 +689,49 @@ export class WebRTCConnectionManager {
   }
 
   /**
+   * Attempt ICE restart when ICE connection fails.
+   * Creates a new offer with iceRestart flag to re-gather candidates.
+   */
+  private async attemptIceRestart(): Promise<void> {
+    if (!this.pc || this.iceRestartAttempted) {
+      return
+    }
+
+    this.iceRestartAttempted = true
+
+    try {
+      console.log('[WebRTC] Creating ICE restart offer')
+      const offer = await this.pc.createOffer({ iceRestart: true })
+      await this.pc.setLocalDescription(offer)
+
+      // Send the new offer to peer
+      const message: OfferMessage = {
+        type: 'offer',
+        target_device_id: this.targetDeviceId,
+        payload: {
+          sdp: offer.sdp!,
+          type: 'offer',
+        },
+      }
+
+      this.sendSignalingMessage(message)
+      console.log('[WebRTC] ICE restart offer sent')
+    } catch (error) {
+      console.error('[WebRTC] ICE restart failed:', error)
+      // If ICE restart fails, fall back to full reconnection
+      this.handleReconnect()
+    }
+  }
+
+  /**
    * Clean up WebRTC resources (PeerConnection, DataChannel) without closing WebSocket.
    */
   private cleanupWebRTC(): void {
     // Clear connection timeout
     this.clearConnectionTimeout()
+
+    // Reset ICE restart flag for next connection attempt
+    this.iceRestartAttempted = false
 
     // Close DataChannel
     if (this.dataChannel) {
@@ -652,14 +749,14 @@ export class WebRTCConnectionManager {
   }
 
   /**
-   * Start connection timeout (15s).
+   * Start connection timeout (10s).
    * If connection doesn't succeed within timeout, trigger failure.
    */
   private startConnectionTimeout(): void {
     this.clearConnectionTimeout()
 
     this.connectionTimeout = window.setTimeout(() => {
-      console.warn('[WebRTC] Connection timeout after 15s')
+      console.warn('[WebRTC] Connection timeout after 10s')
 
       if (this.state !== 'connected') {
         this.setState('failed')
@@ -667,7 +764,7 @@ export class WebRTCConnectionManager {
       }
     }, this.CONNECTION_TIMEOUT_MS)
 
-    console.log('[WebRTC] Started 15s connection timeout')
+    console.log('[WebRTC] Started 10s connection timeout')
   }
 
   /**
