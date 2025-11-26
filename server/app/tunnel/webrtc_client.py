@@ -441,12 +441,19 @@ class TunnelAgent:
         if self.ws_session and not self.ws_session.closed:
             await self.ws_session.close()
 
-        # Create WebSocket connection
+        # Create WebSocket connection (without token in URL for security)
         self.ws_session = aiohttp.ClientSession()
-        url = f"{self.signal_url}?token={self.token}&device_id={self.device_id}"
 
         try:
-            self.ws = await self.ws_session.ws_connect(url)
+            self.ws = await self.ws_session.ws_connect(self.signal_url)
+
+            # Send auth message instead of passing token in URL
+            auth_message = {
+                "type": "auth",
+                "token": self.token,
+                "device_id": self.device_id,
+            }
+            await self.ws.send_json(auth_message)
             logger.info(f"Connected to signaling server: {self.signal_url}")
 
             # Start message handling loop

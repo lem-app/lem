@@ -387,12 +387,22 @@ export class WebRTCConnectionManager {
    */
   private async connectSignaling(): Promise<RTCIceServer[]> {
     return new Promise((resolve, reject) => {
-      const wsUrl = `${this.signalUrl}?token=${this.token}&device_id=${this.deviceId}`
-      this.ws = new WebSocket(wsUrl)
+      // Connect without token in URL (more secure)
+      this.ws = new WebSocket(this.signalUrl)
       let resolved = false
 
       this.ws.onopen = () => {
-        console.log('[Signaling] Connected to signaling server')
+        console.log('[Signaling] Connected, sending auth message')
+        // Send auth message instead of passing token in URL
+        if (this.ws) {
+          this.ws.send(
+            JSON.stringify({
+              type: 'auth',
+              token: this.token,
+              device_id: this.deviceId,
+            })
+          )
+        }
         // Don't resolve yet - wait for "connected" message with ICE servers
       }
 

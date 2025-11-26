@@ -69,6 +69,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS device (
                 id TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
+                privkey TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -155,12 +156,15 @@ def delete_setting(key: str) -> None:
 class Device:
     """Device record."""
 
-    def __init__(self, id: str, pubkey: str, created_at: datetime):
+    def __init__(
+        self, id: str, pubkey: str, created_at: datetime, privkey: str | None = None
+    ):
         self.id = id
         self.pubkey = pubkey
+        self.privkey = privkey
         self.created_at = created_at
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, str | None]:
         """Convert to dictionary."""
         return {
             "id": self.id,
@@ -177,7 +181,9 @@ def get_device() -> Device | None:
         Device or None if not registered
     """
     with get_db() as conn:
-        cursor = conn.execute("SELECT id, pubkey, created_at FROM device LIMIT 1")
+        cursor = conn.execute(
+            "SELECT id, pubkey, privkey, created_at FROM device LIMIT 1"
+        )
         row = cursor.fetchone()
         if not row:
             return None
@@ -185,17 +191,21 @@ def get_device() -> Device | None:
         return Device(
             id=row["id"],
             pubkey=row["pubkey"],
+            privkey=row["privkey"],
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
 
-def register_device(device_id: str, pubkey: str) -> Device:
+def register_device(
+    device_id: str, pubkey: str, privkey: str | None = None
+) -> Device:
     """
     Register this device (insert or replace).
 
     Args:
         device_id: Unique device ID
-        pubkey: Ed25519 public key (hex or base64)
+        pubkey: Ed25519 public key (base64 encoded)
+        privkey: Ed25519 private key (base64 encoded, optional)
 
     Returns:
         Device record
@@ -211,12 +221,14 @@ def register_device(device_id: str, pubkey: str) -> Device:
             # Insert new device
             created_at = datetime.utcnow()
             conn.execute(
-                "INSERT INTO device (id, pubkey, created_at) VALUES (?, ?, ?)",
-                (device_id, pubkey, created_at.isoformat()),
+                "INSERT INTO device (id, pubkey, privkey, created_at) VALUES (?, ?, ?, ?)",
+                (device_id, pubkey, privkey, created_at.isoformat()),
             )
             conn.commit()
 
-            return Device(id=device_id, pubkey=pubkey, created_at=created_at)
+            return Device(
+                id=device_id, pubkey=pubkey, privkey=privkey, created_at=created_at
+            )
     except sqlite3.Error as e:
         raise DatabaseError(f"Failed to register device: {e}") from e
 

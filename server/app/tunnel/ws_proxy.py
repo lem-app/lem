@@ -131,7 +131,7 @@ class WSProxyHandler:
             ws = await self.session.ws_connect(
                 ws_url,
                 headers=frame["headers"],
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
             )
 
             # Store connection
@@ -257,7 +257,7 @@ class WSProxyHandler:
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     # Binary message
-                    data_frame: WSDataFrame = {
+                    data_frame = {
                         "connection_id": conn_id,
                         "opcode": WSOpcode.BINARY,
                         "payload": msg.data,
@@ -268,7 +268,7 @@ class WSProxyHandler:
 
                 elif msg.type == aiohttp.WSMsgType.PING:
                     # Ping (relay as data)
-                    data_frame: WSDataFrame = {
+                    data_frame = {
                         "connection_id": conn_id,
                         "opcode": WSOpcode.PING,
                         "payload": msg.data,
@@ -279,7 +279,7 @@ class WSProxyHandler:
 
                 elif msg.type == aiohttp.WSMsgType.PONG:
                     # Pong (relay as data)
-                    data_frame: WSDataFrame = {
+                    data_frame = {
                         "connection_id": conn_id,
                         "opcode": WSOpcode.PONG,
                         "payload": msg.data,
@@ -303,7 +303,7 @@ class WSProxyHandler:
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     # Error
                     logger.error(f"WebSocket {conn_id}: Error from upstream")
-                    close_frame: WSCloseFrame = {
+                    close_frame = {
                         "connection_id": conn_id,
                         "close_code": 1006,  # Abnormal closure
                         "reason": "Upstream error",
@@ -318,7 +318,7 @@ class WSProxyHandler:
             logger.error(f"WebSocket {conn_id}: Relay error: {e}")
             # Send close frame on error
             try:
-                close_frame: WSCloseFrame = {
+                close_frame = {
                     "connection_id": conn_id,
                     "close_code": 1006,
                     "reason": f"Relay error: {str(e)}",

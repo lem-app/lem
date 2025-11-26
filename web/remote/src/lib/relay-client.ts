@@ -149,8 +149,8 @@ export class RelayClient {
    */
   private async connectRelay(): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Build WebSocket URL: ws://localhost:8001/relay/{session_id}?token={jwt}
-      const wsUrl = `${this.relayUrl}/relay/${this.sessionId}?token=${this.token}`
+      // Connect without token in URL (more secure)
+      const wsUrl = `${this.relayUrl}/relay/${this.sessionId}`
 
       console.log(`[RelayClient] Connecting to relay server: ${wsUrl}`)
 
@@ -158,7 +158,11 @@ export class RelayClient {
       this.ws.binaryType = 'arraybuffer'
 
       this.ws.onopen = () => {
-        console.log('[RelayClient] Connected to relay server')
+        console.log('[RelayClient] Connected, sending auth message')
+        // Send auth message instead of passing token in URL
+        if (this.ws) {
+          this.ws.send(JSON.stringify({ type: 'auth', token: this.token }))
+        }
         this.setState('connected')
         resolve()
       }
