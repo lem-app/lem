@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2025 Lem
 #
-# Launch local server and web dashboard for testing against AWS infrastructure
+# Launch local server and web dashboard for testing against AWS infrastructure.
+# Overrides VITE_DEFAULT_SIGNALING_URL to point at cloud services.
+#
+# For fully local development, use launch_servers.sh instead.
 
 set -e
 

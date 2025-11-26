@@ -18,7 +18,7 @@ SQLite database for Lem v0.1.
 
 Schema:
 - settings(key TEXT PRIMARY KEY, value TEXT)
-- device(id TEXT PRIMARY KEY, pubkey TEXT, created_at TIMESTAMP)
+- device(id TEXT PRIMARY KEY, pubkey TEXT, privkey TEXT, created_at TIMESTAMP)
 - auth(state_json TEXT)
 
 Requirements:
