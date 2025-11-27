@@ -360,11 +360,11 @@ uv run mypy server/              # Type check
 uv run ruff format server/       # Format
 uv run ruff check server/        # Lint
 
-# TypeScript (web/local/)
+# TypeScript (web/local/ or web/remote/)
 pnpm install                     # Install deps
 pnpm add react                   # Add dependency
-pnpm run dev                     # Dev server
-pnpm vitest                      # Run tests
+pnpm run dev                     # Dev server (local: 5174, remote: 5173)
+pnpm test                        # Run tests (vitest, remote only)
 pnpm tsc --noEmit                # Type check
 pnpm prettier --write .          # Format
 pnpm eslint .                    # Lint

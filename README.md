@@ -26,7 +26,7 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 
 - **Docker** and Docker Compose
 - **Python 3.11+** (recommended: [uv](https://github.com/astral-sh/uv))
-- **Node.js 18+** and [pnpm](https://pnpm.io/)
+- **[Node.js](https://nodejs.org/) 20+** and [pnpm](https://pnpm.io/)
 
 ### Quick Start
 
@@ -50,12 +50,13 @@ Open http://localhost:5174 in your browser.
 
 ## 🏗️ Architecture
 
-Lem consists of four main components:
+Lem consists of five main components:
 
 1. **Local Server** (`/server`): FastAPI server running on your machine (port 5142)
 2. **Local Dashboard** (`/web/local`): React web UI for managing local services
-3. **Cloud Signaling** (`/cloud/signaling`): WebRTC signaling for P2P connections
-4. **Cloud Relay** (`/cloud/relay`): Fallback relay for restricted networks
+3. **Remote Dashboard** (`/web/remote`): React web app for accessing your local AI remotely
+4. **Cloud Signaling** (`/cloud/signaling`): WebRTC signaling for P2P connections
+5. **Cloud Relay** (`/cloud/relay`): Fallback relay for restricted networks
 
 
 ## 🔐 Security
