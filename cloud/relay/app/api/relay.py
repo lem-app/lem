@@ -78,7 +78,7 @@ async def relay_websocket(
 
                 auth_token = auth_msg.get("token")
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"Session {session_id}: Auth timeout")
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return

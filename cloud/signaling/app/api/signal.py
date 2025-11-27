@@ -42,12 +42,14 @@ class ConnectionManager:
         # Lock to prevent race conditions during connect/disconnect
         self._lock = asyncio.Lock()
 
-    async def connect(self, device_id: str, websocket: WebSocket) -> None:
-        """Connect a device.
+    async def register(self, device_id: str, websocket: WebSocket) -> None:
+        """Register an already-accepted WebSocket connection for a device.
+
+        Closes any existing connection for this device before registering.
 
         Args:
             device_id: Device identifier.
-            websocket: WebSocket connection.
+            websocket: Already-accepted WebSocket connection.
         """
         async with self._lock:
             # Close existing connection if any
@@ -59,7 +61,6 @@ class ConnectionManager:
                 except Exception as e:
                     logger.warning(f"Error closing old connection: {e}")
 
-            await websocket.accept()
             self.active_connections[device_id] = websocket
             logger.info(f"Device {device_id} connected to signaling server")
 
@@ -205,7 +206,7 @@ async def websocket_signal_endpoint(
                         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                         return
 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Auth timeout - no auth message received")
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
@@ -232,18 +233,7 @@ async def websocket_signal_endpoint(
                 return
 
             # Register connection (websocket already accepted)
-            async with manager._lock:
-                # Close existing connection if any
-                if verified_device_id in manager.active_connections:
-                    old_ws = manager.active_connections[verified_device_id]
-                    logger.info(f"Closing existing connection for device {verified_device_id}")
-                    try:
-                        await old_ws.close(code=status.WS_1008_POLICY_VIOLATION)
-                    except Exception as e:
-                        logger.warning(f"Error closing old connection: {e}")
-
-                manager.active_connections[verified_device_id] = websocket
-                logger.info(f"Device {verified_device_id} connected to signaling server")
+            await manager.register(verified_device_id, websocket)
 
             # Send connection confirmation with ICE servers configuration
             await websocket.send_json(
@@ -343,11 +333,13 @@ async def websocket_signal_endpoint(
                     await websocket.send_json({"type": "error", "message": "Internal error"})
 
         except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected for device {device_id}")
+            disconnect_id = verified_device_id or auth_device_id or "unknown"
+            logger.info(f"WebSocket disconnected for device {disconnect_id}")
         except Exception as e:
             logger.error(f"Unexpected error in WebSocket handler: {e}")
         finally:
-            # Clean up connection manager - use verified_device_id if available
-            cleanup_device_id = verified_device_id if verified_device_id else device_id
-            await manager.disconnect(cleanup_device_id)
+            # Clean up connection manager - only if we have a valid device_id
+            cleanup_device_id = verified_device_id or auth_device_id
+            if cleanup_device_id:
+                await manager.disconnect(cleanup_device_id)
             # Note: db_conn cleanup happens automatically via the async for context

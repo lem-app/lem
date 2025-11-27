@@ -22,7 +22,7 @@ and manage local auth state for TunnelAgent integration.
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, status
