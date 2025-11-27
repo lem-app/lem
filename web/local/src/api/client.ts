@@ -33,16 +33,23 @@ import type {
   AuthStatus,
 } from './types';
 
-const API_BASE_URL = 'http://127.0.0.1:5142';
+// Use relative URLs - Vite dev server proxies /v1/* to the backend
+// For production builds, set VITE_API_URL to the full backend URL
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 class ApiError extends Error {
+  status: number;
+  problemDetails?: ProblemDetails;
+
   constructor(
     message: string,
-    public status: number,
-    public problemDetails?: ProblemDetails
+    status: number,
+    problemDetails?: ProblemDetails
   ) {
     super(message);
     this.name = 'ApiError';
+    this.status = status;
+    this.problemDetails = problemDetails;
   }
 }
 

@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "format": "prettier --write .",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -40,6 +41,7 @@
     "tailwindcss": "^4.1.17",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.45.0",
+    "prettier": "^3.5.3",
     "vite": "^7.1.7"
   }
 }
