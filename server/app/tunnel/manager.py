@@ -22,10 +22,15 @@ Manages the lifecycle of TunnelAgent, including:
 - Auto-stop on logout
 - Graceful shutdown
 - Status reporting
+
+Environment variables:
+- LEM_SIGNAL_URL: Expected signaling URL. If set and differs from stored auth,
+  raises RuntimeError to prevent using stale credentials against wrong server.
 """
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from app.db import get_auth_state
@@ -83,7 +88,18 @@ class TunnelManager:
             self.agent.on_state_change = on_state_change
 
             # Build WebSocket signaling URL
-            signal_url = auth_state.signaling_url.replace("http://", "ws://").replace("https://", "wss://")
+            # Allow env var override for testing against different environments
+            env_signal_url = os.environ.get("LEM_SIGNAL_URL")
+            if env_signal_url and env_signal_url != auth_state.signaling_url:
+                # URL mismatch - stored token won't work with different server
+                raise RuntimeError(
+                    f"LEM_SIGNAL_URL ({env_signal_url}) doesn't match stored auth "
+                    f"({auth_state.signaling_url}). Logout and re-login, or run: "
+                    f"sqlite3 ~/.lem/lem.db 'DELETE FROM auth'"
+                )
+
+            base_url = env_signal_url or auth_state.signaling_url
+            signal_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
             if not signal_url.endswith("/signal"):
                 signal_url = f"{signal_url}/signal"
 
