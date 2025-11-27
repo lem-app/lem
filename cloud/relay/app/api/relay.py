@@ -15,6 +15,8 @@
 
 """WebSocket relay endpoint."""
 
+import asyncio
+import json
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
@@ -28,30 +30,77 @@ router = APIRouter(prefix="/relay", tags=["relay"])
 
 
 @router.websocket("/{session_id}")
-async def relay_websocket(websocket: WebSocket, session_id: str, token: str | None = None) -> None:
+async def relay_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    token: str | None = None,
+) -> None:
     """WebSocket relay endpoint.
 
     Connects two WebSocket clients via a relay session. Frames from one client
     are forwarded to the other bidirectionally.
 
+    Authentication can be provided via:
+    1. Query parameter (deprecated, token visible in logs)
+    2. First message with type "auth" (preferred, more secure)
+
     Args:
         websocket: WebSocket connection.
         session_id: Unique session identifier (shared by both clients).
-        token: JWT access token for authentication (query parameter).
+        token: JWT access token for authentication (optional, deprecated).
 
     Raises:
         HTTPException: If authentication fails.
     """
-    # Validate JWT token
-    if token is None or not validate_token(token):
-        logger.warning(f"Session {session_id}: Authentication failed")
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
-        return
+    auth_token: str | None = token
 
-    logger.info(f"Session {session_id}: WebSocket connection request")
-
-    # Accept the WebSocket connection
+    # Accept connection first (auth can happen after)
     await websocket.accept()
+
+    # If no token in query params, wait for auth message
+    if auth_token is None or not validate_token(auth_token):
+        if auth_token is None:
+            try:
+                # Wait for auth message with 10 second timeout
+                auth_data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=10.0
+                )
+                auth_msg = json.loads(auth_data)
+
+                if auth_msg.get("type") != "auth":
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "First message must be auth message"
+                    })
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+
+                auth_token = auth_msg.get("token")
+
+            except TimeoutError:
+                logger.warning(f"Session {session_id}: Auth timeout")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            except json.JSONDecodeError:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid JSON in auth message"
+                })
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
+        # Validate the token
+        if auth_token is None or not validate_token(auth_token):
+            logger.warning(f"Session {session_id}: Authentication failed")
+            await websocket.send_json({
+                "type": "error",
+                "message": "Authentication failed"
+            })
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+    logger.info(f"Session {session_id}: WebSocket connection authenticated")
 
     try:
         # Get or create session

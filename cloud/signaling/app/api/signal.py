@@ -42,12 +42,14 @@ class ConnectionManager:
         # Lock to prevent race conditions during connect/disconnect
         self._lock = asyncio.Lock()
 
-    async def connect(self, device_id: str, websocket: WebSocket) -> None:
-        """Connect a device.
+    async def register(self, device_id: str, websocket: WebSocket) -> None:
+        """Register an already-accepted WebSocket connection for a device.
+
+        Closes any existing connection for this device before registering.
 
         Args:
             device_id: Device identifier.
-            websocket: WebSocket connection.
+            websocket: Already-accepted WebSocket connection.
         """
         async with self._lock:
             # Close existing connection if any
@@ -59,7 +61,6 @@ class ConnectionManager:
                 except Exception as e:
                     logger.warning(f"Error closing old connection: {e}")
 
-            await websocket.accept()
             self.active_connections[device_id] = websocket
             logger.info(f"Device {device_id} connected to signaling server")
 
@@ -149,141 +150,196 @@ async def verify_token_and_device(
 @router.websocket("/signal")
 async def websocket_signal_endpoint(
     websocket: WebSocket,
-    token: str = Query(..., description="JWT access token"),
-    device_id: str = Query(..., description="Device ID"),
+    token: str | None = Query(None, description="JWT access token (deprecated, use auth message)"),
+    device_id: str | None = Query(None, description="Device ID (deprecated, use auth message)"),
 ) -> None:
     """WebSocket endpoint for WebRTC signaling.
 
     Handles SDP/ICE message exchange between peers.
 
+    Authentication can be provided via:
+    1. Query parameters (deprecated, token visible in logs)
+    2. First message with type "auth" (preferred, more secure)
+
     Args:
         websocket: WebSocket connection.
-        token: JWT access token.
-        device_id: Device identifier.
+        token: JWT access token (optional, deprecated).
+        device_id: Device identifier (optional, deprecated).
     """
-    db_conn: aiosqlite.Connection | None = None
+    verified_device_id: str | None = None
+    auth_token: str | None = token
+    auth_device_id: str | None = device_id
 
-    try:
-        # Get database connection
-        db_gen = get_db()
-        db_conn = await db_gen.__anext__()
+    # Accept connection first (auth happens after)
+    await websocket.accept()
 
-        # Verify token and device
+    # Use async for to properly manage the database connection lifecycle
+    # The generator yields once and cleanup happens automatically when we exit
+    async for db_conn in get_db():
         try:
-            user_id, verified_device_id = await verify_token_and_device(
-                token, device_id, db_conn
-            )
-        except ValueError as e:
-            logger.warning(f"Authentication failed: {e}")
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
+            # If no token in query params, wait for auth message
+            if not auth_token or not auth_device_id:
+                try:
+                    # Wait for auth message with 10 second timeout
+                    auth_data = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=10.0
+                    )
+                    auth_msg = json.loads(auth_data)
 
-        # Connect the device
-        await manager.connect(verified_device_id, websocket)
+                    if auth_msg.get("type") != "auth":
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "First message must be auth message"
+                        })
+                        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        return
 
-        # Send connection confirmation with ICE servers configuration
-        await websocket.send_json(
-            {
-                "type": "connected",
-                "device_id": verified_device_id,
-                "message": "Connected to signaling server",
-                "ice_servers": settings.ice_servers,
-            }
-        )
+                    auth_token = auth_msg.get("token")
+                    auth_device_id = auth_msg.get("device_id")
 
-        # Handle incoming messages
-        while True:
-            data = await websocket.receive_text()
+                    if not auth_token or not auth_device_id:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Auth message missing token or device_id"
+                        })
+                        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        return
 
+                except TimeoutError:
+                    logger.warning("Auth timeout - no auth message received")
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+                except json.JSONDecodeError:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Invalid JSON in auth message"
+                    })
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+
+            # Verify token and device
             try:
-                message: dict[str, Any] = json.loads(data)
-
-                # Validate message structure
-                if "type" not in message or "target_device_id" not in message:
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "message": "Invalid message format: missing type or target_device_id",
-                        }
-                    )
-                    continue
-
-                # Check payload size (64 KB limit as per architecture)
-                if len(data) > 64 * 1024:
-                    await websocket.send_json(
-                        {"type": "error", "message": "Message exceeds 64 KB limit"}
-                    )
-                    continue
-
-                target_device_id: str = message["target_device_id"]
-                msg_type: str = message["type"]
-
-                # Handle relay coordination messages
-                if msg_type == "connect-request":
-                    # Transform to connect-request-received
-                    notification = {
-                        "type": "connect-request-received",
-                        "from_device_id": verified_device_id,
-                        "preferred_transport": message.get("preferred_transport", "auto"),
-                        "relay_session_id": message.get("relay_session_id"),
-                        "relay_url": settings.relay_url,
-                    }
-                    success = await manager.send_message(target_device_id, notification)
-
-                elif msg_type == "connect-ack":
-                    # Transform to connect-ack-received
-                    notification = {
-                        "type": "connect-ack-received",
-                        "from_device_id": verified_device_id,
-                        "transport": message.get("transport"),
-                        "relay_session_id": message.get("relay_session_id"),
-                        "status": message.get("status"),
-                    }
-                    success = await manager.send_message(target_device_id, notification)
-
-                else:
-                    # Generic message routing (WebRTC signaling, etc.)
-                    # Add sender information
-                    message["sender_device_id"] = verified_device_id
-                    # Route message to target device
-                    success = await manager.send_message(target_device_id, message)
-
-                if success:
-                    logger.info(
-                        f"Routed {message['type']} from {verified_device_id} to {target_device_id}"
-                    )
-                    # Send acknowledgment
-                    await websocket.send_json(
-                        {
-                            "type": "ack",
-                            "message": f"Message delivered to {target_device_id}",
-                        }
-                    )
-                else:
-                    logger.warning(
-                        f"Target device {target_device_id} not connected"
-                    )
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "message": f"Target device {target_device_id} not connected",
-                        }
-                    )
-
-            except json.JSONDecodeError:
-                await websocket.send_json(
-                    {"type": "error", "message": "Invalid JSON format"}
+                user_id, verified_device_id = await verify_token_and_device(
+                    auth_token, auth_device_id, db_conn
                 )
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-                await websocket.send_json({"type": "error", "message": "Internal error"})
+            except ValueError as e:
+                logger.warning(f"Authentication failed: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Authentication failed"
+                })
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
 
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for device {device_id}")
-    except Exception as e:
-        logger.error(f"Unexpected error in WebSocket handler: {e}")
-    finally:
-        # Clean up
-        await manager.disconnect(device_id)
-        if db_conn:
-            await db_conn.close()
+            # Register connection (websocket already accepted)
+            await manager.register(verified_device_id, websocket)
+
+            # Send connection confirmation with ICE servers configuration
+            await websocket.send_json(
+                {
+                    "type": "connected",
+                    "device_id": verified_device_id,
+                    "message": "Connected to signaling server",
+                    "ice_servers": settings.ice_servers,
+                }
+            )
+
+            # Handle incoming messages
+            while True:
+                data = await websocket.receive_text()
+
+                try:
+                    message: dict[str, Any] = json.loads(data)
+
+                    # Validate message structure
+                    if "type" not in message or "target_device_id" not in message:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "message": "Invalid message format: missing type or target_device_id",
+                            }
+                        )
+                        continue
+
+                    # Check payload size (64 KB limit as per architecture)
+                    if len(data) > 64 * 1024:
+                        await websocket.send_json(
+                            {"type": "error", "message": "Message exceeds 64 KB limit"}
+                        )
+                        continue
+
+                    target_device_id: str = message["target_device_id"]
+                    msg_type: str = message["type"]
+
+                    # Handle relay coordination messages
+                    if msg_type == "connect-request":
+                        # Transform to connect-request-received
+                        notification = {
+                            "type": "connect-request-received",
+                            "from_device_id": verified_device_id,
+                            "preferred_transport": message.get("preferred_transport", "auto"),
+                            "relay_session_id": message.get("relay_session_id"),
+                            "relay_url": settings.relay_url,
+                        }
+                        success = await manager.send_message(target_device_id, notification)
+
+                    elif msg_type == "connect-ack":
+                        # Transform to connect-ack-received
+                        notification = {
+                            "type": "connect-ack-received",
+                            "from_device_id": verified_device_id,
+                            "transport": message.get("transport"),
+                            "relay_session_id": message.get("relay_session_id"),
+                            "status": message.get("status"),
+                        }
+                        success = await manager.send_message(target_device_id, notification)
+
+                    else:
+                        # Generic message routing (WebRTC signaling, etc.)
+                        # Add sender information
+                        message["sender_device_id"] = verified_device_id
+                        # Route message to target device
+                        success = await manager.send_message(target_device_id, message)
+
+                    if success:
+                        logger.info(
+                            f"Routed {message['type']} from {verified_device_id} to {target_device_id}"
+                        )
+                        # Send acknowledgment
+                        await websocket.send_json(
+                            {
+                                "type": "ack",
+                                "message": f"Message delivered to {target_device_id}",
+                            }
+                        )
+                    else:
+                        logger.warning(
+                            f"Target device {target_device_id} not connected"
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "message": f"Target device {target_device_id} not connected",
+                            }
+                        )
+
+                except json.JSONDecodeError:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Invalid JSON format"}
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    await websocket.send_json({"type": "error", "message": "Internal error"})
+
+        except WebSocketDisconnect:
+            disconnect_id = verified_device_id or auth_device_id or "unknown"
+            logger.info(f"WebSocket disconnected for device {disconnect_id}")
+        except Exception as e:
+            logger.error(f"Unexpected error in WebSocket handler: {e}")
+        finally:
+            # Clean up connection manager - only if we have a valid device_id
+            cleanup_device_id = verified_device_id or auth_device_id
+            if cleanup_device_id:
+                await manager.disconnect(cleanup_device_id)
+            # Note: db_conn cleanup happens automatically via the async for context

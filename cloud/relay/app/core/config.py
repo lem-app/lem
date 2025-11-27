@@ -15,7 +15,14 @@
 
 """Configuration settings for the relay server."""
 
+import os
+from typing import Self
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Default key used for development - NEVER use in production
+_DEFAULT_SECRET_KEY = "dev-secret-key-change-in-production"
 
 
 class Settings(BaseSettings):
@@ -24,7 +31,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # JWT settings (must match signaling server for interop)
-    secret_key: str = "dev-secret-key-change-in-production"
+    secret_key: str = _DEFAULT_SECRET_KEY
+
+    @model_validator(mode="after")
+    def validate_secret_key_for_production(self) -> Self:
+        """Ensure default secret key is not used in production."""
+        env = os.getenv("ENV", "").lower()
+        if env == "production" and self.secret_key == _DEFAULT_SECRET_KEY:
+            raise ValueError(
+                "Cannot use default secret key in production. "
+                "Set SECRET_KEY environment variable to a secure random value."
+            )
+        return self
     algorithm: str = "HS256"
 
     # Server

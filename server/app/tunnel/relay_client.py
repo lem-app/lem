@@ -21,6 +21,7 @@ protocol as the DataChannel implementation.
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable
 from enum import Enum
@@ -181,14 +182,16 @@ class RelayClient:
         if self.ws_session and not self.ws_session.closed:
             await self.ws_session.close()
 
-        # Create WebSocket connection
+        # Create WebSocket connection (without token in URL for security)
         self.ws_session = aiohttp.ClientSession()
-
-        # Build WebSocket URL: ws://localhost:8001/relay/{session_id}?token={jwt}
-        ws_url = f"{self.relay_url}/relay/{self.session_id}?token={self.token}"
+        ws_url = f"{self.relay_url}/relay/{self.session_id}"
 
         try:
             self.ws = await self.ws_session.ws_connect(ws_url)
+
+            # Send auth message instead of passing token in URL
+            auth_message = json.dumps({"type": "auth", "token": self.token})
+            await self.ws.send_str(auth_message)
             logger.info(f"Connected to relay server: {ws_url}")
 
             await self._set_state(RelayConnectionState.CONNECTED)

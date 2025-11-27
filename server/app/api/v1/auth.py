@@ -22,12 +22,13 @@ and manage local auth state for TunnelAgent integration.
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
+from app.crypto import generate_keypair
 from app.db import (
     AuthState,
     delete_auth_state,
@@ -146,23 +147,27 @@ async def register(request: RegisterRequest) -> AuthResponse:
                 auth_data = await resp.json()
                 jwt_token: str = auth_data["access_token"]
 
-            # Step 2: Get or create persistent device_id for this local server
+            # Step 2: Get or create persistent device_id and keypair for this local server
             device = get_device()
-            if device is None:
-                # First time registration - create persistent device_id
+            if device is None or device.privkey is None:
+                # First time registration or missing keys - create new keypair
                 device_id = f"local-server-{uuid.uuid4().hex[:8]}"
-                register_device(device_id=device_id, pubkey="placeholder-pubkey")
-                logger.info(f"Created new device_id: {device_id}")
+                keypair = generate_keypair()
+                pubkey = keypair.public_key_b64
+                privkey = keypair.private_key_b64
+                register_device(device_id=device_id, pubkey=pubkey, privkey=privkey)
+                logger.info(f"Created new device with Ed25519 keypair: {device_id}")
             else:
-                # Reuse existing device_id
+                # Reuse existing device_id and keypair
                 device_id = device.id
+                pubkey = device.pubkey
                 logger.info(f"Reusing existing device_id: {device_id}")
 
             # Step 3: Register device with signaling server
             async with session.post(
                 f"{signaling_url}/devices/register",
                 headers={"Authorization": f"Bearer {jwt_token}"},
-                json={"device_id": device_id, "pubkey": "placeholder-pubkey"},
+                json={"device_id": device_id, "pubkey": pubkey},
             ) as resp:
                 if resp.status not in (200, 201):
                     error_text = await resp.text()
@@ -256,23 +261,27 @@ async def login(request: LoginRequest) -> AuthResponse:
                 auth_data = await resp.json()
                 jwt_token: str = auth_data["access_token"]
 
-            # Step 2: Get or create persistent device_id for this local server
+            # Step 2: Get or create persistent device_id and keypair for this local server
             device = get_device()
-            if device is None:
-                # First time login - create persistent device_id
+            if device is None or device.privkey is None:
+                # First time login or missing keys - create new keypair
                 device_id = f"local-server-{uuid.uuid4().hex[:8]}"
-                register_device(device_id=device_id, pubkey="placeholder-pubkey")
-                logger.info(f"Created new device_id: {device_id}")
+                keypair = generate_keypair()
+                pubkey = keypair.public_key_b64
+                privkey = keypair.private_key_b64
+                register_device(device_id=device_id, pubkey=pubkey, privkey=privkey)
+                logger.info(f"Created new device with Ed25519 keypair: {device_id}")
             else:
-                # Reuse existing device_id
+                # Reuse existing device_id and keypair
                 device_id = device.id
+                pubkey = device.pubkey
                 logger.info(f"Reusing existing device_id: {device_id}")
 
             # Step 3: Register device with signaling server
             async with session.post(
                 f"{signaling_url}/devices/register",
                 headers={"Authorization": f"Bearer {jwt_token}"},
-                json={"device_id": device_id, "pubkey": "placeholder-pubkey"},
+                json={"device_id": device_id, "pubkey": pubkey},
             ) as resp:
                 if resp.status not in (200, 201):
                     error_text = await resp.text()
