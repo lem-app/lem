@@ -33,20 +33,20 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 ```bash
 # Clone the repository
 git clone https://github.com/lem-app/lem.git
-cd lem/lem-app
+cd lem
 
 # Start the local server
-cd server
+cd lem-app/server
 uv sync
 uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
 
 # In another terminal, start the web dashboard
-cd web/local
+cd lem/lem-app/web/local
 pnpm install
 pnpm run dev
 ```
 
-Open http://localhost:5173 in your browser.
+Open http://localhost:5174 in your browser.
 
 ## 🏗️ Architecture
 
@@ -138,27 +138,32 @@ lem-app/
 ### Running Tests
 
 ```bash
+# From lem/lem-app directory:
+
 # Python tests
 cd server
 uv run pytest --cov=app
 
 # TypeScript tests
 cd web/remote
-pnpm run test
+pnpm test
 ```
 
 ### Code Quality
 
 ```bash
+# From lem/lem-app directory:
+
 # Python linting and formatting
-uv run ruff check server/
-uv run ruff format server/
-uv run mypy server/
+cd server
+uv run ruff check app/
+uv run ruff format app/
+uv run mypy app/
 
 # TypeScript linting and formatting
 cd web/local
-pnpm run lint
-pnpm run format
+pnpm lint
+pnpm format
 pnpm tsc --noEmit
 ```
 
