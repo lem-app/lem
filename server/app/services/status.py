@@ -112,8 +112,6 @@ def _check_image_exists(service_id: str) -> bool:
     if not service_def:
         return False
 
-    # Image might be templated: ${HARBOR_OLLAMA_VERSION}
-    # We can check by listing images with the harbor filter
     try:
         result = subprocess.run(
             ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
@@ -125,19 +123,24 @@ def _check_image_exists(service_id: str) -> bool:
         )
 
         images = result.stdout.strip().split("\n")
+        service_lower = service_id.lower()
 
-        # Check if any image matches common patterns for this service
-        # Common patterns: ollama/ollama, ghcr.io/open-webui/open-webui, etc.
-        service_patterns = [
-            f"{service_id}/",  # ollama/ollama
-            f"/{service_id}:",  # */ollama:*
-            f"harbor.{service_id}",  # harbor.ollama
+        # Also check common name variations (e.g., webui -> open-webui)
+        variations = [
+            service_lower,
+            service_lower.replace("-", ""),  # open-webui -> openwebui
+            service_lower.replace("_", ""),  # some_service -> someservice
         ]
 
         for image in images:
+            if not image:
+                continue
             image_lower = image.lower()
-            for pattern in service_patterns:
-                if pattern.lower() in image_lower:
+
+            # Check if any variation of service_id appears in the image name
+            for variant in variations:
+                if variant in image_lower:
+                    logger.debug(f"Found image for {service_id}: {image}")
                     return True
 
         return False
