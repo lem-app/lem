@@ -435,4 +435,6 @@ env = {"DOCKER_HOST": "unix:///var/run/docker.sock"}  # Linux only
 
 ---
 
+and dont forget, YAGNI
+
 **End of Coding Standards** — Keep it short, keep it scanned.

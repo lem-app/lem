@@ -77,6 +77,23 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 state_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                progress INTEGER DEFAULT 0,
+                message TEXT DEFAULT '',
+                error TEXT,
+                extra_json TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_jobs_service_id ON jobs(service_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
         """
         )
 
