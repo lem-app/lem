@@ -16,8 +16,46 @@
 // API types for Lem Local Server v1
 // Based on docs/api.md
 
+// Service catalog types
+export type ServiceCategory = "backend" | "frontend" | "satellite";
+export type ServiceStatus = "not_installed" | "stopped" | "running" | "error";
+
+export interface Service {
+  id: string;
+  name: string;
+  category: ServiceCategory;
+  description: string;
+  status: ServiceStatus;
+  host_port: number | null;
+  endpoint: string | null;
+  tags: string[];
+  depends_on: string[];
+  has_api: boolean;
+  has_ui: boolean;
+}
+
+// Job types
+export type JobStatus = "pending" | "running" | "completed" | "failed";
+export type JobType = "install" | "remove" | "pull_model";
+
+export interface Job {
+  id: string;
+  type: JobType;
+  service_id: string;
+  status: JobStatus;
+  progress: number;
+  message: string;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobResponse {
+  job_id: string;
+}
+
 // Runner types (§3)
-export type RunnerStatus = 'running' | 'stopped' | 'error';
+export type RunnerStatus = "running" | "stopped" | "error";
 
 export interface Runner {
   id: string;
@@ -30,7 +68,7 @@ export interface Runner {
 }
 
 // Client types (§4)
-export type ClientStatus = 'running' | 'stopped' | 'error';
+export type ClientStatus = "running" | "stopped" | "error";
 
 export interface Client {
   id: string;
@@ -43,7 +81,7 @@ export interface Client {
 }
 
 // Model types (§3.4)
-export type ModelStatus = 'ready' | 'pulling' | 'stopped' | 'error';
+export type ModelStatus = "ready" | "pulling" | "stopped" | "error";
 
 export interface Model {
   id: string;
@@ -63,7 +101,14 @@ export interface ModelPullResponse {
 }
 
 // Tunnel types (§6)
-export type TunnelMode = 'webrtc' | 'turn' | 'relay-ws' | 'offline' | 'connecting' | 'connected' | 'failed';
+export type TunnelMode =
+  | "webrtc"
+  | "turn"
+  | "relay-ws"
+  | "offline"
+  | "connecting"
+  | "connected"
+  | "failed";
 
 export interface TunnelStatus {
   mode: TunnelMode;
@@ -107,7 +152,7 @@ export interface AuthStatus {
 
 // Health types (§2.1)
 export interface Health {
-  status: 'ok' | 'degraded' | 'error';
+  status: "ok" | "degraded" | "error";
   components: {
     docker: string;
     runners: Record<string, RunnerStatus>;
@@ -133,7 +178,7 @@ export interface System {
 
 // Standard response types
 export interface StatusResponse {
-  status: 'ok';
+  status: "ok";
 }
 
 // Error types (§10)

@@ -14,13 +14,12 @@
 // Public License for more details.
 
 // Lem Local Dashboard v0.1
-import type { ReactElement } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { Toaster } from 'react-hot-toast';
-import { RunnersList } from './components/RunnersList';
-import { ClientsList } from './components/ClientsList';
-import { ModelPull } from './components/ModelPull';
-import { RemoteAccess } from './components/RemoteAccess';
+import type { ReactElement } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "react-hot-toast";
+import { ServicesList } from "./components/ServicesList";
+import { ModelPull } from "./components/ModelPull";
+import { RemoteAccess } from "./components/RemoteAccess";
 
 // Create a client for React Query
 const queryClient = new QueryClient({
@@ -39,7 +38,9 @@ function App(): ReactElement {
         <header className="border-b bg-card px-6 py-4">
           <div className="text-center">
             <h1 className="text-2xl font-bold">Lem Dashboard</h1>
-            <p className="text-sm text-muted-foreground">Local AI Infrastructure Manager</p>
+            <p className="text-sm text-muted-foreground">
+              Local AI Infrastructure Manager
+            </p>
           </div>
         </header>
 
@@ -49,11 +50,7 @@ function App(): ReactElement {
           </section>
 
           <section>
-            <RunnersList />
-          </section>
-
-          <section>
-            <ClientsList />
+            <ServicesList />
           </section>
 
           <section>
@@ -66,19 +63,19 @@ function App(): ReactElement {
           toastOptions={{
             duration: 4000,
             style: {
-              background: '#363636',
-              color: '#fff',
+              background: "#363636",
+              color: "#fff",
             },
             success: {
               iconTheme: {
-                primary: '#4ade80',
-                secondary: '#fff',
+                primary: "#4ade80",
+                secondary: "#fff",
               },
             },
             error: {
               iconTheme: {
-                primary: '#ef4444',
-                secondary: '#fff',
+                primary: "#ef4444",
+                secondary: "#fff",
               },
             },
           }}

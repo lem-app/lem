@@ -17,12 +17,13 @@
 Lem Local Server - Main FastAPI Application
 
 This is the local server that runs on the user's machine and manages:
-- Ollama runner installation and lifecycle
-- Open WebUI client installation and lifecycle
+- Harbor service catalog (80+ AI services)
+- Service lifecycle (install, start, stop, remove)
 - Remote access tunneling (P2P/TURN/relay)
 
 Port: 5142 (default)
 """
+
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -33,8 +34,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth as auth_module
 from app.api.v1.auth import router as auth_router
+from app.catalog import get_all_services, get_service_definition
+from app.catalog.models import ServiceCategory
 from app.db import init_db
-from app.tunnel.manager import TunnelManager
+
+# Legacy imports for backward compatibility
 from app.drivers.clients.openwebui import (
     get_openwebui_status,
     get_openwebui_url,
@@ -52,6 +56,19 @@ from app.drivers.runners.ollama import (
     start_ollama,
     stop_ollama,
 )
+from app.jobs import JobStatus, get_job, get_recent_jobs
+from app.jobs.queue import init_job_queue, shutdown_job_queue
+from app.services import (
+    get_all_services_with_status,
+    get_service_endpoint,
+    get_service_status,
+    install_service,
+    remove_service,
+    start_service,
+    stop_service,
+)
+from app.services.lifecycle import register_job_handlers
+from app.tunnel.manager import TunnelManager
 
 # Configure logging for the application
 logging.basicConfig(
@@ -79,6 +96,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_db()
     logger.info("✓ Database initialized at ~/.lem/lem.db")
 
+    # Startup: Initialize job queue
+    await init_job_queue()
+    register_job_handlers()
+    logger.info("✓ Job queue initialized")
+
     # Startup: Initialize TunnelManager
     tunnel_manager = TunnelManager()
 
@@ -92,6 +114,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning(f"TunnelAgent auto-start failed: {e}")
 
     yield
+
+    # Shutdown: Stop job queue
+    await shutdown_job_queue()
+    logger.info("✓ Job queue stopped")
 
     # Shutdown: Stop TunnelAgent gracefully
     if tunnel_manager:
@@ -440,3 +466,261 @@ async def pull_model(request: dict[str, str]) -> dict[str, Any]:
     """
     model_ref = request.get("model_ref", "")
     return await pull_ollama_model(model_ref)
+
+
+# =============================================================================
+# NEW: Catalog Endpoints
+# =============================================================================
+
+
+@app.get("/v1/catalog")
+async def list_catalog(
+    category: ServiceCategory | None = None,
+) -> list[dict[str, Any]]:
+    """
+    List all available services from the Harbor catalog.
+
+    This returns static catalog information (not runtime status).
+    Use /v1/services for runtime status.
+
+    Args:
+        category: Optional filter by category (backend, frontend, satellite)
+
+    Returns:
+        List of service definitions from the catalog
+    """
+    all_services = get_all_services()
+
+    if category:
+        all_services = [s for s in all_services if s.category == category]
+
+    return [s.model_dump() for s in all_services]
+
+
+@app.get("/v1/catalog/{service_id}")
+async def get_catalog_entry(service_id: str) -> dict[str, Any]:
+    """
+    Get details for a specific service from the catalog.
+
+    Args:
+        service_id: Service ID to look up
+
+    Returns:
+        Service definition
+
+    Raises:
+        HTTPException: 404 if service not found
+    """
+    service = get_service_definition(service_id)
+    if not service:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "type": "https://lem.gg/errors/service-not-found",
+                "title": "Service Not Found",
+                "detail": f"Service '{service_id}' not found in catalog",
+            },
+        )
+    return service.model_dump()
+
+
+# =============================================================================
+# NEW: Services Endpoints (with runtime status)
+# =============================================================================
+
+
+@app.get("/v1/services")
+async def list_services(
+    category: ServiceCategory | None = None,
+) -> list[dict[str, Any]]:
+    """
+    List all services with their current runtime status.
+
+    This includes:
+    - Service metadata (name, description, category)
+    - Runtime status (not_installed, stopped, running, error)
+    - Endpoint URL (if running)
+
+    Args:
+        category: Optional filter by category
+
+    Returns:
+        List of services with status
+    """
+    all_services = await get_all_services_with_status()
+
+    if category:
+        all_services = [s for s in all_services if s.category == category]
+
+    return [s.model_dump() for s in all_services]
+
+
+@app.get("/v1/services/{service_id}")
+async def get_service(service_id: str) -> dict[str, Any]:
+    """
+    Get a specific service with its runtime status.
+
+    Args:
+        service_id: Service ID to look up
+
+    Returns:
+        Service with status
+
+    Raises:
+        HTTPException: 404 if service not found
+    """
+    service_def = get_service_definition(service_id)
+    if not service_def:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "type": "https://lem.gg/errors/service-not-found",
+                "title": "Service Not Found",
+                "detail": f"Service '{service_id}' not found in catalog",
+            },
+        )
+
+    status = await get_service_status(service_id)
+    endpoint = await get_service_endpoint(service_id)
+
+    return {
+        **service_def.model_dump(),
+        "status": status.value,
+        "endpoint": endpoint,
+    }
+
+
+@app.post("/v1/services/{service_id}/install")
+async def install_service_endpoint(service_id: str) -> dict[str, Any]:
+    """
+    Install a service (async operation).
+
+    Creates a background job that pulls the service image.
+    Dependencies are automatically installed first.
+
+    Args:
+        service_id: Service ID to install
+
+    Returns:
+        {"job_id": "...", "status": "pending", "message": "..."}
+
+    Raises:
+        HTTPException: 404 if not found, 409 if job already in progress
+    """
+    job_id = await install_service(service_id)
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": f"Installation of {service_id} queued",
+    }
+
+
+@app.post("/v1/services/{service_id}/start")
+async def start_service_endpoint(service_id: str) -> dict[str, str]:
+    """
+    Start an installed service.
+
+    Args:
+        service_id: Service ID to start
+
+    Returns:
+        {"status": "ok"}
+
+    Raises:
+        HTTPException: 404 if not found, 400 if not installed
+    """
+    return await start_service(service_id)
+
+
+@app.post("/v1/services/{service_id}/stop")
+async def stop_service_endpoint(service_id: str) -> dict[str, str]:
+    """
+    Stop a running service.
+
+    Args:
+        service_id: Service ID to stop
+
+    Returns:
+        {"status": "ok"}
+
+    Raises:
+        HTTPException: 404 if not found
+    """
+    return await stop_service(service_id)
+
+
+@app.post("/v1/services/{service_id}/remove")
+async def remove_service_endpoint(service_id: str) -> dict[str, Any]:
+    """
+    Remove a service (async operation).
+
+    Creates a background job that stops and removes the service.
+
+    Args:
+        service_id: Service ID to remove
+
+    Returns:
+        {"job_id": "...", "status": "pending", "message": "..."}
+
+    Raises:
+        HTTPException: 404 if not found, 409 if job already in progress
+    """
+    job_id = await remove_service(service_id)
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": f"Removal of {service_id} queued",
+    }
+
+
+# =============================================================================
+# NEW: Jobs Endpoints
+# =============================================================================
+
+
+@app.get("/v1/jobs")
+async def list_jobs(
+    status: JobStatus | None = None,
+    service_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """
+    List recent jobs.
+
+    Args:
+        status: Optional filter by status (pending, running, completed, failed)
+        service_id: Optional filter by service ID
+        limit: Maximum number of jobs to return (default 20)
+
+    Returns:
+        List of jobs, most recent first
+    """
+    jobs = get_recent_jobs(status=status, service_id=service_id, limit=limit)
+    return [j.model_dump() for j in jobs]
+
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job_status(job_id: str) -> dict[str, Any]:
+    """
+    Get the status of a specific job.
+
+    Args:
+        job_id: Job ID to look up
+
+    Returns:
+        Job details including status, progress, and message
+
+    Raises:
+        HTTPException: 404 if job not found
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "type": "https://lem.gg/errors/job-not-found",
+                "title": "Job Not Found",
+                "detail": f"Job '{job_id}' not found",
+            },
+        )
+    return job.model_dump()
