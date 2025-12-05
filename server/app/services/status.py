@@ -152,13 +152,13 @@ def _check_image_exists(service_id: str) -> bool:
         return False
 
 
-def _parse_host_port(ports_str: str, container_port: int) -> int | None:
+def _parse_host_port(ports_str: str, container_port: int | None = None) -> int | None:
     """
     Parse the host port from Docker port mappings.
 
     Args:
         ports_str: Docker ports string like "0.0.0.0:33821->11434/tcp"
-        container_port: Container port to find mapping for
+        container_port: Container port to find mapping for (optional)
 
     Returns:
         Host port or None
@@ -168,10 +168,17 @@ def _parse_host_port(ports_str: str, container_port: int) -> int | None:
     if not ports_str:
         return None
 
-    # Pattern: look for <host_port>-><container_port>/tcp
-    pattern = rf"(?:0\.0\.0\.0:|::]:)?(\d+)->{container_port}/tcp"
-    match = re.search(pattern, ports_str)
+    if container_port:
+        # Pattern: look for <host_port>-><container_port>/tcp
+        pattern = rf"(?:0\.0\.0\.0:|::]:)?(\d+)->{container_port}/tcp"
+        match = re.search(pattern, ports_str)
+        if match:
+            return int(match.group(1))
 
+    # Fallback: extract the first host port from the string
+    # Pattern matches: "0.0.0.0:33891->33891/tcp" or "[::]:33891->33891/tcp"
+    fallback_pattern = r"(?:0\.0\.0\.0:|:\]:|\[::\]:)(\d+)->"
+    match = re.search(fallback_pattern, ports_str)
     if match:
         return int(match.group(1))
 
@@ -224,7 +231,7 @@ async def get_service_endpoint(service_id: str) -> str | None:
         Endpoint URL or None if not running
     """
     service_def = get_service_definition(service_id)
-    if not service_def or not service_def.container_port:
+    if not service_def:
         return None
 
     containers = _get_running_containers()
@@ -232,6 +239,7 @@ async def get_service_endpoint(service_id: str) -> str | None:
     if service_id not in containers:
         return None
 
+    # Try to extract port - container_port may be None for services with dynamic ports
     ports_str = str(containers[service_id].get("ports", ""))
     host_port = _parse_host_port(ports_str, service_def.container_port)
 
@@ -271,7 +279,7 @@ async def get_all_services_with_status() -> list[Service]:
         # Get endpoint if running
         endpoint = None
         host_port = None
-        if status == ServiceStatus.RUNNING and svc_def.container_port:
+        if status == ServiceStatus.RUNNING:
             ports_str = str(containers[svc_def.id].get("ports", ""))
             host_port = _parse_host_port(ports_str, svc_def.container_port)
             if host_port:

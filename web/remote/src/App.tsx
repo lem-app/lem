@@ -28,6 +28,7 @@ import { ConnectionStatus } from './components/ConnectionStatus'
 import { APITester } from './components/APITester'
 import { ClientViewer } from './components/ClientViewer'
 import { ClientSelector } from './components/ClientSelector'
+import { ServicesCatalog } from './components/ServicesCatalog'
 import { Button } from '@/components/ui/button'
 
 const SIGNAL_URL = import.meta.env.VITE_SIGNAL_URL || 'ws://localhost:8000/signal'
@@ -57,10 +58,14 @@ function getBrowserDeviceId(): string {
   return newId
 }
 
+type ViewMode = 'clients' | 'services'
+
 function App(): ReactElement {
   const { isAuthenticated, token, login, logout, isLoading, error: authError } = useAuth()
   const [targetDeviceId, setTargetDeviceId] = useState<string | null>(null)
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null)
+  const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>('services')
 
   const browserDeviceId = getBrowserDeviceId()
 
@@ -93,10 +98,17 @@ function App(): ReactElement {
 
   const handleSelectClient = (clientId: string) => {
     setSelectedClientId(clientId)
+    setSelectedServiceId(null)
   }
 
-  const handleBackFromClient = () => {
+  const handleLaunchService = (serviceId: string) => {
+    setSelectedServiceId(serviceId)
     setSelectedClientId(null)
+  }
+
+  const handleBackFromViewer = () => {
+    setSelectedClientId(null)
+    setSelectedServiceId(null)
   }
 
   const handleLogin = async (credentials: Parameters<typeof login>[0]) => {
@@ -137,14 +149,19 @@ function App(): ReactElement {
     )
   }
 
-  // Authenticated and device selected - check if viewing a client
-  if (selectedClientId && connectionState === 'connected' && (connectionMode === 'relay' || dataChannelState === 'open')) {
+  // Authenticated and device selected - check if viewing a client or service
+  const isViewingApp =
+    (selectedClientId || selectedServiceId) &&
+    connectionState === 'connected' &&
+    (connectionMode === 'relay' || dataChannelState === 'open')
+  if (isViewingApp) {
     return (
       <ClientViewer
-        clientId={selectedClientId}
+        clientId={selectedClientId ?? undefined}
+        serviceId={selectedServiceId ?? undefined}
         connectionState={connectionState}
         dataChannelState={dataChannelState}
-        onBack={handleBackFromClient}
+        onBack={handleBackFromViewer}
         proxyFetch={proxyFetch}
       />
     )
@@ -158,10 +175,12 @@ function App(): ReactElement {
           <div className="space-y-1">
             <h1 className="text-2xl font-bold">Lem Remote Access</h1>
             <p className="text-sm text-muted-foreground">
-              Browser Device ID: <code className="rounded bg-muted px-1 py-0.5 text-xs">{browserDeviceId}</code>
+              Browser Device ID:{' '}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">{browserDeviceId}</code>
             </p>
             <p className="text-sm text-muted-foreground">
-              Target Device ID: <code className="rounded bg-muted px-1 py-0.5 text-xs">{targetDeviceId}</code>
+              Target Device ID:{' '}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">{targetDeviceId}</code>
             </p>
           </div>
           <div className="flex gap-2">
@@ -185,12 +204,35 @@ function App(): ReactElement {
           onDisconnect={disconnect}
         />
 
-        {connectionState === 'connected' && (connectionMode === 'relay' || dataChannelState === 'open') && (
-          <>
-            <ClientSelector proxyFetch={proxyFetch} onSelectClient={handleSelectClient} />
-            <APITester proxyFetch={proxyFetch} isConnected={true} />
-          </>
-        )}
+        {connectionState === 'connected' &&
+          (connectionMode === 'relay' || dataChannelState === 'open') && (
+            <>
+              {/* View mode tabs */}
+              <div className="flex gap-2 px-4">
+                <Button
+                  variant={viewMode === 'services' ? 'default' : 'outline'}
+                  onClick={() => setViewMode('services')}
+                >
+                  Service Catalog
+                </Button>
+                <Button
+                  variant={viewMode === 'clients' ? 'default' : 'outline'}
+                  onClick={() => setViewMode('clients')}
+                >
+                  Legacy Clients
+                </Button>
+              </div>
+
+              {/* View content */}
+              {viewMode === 'services' ? (
+                <ServicesCatalog proxyFetch={proxyFetch} onLaunchService={handleLaunchService} />
+              ) : (
+                <ClientSelector proxyFetch={proxyFetch} onSelectClient={handleSelectClient} />
+              )}
+
+              <APITester proxyFetch={proxyFetch} isConnected={true} />
+            </>
+          )}
       </div>
     </div>
   )

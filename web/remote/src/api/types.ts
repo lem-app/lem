@@ -244,3 +244,78 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'fai
  * DataChannel state.
  */
 export type DataChannelState = 'connecting' | 'open' | 'closing' | 'closed' | 'none'
+
+/**
+ * Connection mode.
+ */
+export type ConnectionMode = 'webrtc' | 'relay'
+
+// =============================================================================
+// Service Catalog Types (for local server API)
+// =============================================================================
+
+/**
+ * Service category from Harbor catalog.
+ */
+export type ServiceCategory = 'backend' | 'frontend' | 'satellite'
+
+/**
+ * Service runtime status.
+ */
+export type ServiceStatus = 'not_installed' | 'stopped' | 'running' | 'error'
+
+/**
+ * Service from the catalog with runtime status.
+ */
+export interface Service {
+  id: string
+  name: string
+  category: ServiceCategory
+  description: string
+  status: ServiceStatus
+  host_port: number | null
+  endpoint: string | null
+  tags: string[]
+  depends_on: string[]
+  has_api: boolean
+  has_ui: boolean
+}
+
+/**
+ * Job status for async operations.
+ */
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed'
+
+/**
+ * Job type.
+ */
+export type JobType = 'install' | 'remove' | 'pull_model'
+
+/**
+ * Background job for tracking async operations.
+ */
+export interface Job {
+  id: string
+  type: JobType
+  service_id: string
+  status: JobStatus
+  progress: number
+  message: string
+  error: string | null
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Response from install/remove operations.
+ */
+export interface JobResponse {
+  job_id: string
+}
+
+/**
+ * Standard status response.
+ */
+export interface StatusResponse {
+  status: 'ok'
+}
