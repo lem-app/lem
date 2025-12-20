@@ -25,12 +25,12 @@ import asyncio
 import logging
 import os
 import subprocess
-from pathlib import Path
 
 from fastapi import HTTPException
 
 from app.catalog import get_service_definition, get_service_dependencies
 from app.catalog.models import ServiceStatus
+from app.config.platform import DOCKER_HOST, HARBOR_SCRIPT
 from app.jobs import (
     Job,
     JobType,
@@ -43,10 +43,6 @@ from app.services.status import get_service_status
 
 logger = logging.getLogger(__name__)
 
-# Harbor and Docker paths
-HARBOR_SCRIPT = Path.home() / ".lem" / "harbor" / "harbor.sh"
-DSP_SOCKET = Path.home() / ".docker" / "run" / "docker.sock"
-
 # Timeouts
 INSTALL_TIMEOUT = 600  # 10 minutes for install (image pull)
 START_TIMEOUT = 300  # 5 minutes for start
@@ -58,7 +54,7 @@ def _get_docker_env() -> dict[str, str]:
     """Get environment with Docker socket configured."""
     return {
         **os.environ,
-        "DOCKER_HOST": f"unix://{DSP_SOCKET}",
+        "DOCKER_HOST": DOCKER_HOST,
     }
 
 

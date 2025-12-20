@@ -14,21 +14,15 @@
 # Public License for more details.
 
 """
-Harbor CLI wrapper for Lem v0.1 (CORRECTED)
+Harbor CLI wrapper for Lem v0.1.
 
 Provides safe subprocess execution of Harbor CLI commands with:
 - Timeout handling (default 5 minutes)
 - Error capture and logging
 - Version validation
-- DOCKER_HOST env var for DSP routing
+- Cross-platform Docker socket detection
 
-IMPORTANT CORRECTIONS from original design:
-1. Harbor is at ~/.lem/harbor/harbor.sh (not /usr/local/bin/harbor binary)
-2. Docker routing via DOCKER_HOST env var (not HARBOR_CONFIG)
-3. No harbor-config.yaml file (Harbor uses .env, but we don't need it)
-4. Harbor version is 0.3.20 (not 1.2.3)
-
-See docs/harbor_review_2025-10-24.md for detailed explanation of corrections.
+Uses the centralized platform module for path configuration.
 """
 
 from __future__ import annotations
@@ -37,18 +31,10 @@ import json
 import logging
 import os
 import subprocess
-from pathlib import Path
+
+from app.config.platform import DOCKER_HOST, HARBOR_SCRIPT
 
 logger = logging.getLogger(__name__)
-
-# Harbor installation path (cloned git repo)
-HARBOR_SCRIPT = Path.home() / ".lem" / "harbor" / "harbor.sh"
-
-# DSP socket path
-# TODO: Switch to DSP socket when Phase 1.3 is complete
-# DSP_SOCKET = Path("/run/lem/lem-docker-proxy.sock")
-# For now, use actual Docker socket for testing
-DSP_SOCKET = Path.home() / ".docker" / "run" / "docker.sock"
 
 DEFAULT_TIMEOUT = 300  # 5 minutes
 
@@ -112,11 +98,10 @@ def harbor_up(
     """
     logger.info(f"Starting Harbor service: {service} (skip_defaults={skip_defaults})")
 
-    # WHY: We set DOCKER_HOST to route all Docker operations through DSP
-    # Harbor uses standard Docker environment variables, not Harbor-specific config
+    # Set DOCKER_HOST for cross-platform Docker socket routing
     env = {
         **os.environ,  # Preserve existing env
-        "DOCKER_HOST": f"unix://{DSP_SOCKET}",
+        "DOCKER_HOST": DOCKER_HOST,
     }
 
     # Build command list conditionally to avoid empty string args
@@ -169,10 +154,10 @@ def harbor_down(service: str, timeout: int = 60) -> tuple[int, str, str]:
     """
     logger.info(f"Stopping Harbor service: {service}")
 
-    # Set DOCKER_HOST for DSP routing
+    # Set DOCKER_HOST for cross-platform routing
     env = {
         **os.environ,
-        "DOCKER_HOST": f"unix://{DSP_SOCKET}",
+        "DOCKER_HOST": DOCKER_HOST,
     }
 
     try:
@@ -254,7 +239,7 @@ def harbor_ps() -> dict[str, dict[str, str | bool | int | None]]:
     """
     env = {
         **os.environ,
-        "DOCKER_HOST": f"unix://{DSP_SOCKET}",
+        "DOCKER_HOST": DOCKER_HOST,
     }
 
     try:
