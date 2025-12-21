@@ -39,7 +39,7 @@ export function RemoteAccess(): ReactElement {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [signalingUrl, setSignalingUrl] = useState(
-    import.meta.env.VITE_DEFAULT_SIGNALING_URL || 'http://localhost:8000'
+    import.meta.env.VITE_DEFAULT_SIGNALING_URL || 'https://signal.lem.gg'
   );
 
   const { data: authStatus, isLoading: authLoading } = useQuery({
