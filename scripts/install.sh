@@ -477,6 +477,57 @@ start_server() {
     warn "Server may still be starting. Check logs at $LEM_HOME/logs/lem.log"
 }
 
+# Install lem CLI to PATH
+install_cli() {
+    info "Installing lem CLI..."
+
+    local bin_dir="$LEM_HOME/bin"
+    mkdir -p "$bin_dir"
+
+    # Copy lem script to bin directory
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [ -f "$script_dir/lem" ]; then
+        cp "$script_dir/lem" "$bin_dir/lem"
+        chmod +x "$bin_dir/lem"
+    else
+        # Create minimal lem script if not found
+        cat > "$bin_dir/lem" << 'LEMSCRIPT'
+#!/bin/bash
+LEM_HOME="${LEM_HOME:-$HOME/.lem}"
+exec "$LEM_HOME/bin/lem-full" "$@"
+LEMSCRIPT
+        chmod +x "$bin_dir/lem"
+    fi
+
+    # Add to PATH in shell config if not already there
+    local path_line="export PATH=\"\$HOME/.lem/bin:\$PATH\""
+    local added_to_shell=false
+
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        if [ -f "$rc_file" ]; then
+            if ! grep -q '\.lem/bin' "$rc_file" 2>/dev/null; then
+                echo "" >> "$rc_file"
+                echo "# Lem CLI" >> "$rc_file"
+                echo "$path_line" >> "$rc_file"
+                added_to_shell=true
+            fi
+        fi
+    done
+
+    # Also try to create symlink in ~/.local/bin if it exists and is in PATH
+    if [ -d "$HOME/.local/bin" ]; then
+        ln -sf "$bin_dir/lem" "$HOME/.local/bin/lem" 2>/dev/null || true
+    fi
+
+    success "Lem CLI installed to $bin_dir"
+
+    if [ "$added_to_shell" = true ]; then
+        warn "Run 'source ~/.bashrc' or start a new terminal to use 'lem' command"
+    fi
+}
+
 # Open browser
 open_browser() {
     local url="http://localhost:$LEM_PORT"
@@ -541,6 +592,7 @@ main() {
     create_directories
     install_harbor
     install_lem_server
+    install_cli
 
     # Create platform-specific service
     case "$PLATFORM" in

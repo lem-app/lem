@@ -14,8 +14,14 @@ set -e
 
 LEM_HOME="${LEM_HOME:-$HOME/.lem}"
 LEM_PORT="${LEM_PORT:-5142}"
-SERVER_DIR="$LEM_HOME/server"
 LOG_FILE="$LEM_HOME/logs/lem.log"
+
+# Find server directory (could be symlink or actual directory)
+if [ -L "$LEM_HOME/server" ]; then
+    SERVER_DIR="$(readlink -f "$LEM_HOME/server")"
+else
+    SERVER_DIR="$LEM_HOME/server"
+fi
 
 # Detect platform
 OS="$(uname -s)"
