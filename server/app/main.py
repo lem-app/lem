@@ -27,10 +27,13 @@ Port: 5142 (default)
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import auth as auth_module
 from app.api.v1.auth import router as auth_router
@@ -174,15 +177,8 @@ async def health() -> dict[str, Any]:
     }
 
 
-@app.get("/")
-async def root() -> dict[str, str]:
-    """
-    Root endpoint - redirects to docs.
-
-    Returns:
-        dict: Welcome message
-    """
-    return {"message": "Lem Local Server v0.1.0", "docs": "/docs", "health": "/v1/health"}
+# Root endpoint is handled by dashboard static files at end of file
+# If no dashboard is built, it falls back to a simple JSON response
 
 
 # ----- Runners List Endpoint -----
@@ -724,3 +720,72 @@ async def get_job_status(job_id: str) -> dict[str, Any]:
             },
         )
     return job.model_dump()
+
+
+# =============================================================================
+# Dashboard Static Files
+# =============================================================================
+
+# Dashboard build directory - check multiple locations
+DASHBOARD_PATHS = [
+    Path.home() / ".lem" / "dashboard",  # Installed location
+    Path(__file__).parent.parent.parent.parent / "web" / "local" / "dist",  # Dev
+]
+
+
+def get_dashboard_path() -> Path | None:
+    """Find the dashboard build directory."""
+    for path in DASHBOARD_PATHS:
+        if path.exists() and (path / "index.html").exists():
+            return path
+    return None
+
+
+# Mount static files if dashboard is built
+_dashboard_path = get_dashboard_path()
+if _dashboard_path:
+    logger.info(f"Serving dashboard from {_dashboard_path}")
+
+    # Mount assets directory for JS/CSS/images
+    assets_path = _dashboard_path / "assets"
+    if assets_path.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_path)), name="assets")
+
+    # Serve index.html for root and SPA routes
+    @app.get("/")
+    async def serve_dashboard() -> FileResponse:
+        """Serve the dashboard."""
+        if _dashboard_path:
+            return FileResponse(_dashboard_path / "index.html")
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    @app.get("/{path:path}")
+    async def serve_spa(request: Request, path: str) -> FileResponse:
+        """Serve SPA routes - return index.html for non-API paths."""
+        # Skip API routes
+        if path.startswith("v1/") or path in ("docs", "redoc", "openapi.json"):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        if _dashboard_path:
+            # Try to serve the exact file first (for favicon, etc.)
+            file_path = _dashboard_path / path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(file_path)
+
+            # Otherwise serve index.html for SPA routing
+            return FileResponse(_dashboard_path / "index.html")
+
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+else:
+    logger.info("Dashboard not found - API only mode")
+    logger.info("To enable dashboard, build web/local or install to ~/.lem/dashboard")
+
+    @app.get("/")
+    async def root_api_only() -> dict[str, str]:
+        """Root endpoint when no dashboard is available."""
+        return {
+            "message": "Lem Local Server v0.1.0",
+            "docs": "/docs",
+            "health": "/v1/health",
+            "note": "Dashboard not installed. Visit /docs for API documentation.",
+        }

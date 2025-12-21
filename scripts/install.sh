@@ -330,6 +330,60 @@ install_lem_server() {
     exit 1
 }
 
+# Build and install the dashboard
+install_dashboard() {
+    info "Building dashboard..."
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local repo_root="$(dirname "$script_dir")"
+    local web_local="$repo_root/web/local"
+    local dashboard_dir="$LEM_HOME/dashboard"
+
+    # Check if we're in the source repo
+    if [ ! -d "$web_local" ]; then
+        warn "Dashboard source not found, skipping build"
+        return 0
+    fi
+
+    # Check for pnpm
+    if ! check_command pnpm; then
+        warn "pnpm not found, skipping dashboard build"
+        echo "Install pnpm with: npm install -g pnpm"
+        echo "Then re-run this script to build the dashboard"
+        return 0
+    fi
+
+    # Check for node
+    if ! check_command node; then
+        warn "Node.js not found, skipping dashboard build"
+        return 0
+    fi
+
+    # Install dependencies
+    info "Installing dashboard dependencies..."
+    (cd "$web_local" && pnpm install --frozen-lockfile 2>/dev/null || pnpm install) || {
+        warn "Failed to install dashboard dependencies"
+        return 0
+    }
+
+    # Build the dashboard
+    info "Building dashboard (this may take a minute)..."
+    (cd "$web_local" && pnpm build) || {
+        warn "Failed to build dashboard"
+        return 0
+    }
+
+    # Copy to LEM_HOME
+    if [ -d "$web_local/dist" ]; then
+        rm -rf "$dashboard_dir"
+        cp -r "$web_local/dist" "$dashboard_dir"
+        success "Dashboard installed to $dashboard_dir"
+    else
+        warn "Dashboard build output not found"
+    fi
+}
+
 # Create systemd service (Linux only)
 create_systemd_service() {
     if [ "$PLATFORM" != "linux" ]; then
@@ -592,6 +646,7 @@ main() {
     create_directories
     install_harbor
     install_lem_server
+    install_dashboard
     install_cli
 
     # Create platform-specific service
