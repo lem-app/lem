@@ -37,6 +37,9 @@ from aiortc import (
 )
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
+from app.crypto import SIGNAL_CONTEXT, sign_challenge
+from app.db import get_device
+
 from .http_proxy import HTTPProxyHandler
 from .message_dispatcher import MessageDispatcher
 from .peer_auth import PeerIdentity, PeerVerifier, build_peer_verifier
@@ -503,7 +506,13 @@ class TunnelAgent:
         """
         msg_type = message.get("type")
 
-        if msg_type == "connected":
+        if msg_type == "challenge":
+            # Proof of possession. The signaling server answers `auth` with a
+            # challenge and will not send `connected` until this device signs
+            # it, so the account token alone no longer opens a device socket.
+            await self._answer_challenge(message)
+
+        elif msg_type == "connected":
             logger.info("Signaling connection confirmed")
 
         elif msg_type == "offer":
@@ -693,6 +702,58 @@ class TunnelAgent:
             }
         )
         logger.info(f"Sent connect-ack to {target_device_id}: {transport}, {status}")
+
+    async def _answer_challenge(self, message: dict[str, Any]) -> None:
+        """Sign the signaling server's challenge and send the auth-response.
+
+        Fails closed. If this device has no private key, or the challenge is
+        malformed, the socket is closed rather than left half-authenticated:
+        an unsigned connection is not a connection, and the server would drop
+        it on timeout anyway.
+
+        Args:
+            message: The challenge frame from the signaling server
+        """
+        challenge = message.get("challenge")
+        if not isinstance(challenge, str) or not challenge:
+            logger.error("Signaling sent a challenge frame with no challenge")
+            await self._close_unauthenticated()
+            return
+
+        device = get_device()
+        if device is None or device.privkey is None:
+            logger.error(
+                "Cannot answer the signaling challenge: this device has no "
+                "private key on file. Log in again to enrol a device key."
+            )
+            await self._close_unauthenticated()
+            return
+
+        if not self.device_id:
+            logger.error("Cannot answer the signaling challenge: no device_id set")
+            await self._close_unauthenticated()
+            return
+
+        try:
+            signature = sign_challenge(device.privkey, SIGNAL_CONTEXT, self.device_id, challenge)
+        except ValueError as e:
+            logger.error(f"Cannot sign the signaling challenge: {e}")
+            await self._close_unauthenticated()
+            return
+
+        await self._send_signaling_message({"type": "auth-response", "signature": signature})
+        logger.info("Answered the signaling device-key challenge")
+
+    async def _close_unauthenticated(self) -> None:
+        """Close the signaling socket after failing to prove key possession.
+
+        Reconnecting would loop on the same failure, so this does not trigger
+        the reconnect path.
+        """
+        self.should_reconnect = False
+        if self.ws is not None and not self.ws.closed:
+            await self.ws.close()
+        await self._set_state(ConnectionState.FAILED)
 
     async def _send_signaling_message(self, message: dict[str, Any]) -> None:
         """Send message to signaling server.
