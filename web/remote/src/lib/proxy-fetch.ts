@@ -66,9 +66,6 @@ interface PendingExchange {
   received: number
   headSettled: boolean
   timer: number | null
-  /** Queued chunks that arrived before the stream's `start` ran. */
-  queued: Uint8Array[]
-  closeAfterQueue: boolean
 }
 
 /**
@@ -233,8 +230,6 @@ export class HTTPProxy {
         received: 0,
         headSettled: false,
         timer: null,
-        queued: [],
-        closeAfterQueue: false,
       }
       this.pending.set(requestId, exchange)
       this.armTimer(requestId, exchange, HEAD_TIMEOUT_MS, 'E_TIMEOUT_HEAD')
@@ -332,14 +327,12 @@ export class HTTPProxy {
     }
 
     const stream = new ReadableStream<Uint8Array>({
+      // `start` runs synchronously during construction, so the controller is in
+      // hand before the Response below is built and therefore before any chunk
+      // frame can be routed here. No queue is needed, and one would be dead
+      // code pretending to handle an ordering that cannot occur.
       start: (controller) => {
         exchange.controller = controller
-        // Chunks can land before `start` runs; replay them in order.
-        exchange.queued.forEach((chunk) => controller.enqueue(chunk))
-        exchange.queued = []
-        if (exchange.closeAfterQueue) {
-          controller.close()
-        }
       },
       cancel: () => {
         // The consumer walked away: tell the server to stop producing.
@@ -396,20 +389,12 @@ export class HTTPProxy {
     exchange.received += frame.payload.byteLength
 
     if (frame.payload.byteLength > 0) {
-      if (exchange.controller) {
-        exchange.controller.enqueue(frame.payload)
-      } else {
-        exchange.queued.push(frame.payload)
-      }
+      exchange.controller?.enqueue(frame.payload)
     }
 
     if (frame.final) {
       this.clearTimer(exchange)
-      if (exchange.controller) {
-        exchange.controller.close()
-      } else {
-        exchange.closeAfterQueue = true
-      }
+      exchange.controller?.close()
       this.pending.delete(frame.requestId)
       return
     }
@@ -451,12 +436,13 @@ export class HTTPProxy {
     }
 
     if (exchange.controller) {
+      // The body is already streaming: error it so the reader sees a failure
+      // rather than a body that merely stops.
       exchange.controller.error(error)
       return
     }
     if (exchange.headSettled) {
-      // Head delivered, stream not started yet: the queued bytes go with it.
-      exchange.queued = []
+      // A bodyless response was already delivered; nothing left to fail.
       return
     }
     exchange.rejectResponse(error)
