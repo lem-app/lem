@@ -23,15 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import subprocess
-from pathlib import Path
 
 from fastapi import HTTPException
 
 from app.catalog import get_service_definition, get_service_dependencies
 from app.catalog.models import ServiceStatus
+from app.config.platform import HARBOR_SCRIPT
 from app.jobs import (
+    ActiveJobExistsError,
     Job,
     JobType,
     create_job,
@@ -39,27 +39,38 @@ from app.jobs import (
     update_job_progress,
 )
 from app.jobs.queue import get_job_queue
-from app.services.status import get_service_status
+from app.services.status import (
+    DockerUnavailableError,
+    get_docker_env,
+    get_service_status,
+    list_service_containers,
+    resolve_service_image,
+)
 
 logger = logging.getLogger(__name__)
-
-# Harbor and Docker paths
-HARBOR_SCRIPT = Path.home() / ".lem" / "harbor" / "harbor.sh"
-DSP_SOCKET = Path.home() / ".docker" / "run" / "docker.sock"
 
 # Timeouts
 INSTALL_TIMEOUT = 600  # 10 minutes for install (image pull)
 START_TIMEOUT = 300  # 5 minutes for start
 STOP_TIMEOUT = 60  # 1 minute for stop
-REMOVE_TIMEOUT = 120  # 2 minutes for remove
+CONTAINER_RM_TIMEOUT = 30
+IMAGE_RM_TIMEOUT = 60
 
 
-def _get_docker_env() -> dict[str, str]:
-    """Get environment with Docker socket configured."""
-    return {
-        **os.environ,
-        "DOCKER_HOST": f"unix://{DSP_SOCKET}",
-    }
+def _harbor_missing(service_id: str, error: OSError) -> HTTPException:
+    """Build an RFC7807 503 for a missing/unusable Harbor CLI."""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "type": "https://lem.gg/errors/harbor-not-installed",
+            "title": "Harbor CLI Not Available",
+            "detail": (
+                f"Could not run the Harbor CLI at {HARBOR_SCRIPT}: {error}. "
+                "Install Harbor (or re-run the Lem installer) and try again."
+            ),
+            "service": service_id,
+        },
+    )
 
 
 async def _run_harbor_command(
@@ -79,7 +90,8 @@ async def _run_harbor_command(
         Tuple of (return_code, stdout, stderr)
 
     Raises:
-        HTTPException: If command fails or times out
+        HTTPException: If Harbor is missing (503), the command fails (503),
+            or it times out (504)
     """
     cmd = [str(HARBOR_SCRIPT)] + args
     logger.info(f"Running: {' '.join(cmd)}")
@@ -91,7 +103,7 @@ async def _run_harbor_command(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_get_docker_env(),
+            env=get_docker_env(),
         )
 
         if result.returncode != 0:
@@ -121,6 +133,107 @@ async def _run_harbor_command(
             },
         ) from e
 
+    except OSError as e:
+        # Harbor not installed, not executable, ... - previously escaped as a
+        # bare 500 FileNotFoundError.
+        logger.error(f"Cannot execute Harbor CLI at {HARBOR_SCRIPT}: {e}")
+        raise _harbor_missing(service_id, e) from e
+
+
+async def _run_docker(args: list[str], timeout: int) -> tuple[int, str]:
+    """
+    Run a Docker command, reporting rather than raising on failure.
+
+    Args:
+        args: Arguments after the `docker` executable
+        timeout: Timeout in seconds
+
+    Returns:
+        Tuple of (return_code, stderr); return code 127 means Docker is missing
+        and 124 means it timed out.
+    """
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["docker", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=get_docker_env(),
+        )
+    except FileNotFoundError as e:
+        return 127, f"docker CLI not found: {e}"
+    except subprocess.TimeoutExpired:
+        return 124, f"'docker {args[0]}' timed out after {timeout}s"
+
+    return result.returncode, (result.stderr or "").strip()
+
+
+def _require_service(service_id: str) -> None:
+    """
+    Raise 404 unless the service exists in the catalog.
+
+    Args:
+        service_id: Service ID to validate
+
+    Raises:
+        HTTPException: 404 if the service is unknown
+    """
+    if get_service_definition(service_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "type": "https://lem.gg/errors/service-not-found",
+                "title": "Service Not Found",
+                "detail": f"Service '{service_id}' not found in catalog",
+            },
+        )
+
+
+def _job_conflict(service_id: str, job_id: str | None) -> HTTPException:
+    """Build an RFC7807 409 for a service that already has an active job."""
+    detail: dict[str, str] = {
+        "type": "https://lem.gg/errors/job-in-progress",
+        "title": "Job Already In Progress",
+        "detail": f"Service '{service_id}' already has an active job",
+    }
+    if job_id:
+        detail["job_id"] = job_id
+    return HTTPException(status_code=409, detail=detail)
+
+
+def _create_job_or_conflict(job_type: JobType, service_id: str) -> str:
+    """
+    Create a job, refusing if the service already has an active one.
+
+    The pre-check is only an optimisation for a nicer error; the guarantee
+    comes from the partial unique index on jobs(service_id) for non-terminal
+    rows, which closes the race where two concurrent installs both passed the
+    check and both enqueued.
+
+    Args:
+        job_type: Type of job to create
+        service_id: Service the job operates on
+
+    Returns:
+        The new job ID
+
+    Raises:
+        HTTPException: 409 if a job is already active for the service
+    """
+    active_job = get_active_job_for_service(service_id)
+    if active_job:
+        raise _job_conflict(service_id, active_job.id)
+
+    try:
+        job = create_job(job_type, service_id)
+    except ActiveJobExistsError as e:
+        existing = get_active_job_for_service(service_id)
+        raise _job_conflict(service_id, existing.id if existing else None) from e
+
+    logger.info(f"Created {job_type.value} job {job.id} for {service_id}")
+    return job.id
+
 
 async def install_service(service_id: str) -> str:
     """
@@ -139,35 +252,8 @@ async def install_service(service_id: str) -> str:
     Raises:
         HTTPException: If service not found or already installing
     """
-    service_def = get_service_definition(service_id)
-    if not service_def:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "type": "https://lem.gg/errors/service-not-found",
-                "title": "Service Not Found",
-                "detail": f"Service '{service_id}' not found in catalog",
-            },
-        )
-
-    # Check if already installing
-    active_job = get_active_job_for_service(service_id)
-    if active_job:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "type": "https://lem.gg/errors/job-in-progress",
-                "title": "Job Already In Progress",
-                "detail": f"Service '{service_id}' already has an active job",
-                "job_id": active_job.id,
-            },
-        )
-
-    # Create the job (will be processed by background worker)
-    job = create_job(JobType.INSTALL, service_id)
-    logger.info(f"Created install job {job.id} for {service_id}")
-
-    return job.id
+    _require_service(service_id)
+    return _create_job_or_conflict(JobType.INSTALL, service_id)
 
 
 async def _handle_install_job(job: Job) -> None:
@@ -228,16 +314,7 @@ async def start_service(service_id: str) -> dict[str, str]:
     Raises:
         HTTPException: If service not found or not installed
     """
-    service_def = get_service_definition(service_id)
-    if not service_def:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "type": "https://lem.gg/errors/service-not-found",
-                "title": "Service Not Found",
-                "detail": f"Service '{service_id}' not found in catalog",
-            },
-        )
+    _require_service(service_id)
 
     status = await get_service_status(service_id)
     if status == ServiceStatus.NOT_INSTALLED:
@@ -276,16 +353,7 @@ async def stop_service(service_id: str) -> dict[str, str]:
     Raises:
         HTTPException: If service not found
     """
-    service_def = get_service_definition(service_id)
-    if not service_def:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "type": "https://lem.gg/errors/service-not-found",
-                "title": "Service Not Found",
-                "detail": f"Service '{service_id}' not found in catalog",
-            },
-        )
+    _require_service(service_id)
 
     status = await get_service_status(service_id)
     if status in (ServiceStatus.NOT_INSTALLED, ServiceStatus.STOPPED):
@@ -299,6 +367,28 @@ async def stop_service(service_id: str) -> dict[str, str]:
     )
 
     return {"status": "ok"}
+
+
+async def install_service_inline(service_id: str) -> None:
+    """
+    Pull and start a service, waiting for it to finish.
+
+    Used by the legacy /v1/runners and /v1/clients endpoints, which promised a
+    synchronous result before the job queue existed. Prefer install_service().
+
+    Args:
+        service_id: Service ID to install
+
+    Raises:
+        HTTPException: 404 if unknown, 503/504 if Harbor fails
+    """
+    _require_service(service_id)
+
+    await _run_harbor_command(
+        ["up", "--no-defaults", service_id],
+        INSTALL_TIMEOUT,
+        service_id,
+    )
 
 
 async def remove_service(service_id: str) -> str:
@@ -319,35 +409,8 @@ async def remove_service(service_id: str) -> str:
     Raises:
         HTTPException: If service not found or already removing
     """
-    service_def = get_service_definition(service_id)
-    if not service_def:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "type": "https://lem.gg/errors/service-not-found",
-                "title": "Service Not Found",
-                "detail": f"Service '{service_id}' not found in catalog",
-            },
-        )
-
-    # Check if already has active job
-    active_job = get_active_job_for_service(service_id)
-    if active_job:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "type": "https://lem.gg/errors/job-in-progress",
-                "title": "Job Already In Progress",
-                "detail": f"Service '{service_id}' already has an active job",
-                "job_id": active_job.id,
-            },
-        )
-
-    # Create the job
-    job = create_job(JobType.REMOVE, service_id)
-    logger.info(f"Created remove job {job.id} for {service_id}")
-
-    return job.id
+    _require_service(service_id)
+    return _create_job_or_conflict(JobType.REMOVE, service_id)
 
 
 async def _handle_remove_job(job: Job) -> None:
@@ -356,8 +419,13 @@ async def _handle_remove_job(job: Job) -> None:
 
     Args:
         job: Job to process
+
+    Raises:
+        RuntimeError: If any removal step failed, so the job is marked failed
+            instead of reporting a success it did not achieve
     """
     service_id = job.service_id
+    failures: list[str] = []
 
     # Stop the service first
     update_job_progress(job.id, 20, "Stopping service...")
@@ -368,54 +436,50 @@ async def _handle_remove_job(job: Job) -> None:
             STOP_TIMEOUT,
             service_id,
         )
-    except HTTPException:
-        # Ignore if already stopped
-        pass
+    except HTTPException as e:
+        # Not fatal: the service may already be down, or Harbor may be gone.
+        logger.warning(f"harbor down {service_id} did not succeed: {e.detail}")
 
-    # Remove container
-    update_job_progress(job.id, 50, "Removing container...")
+    # Resolve the exact image BEFORE the containers are gone
+    image = resolve_service_image(service_id)
+
+    update_job_progress(job.id, 50, "Removing containers...")
 
     try:
-        await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "rm", f"harbor.{service_id}"],
-            capture_output=True,
-            timeout=30,
-            env=_get_docker_env(),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to remove container: {e}")
+        containers = await asyncio.to_thread(list_service_containers, service_id)
+    except DockerUnavailableError as e:
+        raise RuntimeError(f"Cannot remove {service_id}: {e}") from e
 
-    # Find and remove image
+    for container in containers:
+        code, stderr = await _run_docker(["rm", "-f", container], CONTAINER_RM_TIMEOUT)
+        if code != 0 and "No such container" not in stderr:
+            failures.append(f"docker rm {container} exited {code}: {stderr}")
+        else:
+            logger.info(f"Removed container: {container}")
+
     update_job_progress(job.id, 80, "Removing image...")
 
-    try:
-        # List images to find the one for this service
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=_get_docker_env(),
-        )
+    if image is None:
+        # The compose file builds the image locally or leaves the reference
+        # unresolved. Removing a guess is how "remove agent" used to delete
+        # openhands/agent-server, so do nothing instead.
+        logger.info(f"No exact image known for {service_id}; leaving images untouched")
+        message = "Service removed (image kept: no exact image reference)"
+    else:
+        code, stderr = await _run_docker(["rmi", image], IMAGE_RM_TIMEOUT)
+        if code == 0:
+            logger.info(f"Removed image: {image}")
+            message = f"Service removed (image {image} deleted)"
+        elif "No such image" in stderr:
+            message = "Service removed (image was not present)"
+        else:
+            failures.append(f"docker rmi {image} exited {code}: {stderr}")
+            message = f"Service removed (image {image} could not be deleted)"
 
-        for image in result.stdout.strip().split("\n"):
-            if service_id.lower() in image.lower():
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["docker", "rmi", image],
-                    capture_output=True,
-                    timeout=60,
-                    env=_get_docker_env(),
-                )
-                logger.info(f"Removed image: {image}")
-                break
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
-    except Exception as e:
-        logger.warning(f"Failed to remove image: {e}")
-
-    update_job_progress(job.id, 100, "Service removed")
+    update_job_progress(job.id, 100, message)
 
 
 def register_job_handlers() -> None:
