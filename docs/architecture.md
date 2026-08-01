@@ -499,33 +499,53 @@ and `web/local/README.md` is still the unmodified Vite scaffold
 ## 8. Remote dashboard (`web/remote/`) — **Partial**
 
 ```
-web/remote/src/
-├── App.tsx                  # login -> device select -> connect -> catalog/viewer
-├── hooks/useAuth.ts         # JWT in localStorage (see security note below)
-├── hooks/useWebRTC.ts       # owns WebRTCConnectionManager + RelayClient + HTTPProxy
-├── lib/webrtc.ts            # RTCPeerConnection + signaling WebSocket
-├── lib/relay-client.ts      # relay WebSocket transport
-├── lib/proxy-fetch.ts       # fetch() over the tunnel  (works)
-├── lib/http-frame.ts        # v2 codec
-├── lib/ws-proxy.ts          # ProxiedWebSocket + WSProxyManager (v3 ack state machine)
-├── lib/ws-frame.ts          # v3 WS codec
-├── lib/ws-bridge.ts         # window.__lemWsBridge — the framed shim calls in here
-└── components/
-    ├── DeviceSelector.tsx   # GET /devices on the signaling server
-    ├── ConnectionStatus.tsx
-    ├── ServicesCatalog.tsx  # works, over proxyFetch
-    ├── ClientSelector.tsx   # works, over proxyFetch
-    ├── APITester.tsx        # works, over proxyFetch
-    └── ClientViewer.tsx     # frames /app/<deviceId>/<serviceId>/ via the Service Worker
+web/remote/
+├── public/lem-app-sw.js     # the Service Worker: classify, proxy, splice the shim
+└── src/
+    ├── App.tsx              # login -> device select -> connect -> catalog/viewer
+    ├── hooks/useAuth.ts     # login state; token custody lives in lib/session.ts
+    ├── hooks/useWebRTC.ts   # owns WebRTCConnectionManager + RelayClient + HTTPProxy
+    ├── lib/session.ts       # JWT in a module-scoped variable (see security note below)
+    ├── lib/sw-bridge.ts     # registration, swAvailable detection, page<->worker bridge
+    ├── lib/sw-status.ts     # user-facing text for each degradation reason
+    ├── lib/webrtc.ts        # RTCPeerConnection + signaling WebSocket
+    ├── lib/relay-client.ts  # relay WebSocket transport
+    ├── lib/proxy-fetch.ts   # fetch() over the tunnel  (works)
+    ├── lib/http-frame.ts    # v2 codec
+    ├── lib/ws-proxy.ts      # ProxiedWebSocket + WSProxyManager (v3 ack state machine)
+    ├── lib/ws-frame.ts      # v3 WS codec
+    ├── lib/ws-bridge.ts     # window.__lemWsBridge — the framed shim calls in here
+    ├── api/device-key.ts    # non-extractable ed25519 CryptoKey in IndexedDB
+    └── components/
+        ├── DeviceSelector.tsx   # GET /devices on the signaling server
+        ├── ConnectionStatus.tsx
+        ├── ServicesCatalog.tsx  # works, over proxyFetch
+        ├── ClientSelector.tsx   # works, over proxyFetch
+        ├── ServiceCard.tsx      # Launch disabled + reason when the worker is unavailable
+        ├── APITester.tsx        # works, over proxyFetch
+        └── ClientViewer.tsx     # frames /app/<deviceId>/<serviceId>/ via the Service Worker
 ```
 
 Frame routing on receipt reads byte 0 and dispatches to the HTTP proxy or the WS proxy manager,
 identically for both transports (`useWebRTC.ts:123-146` and `:206-222`).
 
-Security note relevant to the tunnel spec: the signaling JWT is kept in `localStorage`
-(`hooks/useAuth.ts:33`, `:44`, `:70`, `:92`). The same-origin Service Worker design in
-[`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §8.4 makes that storage reachable by framed
-app code and requires it to move.
+Security note relevant to the tunnel spec: the signaling JWT is held in a **module-scoped
+variable** in `lib/session.ts` and is persisted nowhere. It used to live in `localStorage`, which
+Phase 4 turned from a defensible choice into a live exposure — the framed app at
+`/app/<deviceId>/<serviceId>/` is genuinely same-origin with the dashboard and can read Web
+Storage directly ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §8.4 requirement 1, landed in
+Phase 6). Two consequences worth knowing before changing this code:
+
+- **A full page reload logs the user out**, deliberately. `lib/token-persistence.test.ts` asserts
+  it, so re-persisting the token "to fix reloads" fails the suite rather than passing review. The
+  `HttpOnly` refresh cookie that removes the cost is
+  [#79](https://github.com/lem-app/lem/issues/79) and belongs to `cloud/signaling`.
+- The ESLint rule banning `localStorage`/`sessionStorage` in `web/remote/src` is a tripwire, not
+  the guarantee. It cannot see IndexedDB, a cookie, a Cache entry or a URL fragment; the sweep in
+  `lib/token-persistence.test.ts` covers those, with a positive control per surface.
+
+The **device** keypair is a separate matter and still lives in IndexedDB (`api/device-key.ts`):
+it is a non-extractable `CryptoKey`, so framed code can neither read it nor copy it out.
 
 ---
 

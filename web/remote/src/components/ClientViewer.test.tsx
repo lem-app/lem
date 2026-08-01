@@ -109,6 +109,58 @@ async function findFrame(): Promise<HTMLIFrameElement> {
   })
 }
 
+// Defect #1 of issue #6 was the iframe pointing at the remote browser's own
+// loopback. The *other* half of that issue was the UI asserting the opposite of
+// what the build did. Both halves regress the same way - quietly, in a string -
+// so the claim is pinned here rather than left to review.
+describe('what ClientViewer tells the user about the tunnel', () => {
+  async function noteText(): Promise<string> {
+    await findFrame()
+    return document.body.textContent ?? ''
+  }
+
+  it('does not claim that everything is routed through a secure tunnel', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    // The exact claim the spec called out, and the shapes it mutates into.
+    expect(text).not.toMatch(/secure WebRTC tunnel/i)
+    expect(text).not.toMatch(/all (HTTP )?requests/i)
+    expect(text).not.toMatch(/all connections/i)
+  })
+
+  it('says the relay can see the traffic, because it can', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    expect(text).toMatch(/relay/i)
+    expect(text).toMatch(/terminates encryption/i)
+  })
+
+  // Presence-plus-scope tied to an issue number, so that closing #72 makes this
+  // stale rather than leaving a claim that is simply false.
+  it('says cookies are not delivered to framed apps, and cites #72', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    expect(text).toMatch(/cookies are not delivered to framed apps/i)
+    expect(text).toContain('#72')
+  })
+
+  // Cross-origin URLs are deliberately not intercepted (spec 3.8), so a user
+  // must not be told their third-party traffic goes via their device.
+  it('says third-party resources are fetched by this browser directly', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    expect(text).toMatch(/directly by this browser/i)
+  })
+})
+
 describe('ClientViewer iframe', () => {
   it('frames the same-origin app path, not the service endpoint', async () => {
     renderViewer('http://localhost:3000/', fakeBridge())

@@ -16,9 +16,12 @@
 /**
  * Authentication hook for managing login state.
  *
- * Token persistence, expiry checking and the 401 interceptor all live in
- * `lib/session.ts` - see the comment there for why the token is in
- * `localStorage` and what that does and does not buy us.
+ * Token custody, expiry checking and the 401 interceptor all live in
+ * `lib/session.ts`. The token is held in a module-scoped variable and is **not
+ * persisted anywhere**, because the framed app at `/app/<deviceId>/<serviceId>/`
+ * shares this origin and can read any store the dashboard writes (tunnel proxy
+ * spec §8.4). The consequence is visible right here: `initialState()` finds no
+ * token after a reload, so a reload is a logout.
  */
 
 import { useState, useCallback, useEffect } from 'react'
@@ -34,8 +37,9 @@ interface AuthState {
 }
 
 function initialState(): AuthState {
-  // readToken() drops the token if its `exp` claim has passed, so a stale
-  // session no longer renders a signed-in dashboard whose every call 401s.
+  // Always null on a fresh realm - see the module comment. readToken() also
+  // drops a token whose `exp` claim has passed, so a stale session never
+  // renders a signed-in dashboard whose every call 401s.
   const token = readToken()
   return {
     token,

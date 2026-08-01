@@ -148,6 +148,55 @@ tracked in [#29](https://github.com/lem-app/lem/issues/29);
 `LEM_TUNNEL_ALLOW_UNVERIFIED_PEERS=1` is a deliberate, loudly-logged opt-out
 that turns the check off.
 
+### ⚠️ Services you view remotely run with the dashboard's privileges
+
+**Only launch services you trust.**
+
+When you open a service from the remote dashboard it is framed at
+`/app/<deviceId>/<serviceId>/` — a path on **the dashboard's own origin**. That
+is not an implementation detail we could avoid: a Service Worker can only
+proxy a document it controls, and it can only control a same-origin one. The
+alternative is the frame loading your *own* machine's `localhost`, which is the
+bug this design exists to fix.
+
+The consequence is that a framed service is **not sandboxed away from the
+dashboard**. The `sandbox` attribute on the iframe does not change this:
+`allow-scripts` together with `allow-same-origin` is the documented escape
+hatch, and dropping `allow-same-origin` would stop the proxy working at all.
+Hostile or compromised service code in that frame can reach the dashboard's
+DOM and its storage. What we do about it:
+
+- The signaling JWT is **never persisted** — it lives in a variable for the
+  lifetime of the page, so there is no stored credential for a framed app to
+  read. The cost is that **a full page reload logs you out**; the `HttpOnly`
+  refresh cookie that removes that cost is
+  [#79](https://github.com/lem-app/lem/issues/79).
+- Upstream `Content-Security-Policy`, `X-Frame-Options` and
+  `Strict-Transport-Security` are stripped and replaced, so a framed app cannot
+  pin *your dashboard's* origin to HTTPS-only or break the proxy.
+
+**The real boundary is giving each service its own origin**
+(`<serviceId>.apps.<dashboard-domain>`), which costs wildcard DNS and a
+wildcard certificate. It is planned, not shipped. Until then, trust in a
+service you launch remotely is the security control.
+
+### Cookies are not delivered to remotely-viewed services
+
+**A framed app cannot sign you in.** This is a functional limitation, not a
+security boundary, and it should not be mistaken for one.
+
+`Set-Cookie` is a forbidden response-header name: a Service Worker cannot
+attach a cookie to a response it synthesises, and the browser never runs the
+step that would store one. So **no cookie from a service you view remotely ever
+reaches your browser** — anything needing a login session will not hold it.
+Tracked in [#72](https://github.com/lem-app/lem/issues/72), whose fix is for the
+worker to keep its own per-service jar. Read-only and anonymous apps are
+unaffected.
+
+Because no cookie exists, there is nothing partitioned and nothing isolated
+here — do not read this as "cookies are isolated per service". Per-service
+origins remain the actual boundary, as above.
+
 ## 📖 Documentation
 
 - [Coding Standards](./CLAUDE.md)
