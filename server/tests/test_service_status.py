@@ -74,7 +74,7 @@ class TestContainerToServiceId:
         assert status_mod.container_to_service_id("my-postgres", CATALOG_IDS) is None
 
     def test_longest_match_wins_over_shared_prefix(self) -> None:
-        """"metamcp" must not swallow a hypothetical "metamcp-sse" service."""
+        """ "metamcp" must not swallow a hypothetical "metamcp-sse" service."""
         ids = {"metamcp", "metamcp-sse"}
         assert status_mod.container_to_service_id("harbor.metamcp-sse", ids) == "metamcp-sse"
         assert status_mod.container_to_service_id("harbor.metamcp", ids) == "metamcp"
@@ -97,9 +97,7 @@ class TestResolveServiceImage:
         )
         assert status_mod.resolve_service_image("ollama") == "ollama/ollama:latest"
 
-    def test_registry_port_is_not_mistaken_for_a_tag(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_registry_port_is_not_mistaken_for_a_tag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             status_mod,
             "get_service_definition",
@@ -202,9 +200,7 @@ class TestDockerQuerying:
         monkeypatch.setattr(status_mod, "_run_docker", recorder)
         monkeypatch.setattr(status_mod, "scan_harbor_services", lambda: dict.fromkeys(CATALOG_IDS))
 
-        assert status_mod._get_containers() == {
-            "mcp-inspector": {"status": "running", "ports": ""}
-        }
+        assert status_mod._get_containers() == {"mcp-inspector": {"status": "running", "ports": ""}}
 
     async def test_status_of_hyphenated_service(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorder = _DockerRecorder(ps_json=_ps_line("harbor.mcp-inspector"))

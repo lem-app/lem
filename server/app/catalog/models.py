@@ -71,12 +71,8 @@ class ServiceMetadata(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="Service IDs this service depends on"
     )
-    has_api: bool = Field(
-        default=False, description="Whether the service exposes an HTTP API"
-    )
-    has_ui: bool = Field(
-        default=False, description="Whether the service has a web UI"
-    )
+    has_api: bool = Field(default=False, description="Whether the service exposes an HTTP API")
+    has_ui: bool = Field(default=False, description="Whether the service has a web UI")
 
 
 class ServiceDefinition(BaseModel):
@@ -90,14 +86,10 @@ class ServiceDefinition(BaseModel):
     name: str = Field(description="Human-friendly display name")
     category: ServiceCategory = Field(description="Service category")
     description: str = Field(description="Short description")
-    container_port: int | None = Field(
-        default=None, description="Primary container port"
-    )
+    container_port: int | None = Field(default=None, description="Primary container port")
     image: str = Field(default="", description="Docker image reference")
     tags: list[str] = Field(default_factory=list, description="Searchable tags")
-    depends_on: list[str] = Field(
-        default_factory=list, description="Service IDs this depends on"
-    )
+    depends_on: list[str] = Field(default_factory=list, description="Service IDs this depends on")
     has_api: bool = Field(default=False, description="Exposes HTTP API")
     has_ui: bool = Field(default=False, description="Has web UI")
 
@@ -114,9 +106,7 @@ class Service(BaseModel):
     category: ServiceCategory
     description: str
     status: ServiceStatus
-    host_port: int | None = Field(
-        default=None, description="Mapped host port when running"
-    )
+    host_port: int | None = Field(default=None, description="Mapped host port when running")
     endpoint: str | None = Field(default=None, description="Full URL when running")
     tags: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)

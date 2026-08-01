@@ -114,9 +114,7 @@ class TunnelAgent:
 
         # Message dispatcher with HTTP and WebSocket proxies
         self.router = create_router_with_client_discovery(local_server_url)
-        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(
-            local_server_url, router=self.router
-        )
+        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(local_server_url, router=self.router)
         self.ws_proxy: WSProxyHandler = WSProxyHandler(self.router, self._send_frame)
         self.message_dispatcher: MessageDispatcher = MessageDispatcher(
             self.http_proxy, self.ws_proxy
@@ -624,9 +622,7 @@ class TunnelAgent:
             # Start relay client for this session
             try:
                 # Create relay client for this specific session
-                relay_client = RelayClient(
-                    local_server_url=self.http_proxy.local_server_url
-                )
+                relay_client = RelayClient(local_server_url=self.http_proxy.local_server_url)
                 # The relay session's proxy is a separate instance, so it needs
                 # the authorization decision made above.
                 relay_client.http_proxy.authorize_peer(from_device_id)
@@ -641,9 +637,7 @@ class TunnelAgent:
                 # Track this relay session
                 self.relay_sessions[relay_session_id] = relay_client
 
-                logger.info(
-                    f"✓ Relay session established for {from_device_id}: {relay_session_id}"
-                )
+                logger.info(f"✓ Relay session established for {from_device_id}: {relay_session_id}")
 
                 # Send acknowledgment
                 await self._send_connect_ack(
@@ -698,9 +692,7 @@ class TunnelAgent:
                 "status": status,
             }
         )
-        logger.info(
-            f"Sent connect-ack to {target_device_id}: {transport}, {status}"
-        )
+        logger.info(f"Sent connect-ack to {target_device_id}: {transport}, {status}")
 
     async def _send_signaling_message(self, message: dict[str, Any]) -> None:
         """Send message to signaling server.
@@ -768,10 +760,7 @@ class TunnelAgent:
 
                     # Try WebRTC with timeout
                     try:
-                        await asyncio.wait_for(
-                            self._reconnect_full(),
-                            timeout=self.webrtc_timeout
-                        )
+                        await asyncio.wait_for(self._reconnect_full(), timeout=self.webrtc_timeout)
 
                         # Reset attempts on successful WebRTC connection
                         self.webrtc_attempts = 0
