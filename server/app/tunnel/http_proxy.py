@@ -72,7 +72,12 @@ from .http_frame import (
     serialize_response_head,
 )
 from .peer_auth import UNVERIFIED_PEER_LABEL, unverified_peers_allowed
-from .router import RequestRouter, create_router_with_client_discovery
+from .router import (
+    SERVICE_HEADER,
+    RequestRouter,
+    UnknownServiceError,
+    create_router_with_client_discovery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +99,12 @@ HOP_BY_HOP_HEADERS = frozenset(
     }
 )
 
-# Headers the proxy sets itself; a peer-supplied value is always discarded.
-PROXY_CONTROLLED_HEADERS = frozenset({CLIENT_HEADER, "authorization", "origin", "referer"})
+# Headers the proxy sets itself or consumes; a peer-supplied value never
+# reaches upstream. X-Lem-Service is routing metadata: the router reads it and
+# it is stripped here, so a peer cannot smuggle its own value through to an app.
+PROXY_CONTROLLED_HEADERS = frozenset(
+    {CLIENT_HEADER, SERVICE_HEADER, "authorization", "origin", "referer"}
+)
 
 # Response headers that must not cross back to the peer: single-hop framing, and
 # anything that would hand the peer upstream state. Content-Length and
@@ -127,6 +136,7 @@ GENERIC_PROXY_ERROR = "Proxy error"
 GENERIC_GATEWAY_ERROR = "Bad gateway"
 GENERIC_PEER_UNAUTHORIZED = "Peer not authorized"
 GENERIC_TOO_LARGE = "Payload too large"
+GENERIC_UNKNOWN_SERVICE = "Unknown service"
 
 
 def validate_path(path: str) -> str:
@@ -550,8 +560,21 @@ class HTTPProxyHandler:
             await self._fail_request(request_id, 403, GENERIC_PEER_UNAUTHORIZED)
             return
 
-        # Use router to determine target
-        target_url = self.router.route(intake.path)
+        # Use router to determine target. An X-Lem-Service header that does not
+        # resolve exactly is refused here; it never falls through to the local
+        # server, which would hand a mistyped service id the privileged local
+        # API together with the credentials appended below.
+        try:
+            target_url = self.router.route(intake.path, intake.headers)
+        except UnknownServiceError as exc:
+            logger.warning(
+                f"Rejected tunnel request {request_id} for service {exc.service_id!r}: "
+                f"not running or not exactly resolvable ({intake.method} {intake.path})"
+            )
+            await self._fail_request(
+                request_id, 502, GENERIC_UNKNOWN_SERVICE, TunnelErrorCode.E_UNKNOWN_SERVICE
+            )
+            return
 
         # Build full URL from a validated path (never string concatenation)
         try:

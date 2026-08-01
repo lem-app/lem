@@ -21,6 +21,8 @@ import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 import { useAuth } from './hooks/useAuth'
 import { useWebRTC } from './hooks/useWebRTC'
+import { useAppProxy } from './hooks/useAppProxy'
+import { swUnavailableMessage } from './lib/sw-status'
 import { registerDevice } from './api/auth'
 import { Login } from './components/Login'
 import { DeviceSelector } from './components/DeviceSelector'
@@ -113,6 +115,18 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
     // stable across renders (useWebRTC keys an effect on it).
     iceServers,
   })
+
+  const isTunnelUp =
+    connectionState === 'connected' && (connectionMode === 'relay' || dataChannelState === 'open')
+
+  const { status: swStatus, bridge } = useAppProxy({
+    proxyFetch,
+    deviceId: targetDeviceId,
+    tunnelUp: isTunnelUp,
+  })
+
+  const launchBlockedReason =
+    swStatus.state === 'unavailable' ? swUnavailableMessage(swStatus.reason) : null
 
   const handleDeviceSelect = (deviceId: string) => {
     setTargetDeviceId(deviceId)
@@ -210,19 +224,19 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
   }
 
   // Authenticated and device selected - check if viewing a client or service
-  const isViewingApp =
-    (selectedClientId || selectedServiceId) &&
-    connectionState === 'connected' &&
-    (connectionMode === 'relay' || dataChannelState === 'open')
+  const isViewingApp = (selectedClientId || selectedServiceId) && isTunnelUp
   if (isViewingApp) {
     return (
       <ClientViewer
         clientId={selectedClientId ?? undefined}
         serviceId={selectedServiceId ?? undefined}
+        deviceId={targetDeviceId}
         connectionState={connectionState}
         dataChannelState={dataChannelState}
         onBack={handleBackFromViewer}
         proxyFetch={proxyFetch}
+        swStatus={swStatus}
+        bridge={bridge}
       />
     )
   }
@@ -288,7 +302,11 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
 
               {/* View content */}
               {viewMode === 'services' ? (
-                <ServicesCatalog proxyFetch={proxyFetch} onLaunchService={handleLaunchService} />
+                <ServicesCatalog
+                  proxyFetch={proxyFetch}
+                  onLaunchService={handleLaunchService}
+                  launchBlockedReason={launchBlockedReason}
+                />
               ) : (
                 <ClientSelector proxyFetch={proxyFetch} onSelectClient={handleSelectClient} />
               )}

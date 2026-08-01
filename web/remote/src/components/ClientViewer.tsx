@@ -16,7 +16,15 @@
 /**
  * Client viewer component.
  *
- * Displays a remote client application (like Open WebUI) through the WebRTC proxy.
+ * Frames a service at a **same-origin** path, `/app/<deviceId>/<serviceId>/`,
+ * where a Service Worker intercepts every request the framed app makes and
+ * performs it over the tunnel.
+ *
+ * The service's own address - `http://127.0.0.1:33801` and the like - is never
+ * given to this browser as a URL to load. It is a *local-machine* address: put
+ * it in an `<iframe src>` on a remote browser and the browser resolves it
+ * against its own loopback, which is the whole of defect #1 in issue #6. The
+ * address is used only on the far side, by the router, to pick an upstream.
  */
 
 import { type ReactElement, useEffect, useState } from 'react'
@@ -27,7 +35,8 @@ import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ArrowLeft, Activity, AlertCircle, Loader2 } from 'lucide-react'
 import { localApiUrl } from '../lib/env'
-import { toFramableUrl } from '../lib/framable-url'
+import { appPath, type SessionRegistrar, type SwStatus } from '../lib/sw-bridge'
+import { swUnavailableMessage } from '../lib/sw-status'
 
 interface Client {
   id: string
@@ -47,23 +56,33 @@ interface AppInfo {
 interface ClientViewerProps {
   clientId?: string
   serviceId?: string
+  /** The device the tunnel is connected to; the first path segment. */
+  deviceId: string
   connectionState: ConnectionState
   dataChannelState: DataChannelState
   onBack: () => void
   proxyFetch: (url: string, init?: RequestInit) => Promise<Response>
+  /** Whether the same-origin proxy is usable, and why not when it is not. */
+  swStatus: SwStatus
+  /** Registers the service session before the frame is created. */
+  bridge: SessionRegistrar | null
 }
 
 export function ClientViewer({
   clientId,
   serviceId,
+  deviceId,
   connectionState,
   dataChannelState,
   onBack,
   proxyFetch,
+  swStatus,
+  bridge,
 }: ClientViewerProps): ReactElement {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [frameSrc, setFrameSrc] = useState<string | null>(null)
 
   const isConnected = connectionState === 'connected' && dataChannelState === 'open'
   const appId = serviceId || clientId
@@ -128,7 +147,41 @@ export function ClientViewer({
     void fetchAppInfo()
   }, [isConnected, clientId, serviceId, proxyFetch])
 
-  const framableUrl = toFramableUrl(appInfo?.url)
+  // Register the session, wait for the worker to acknowledge it, and only then
+  // build the frame URL. Strictly in that order: a `postMessage` to the worker
+  // and a navigation into its scope are independent queues, so a frame created
+  // optimistically can have its first request answered 410 by a worker that has
+  // not been told about the session yet.
+  useEffect(() => {
+    if (bridge === null || appId === undefined) return
+    if (appInfo?.status !== 'running') return
+
+    let path: string
+    try {
+      path = appPath(deviceId, appId)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error))
+      return
+    }
+
+    let cancelled = false
+    bridge
+      .openSession(deviceId, appId)
+      .then(() => {
+        if (!cancelled) setFrameSrc(path)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setErrorMessage(error instanceof Error ? error.message : String(error))
+        }
+      })
+
+    return () => {
+      cancelled = true
+      setFrameSrc(null)
+      bridge.closeSession(deviceId, appId)
+    }
+  }, [bridge, deviceId, appId, appInfo?.status])
 
   const getStatusBadge = () => {
     if (!isConnected || loading) {
@@ -272,46 +325,60 @@ export function ClientViewer({
 
         {isConnected &&
           !loading &&
+          !errorMessage &&
+          appInfo?.status === 'running' &&
+          swStatus.state === 'pending' && (
+            <Card>
+              <CardContent className="flex items-center justify-center py-12">
+                <div className="flex flex-col items-center gap-3">
+                  <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                  <p className="text-sm text-muted-foreground">Preparing the secure app proxy...</p>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+        {isConnected &&
+          !loading &&
           appInfo &&
           appInfo.status === 'running' &&
-          appInfo.url &&
-          framableUrl === null && (
+          swStatus.state === 'unavailable' && (
             <Alert variant="destructive">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                <strong>Refusing to embed {appInfo.name}.</strong> The local server reported the
-                address <code className="break-all">{appInfo.url}</code>, which is not a loopback
-                http(s) URL. Only local addresses are embedded, so a compromised or misconfigured
-                server cannot point this dashboard at arbitrary content.
+                <strong>Cannot open {appInfo.name} here.</strong>{' '}
+                {swUnavailableMessage(swStatus.reason)} Installing, starting and stopping services
+                still work.
               </AlertDescription>
             </Alert>
           )}
 
-        {isConnected && !loading && appInfo && appInfo.status === 'running' && framableUrl && (
+        {isConnected && !loading && appInfo && appInfo.status === 'running' && frameSrc && (
           <Card>
             <CardHeader>
               <CardTitle>{serviceId ? 'Service' : 'Client'} Interface</CardTitle>
               <CardDescription>
-                Accessing <strong>{appInfo.name}</strong> at {framableUrl}. WebSocket connections
-                are automatically proxied.
+                Accessing <strong>{appInfo.name}</strong> on device{' '}
+                <code className="break-all">{deviceId}</code>.
               </CardDescription>
             </CardHeader>
             <CardContent>
               {/*
-                `framableUrl` is allowlisted to loopback origins (see toFramableUrl),
-                which is what keeps `allow-same-origin` from being a sandbox escape:
-                the frame can never share this dashboard's origin. `allow-popups` and
-                `allow-top-navigation` stay off so the frame cannot open windows or
-                navigate the dashboard away, `allow=""` drops every powerful feature
-                (camera, mic, geolocation, ...), and no referrer leaks the app URL.
+                The src is same-origin by construction, which is what lets a
+                Service Worker control the document and proxy every request it
+                makes. It also means `allow-same-origin` + `allow-scripts` is
+                not a boundary: the framed document shares this origin and can
+                reach `parent.document`. The sandbox attribute restrains
+                well-behaved apps only - see the tunnel proxy spec, section 8.4.
+                `allow-popups` and `allow-top-navigation` stay off, and
+                `allow=""` drops every powerful feature (camera, mic, ...).
               */}
               <div className="rounded-lg border bg-background">
                 <iframe
-                  src={framableUrl}
+                  src={frameSrc}
                   title={appInfo.name}
                   className="h-[calc(100vh-300px)] w-full rounded-lg"
                   sandbox="allow-scripts allow-same-origin allow-forms"
-                  referrerPolicy="no-referrer"
                   allow=""
                 />
               </div>

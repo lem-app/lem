@@ -653,6 +653,11 @@ class TestResponseSizeCap:
         assert response.status_code == 502
         assert json.loads(response.body) == {"error": "Payload too large"}
         assert response.cancel_reason == int(TunnelErrorCode.E_TOO_LARGE)
+        # "Before streaming" as a fact, not an implication: the only chunk on
+        # the wire is the problem body, so not one byte of the 5 MB asset was
+        # framed before the refusal.
+        assert response.chunk_count == 1
+        assert BINARY_ASSET[:64] not in response.body
 
     async def test_unknown_length_over_cap_cancels_without_a_final_chunk(
         self, upstream: tuple[str, UpstreamState]

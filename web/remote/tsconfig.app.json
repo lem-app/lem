@@ -8,6 +8,13 @@
     "types": ["vite/client", "vitest/globals"],
     "skipLibCheck": true,
 
+    /* The Service Worker is authored as a checked ES module in `public/`: it
+       must be served verbatim at the origin root for the `/app/` scope to be
+       claimable, and a build step between source and served bytes is a place
+       for the two to disagree. JSDoc types make it as strict as the .ts. */
+    "allowJs": true,
+    "checkJs": true,
+
     /* Bundler mode */
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -32,5 +39,5 @@
   },
   // Tests are type-checked too. Excluding them let `webrtc.test.ts` push a
   // `string | ArrayBuffer` into a `string[]` without anyone noticing.
-  "include": ["src"]
+  "include": ["src", "public/lem-app-sw.js"]
 }

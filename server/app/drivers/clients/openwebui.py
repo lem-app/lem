@@ -18,7 +18,7 @@ Open WebUI URL discovery for Lem.
 
 Install/start/stop/status for Open WebUI are handled by app.services (the
 generic Harbor service path). All that remains here is URL discovery for the
-tunnel request router, which needs a synchronous lookup.
+legacy `/v1/clients` listing.
 """
 
 from __future__ import annotations
@@ -32,22 +32,25 @@ logger = logging.getLogger(__name__)
 # Harbor's service ID for Open WebUI
 OPENWEBUI_SERVICE_ID = "webui"
 
-OPENWEBUI_DEFAULT_URL = "http://127.0.0.1:3000"
 
-
-def get_openwebui_url() -> str:
+def get_openwebui_url() -> str | None:
     """
     Get the Open WebUI URL with the actual dynamically-mapped port.
 
     Harbor maps Open WebUI to a dynamic port, so Docker has to be queried for
-    it. Falls back to the standard port 3000 if discovery fails.
+    it. Returns None when discovery fails.
+
+    This used to return the sentinel "http://127.0.0.1:3000" on a miss, which
+    every caller then had to recognise as "not found" - a value that means two
+    things is a bug waiting to be rediscovered, and the tunnel router was the
+    one place that got the re-interpretation right.
 
     Returns:
-        str: The Open WebUI URL (e.g., "http://127.0.0.1:33801")
+        The Open WebUI URL (e.g. "http://127.0.0.1:33801"), or None
     """
     url = get_service_url(OPENWEBUI_SERVICE_ID)
     if url:
         return url
 
-    logger.warning("Could not discover Open WebUI port, using default 3000")
-    return OPENWEBUI_DEFAULT_URL
+    logger.warning("Could not discover the Open WebUI port")
+    return None
