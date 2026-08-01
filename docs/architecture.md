@@ -83,9 +83,9 @@ FastAPI app created in `server/app/main.py:130-137`. Startup and shutdown are dr
 ```
 server/app/
 ├── main.py                  # 26 endpoints + lifespan  (main.py:160-726)
-├── api/v1/auth.py           # 4 endpoints, /v1/auth/*  (auth.py:102-389)
+├── api/v1/auth.py           # 4 endpoints, /v1/auth/*  (auth.py:203-436)
 ├── db.py                    # SQLite: settings, device, auth, jobs
-├── crypto.py                # Ed25519 keypair generation
+├── crypto.py                # Ed25519 keypair, challenge signing
 ├── catalog/
 │   ├── scanner.py           # reads ~/.lem/harbor/compose.*.yml
 │   ├── registry.py          # curated metadata + merge
@@ -223,14 +223,20 @@ sequenceDiagram
 | `auth` | `id` PK `CHECK (id = 1)`, `state_json` | One row holding `{email, jwt_token, device_id, signaling_url}` (`db.py:265-317`). | `db.py:76-79` |
 | `jobs` | `id` PK, `type`, `service_id`, `status`, `progress`, `message`, `error`, `extra_json`, `created_at`, `updated_at` | Background job records; indexed on `status`, `service_id`, `created_at`. | `db.py:81-96` |
 
-The Ed25519 keypair is generated on first login/register (`api/v1/auth.py:154-158`, `:268-272`)
-and stored base64-encoded in `device.pubkey` / `device.privkey`. The public key is uploaded to
-the signaling server. **The private key is still never used to sign anything on this side** —
-`crypto.py`'s `load_keypair_from_b64` (`:78`) and `public_key_from_b64` (`:102`) have no call
-sites, so what authenticates this device to the cloud is its JWT. The signaling server does now
-demand an ed25519 signature (see §5), which is why registration from this client fails against
-current `main`; that is [#17](https://github.com/lem-app/lem/issues/17). File permissions are
-enforced today: `~/.lem` is 0700 and `lem.db` plus its WAL/SHM sidecars are 0600
+The Ed25519 keypair is generated on first login/register (`api/v1/auth.py:62-88`) and stored
+base64-encoded in `device.pubkey` / `device.privkey`. The public key is uploaded to the
+signaling server, and **the private key is used**: `crypto.py::sign_challenge` (`:108-125`)
+loads it via `load_keypair_from_b64` (`:139`) and signs the server's registration challenge
+(`auth.py:134`) and every signaling-connect challenge
+(`app/tunnel/webrtc_client.py:754-793`). Authenticating to the cloud therefore takes both the
+account JWT *and* possession of this key.
+
+`public_key_from_b64` (`:163`) is the *verification* primitive and still has no production call
+site — this process never has to verify anybody else's key, because tunnel peers are authorized
+by asking the signaling server rather than by challenging them directly. That is the open half
+of [#29](https://github.com/lem-app/lem/issues/29); see `app/tunnel/peer_auth.py`.
+
+File permissions are enforced: `~/.lem` is 0700 and `lem.db` plus its WAL/SHM sidecars are 0600
 (`db.py:46-47`, `:71`, `:84`); `~/.lem/api_token` is 0600 (`security.py:416`).
 
 Signaling server storage is separate: `users` and `devices` tables in `signaling.db` (SQLite) or
@@ -321,10 +327,10 @@ sequenceDiagram
 - Frames are dispatched on byte 0 (`message_dispatcher.py:65-101`) into `HTTPProxyHandler` or
   `WSProxyHandler`.
 
-**The diagram above is the server's contract, not what the clients do.** Neither
-`webrtc.ts:429-440` nor `webrtc_client.py:459-465` waits for the `challenge`, and neither
-registration call signs a nonce, so against a signaling server on current `main` the handshake
-does not complete — [#17](https://github.com/lem-app/lem/issues/17).
+Both clients implement the full handshake shown above, including the challenge step:
+`web/remote/src/lib/webrtc.ts:485-489` and `:521-536` in the browser,
+`server/app/tunnel/webrtc_client.py:557-561` and `:754-793` in the local server. Neither treats
+the socket as usable before `connected` arrives.
 
 **What works** once a connection is established: JSON API calls. `ServicesCatalog`,
 `ClientSelector`, `APITester`, and job polling all go through `proxyFetch` and function.
@@ -383,7 +389,7 @@ The mechanism functions when driven explicitly. **Automatic fallback does not tr
   the session.
 
 Also note: on the relay path frames are sent **in plaintext** to the relay
-(`relay_client.py:139-152`), which terminates TLS, forwards them in the clear and meters their
+(`relay_client.py:223-235`), which terminates TLS, forwards them in the clear and meters their
 size (`cloud/relay/app/core/session_manager.py:209-218`, `:288-297`). The protection is TLS to
 the relay, not end-to-end encryption, and the relay operator is trusted with the traffic. The
 README used to claim "End-to-end encryption: all remote traffic is encrypted"; it no longer
@@ -427,8 +433,8 @@ FastAPI app (`app/main.py:36-60`) with four routers: health, auth, devices, sign
 
 | Concern | Implementation |
 |---|---|
-| Auth | Email/password → JWT (`api/auth.py:27-135`), HS256, 24 h expiry (`core/config.py`). |
-| Devices | UPSERT keyed by `device_id`, rejecting a device id owned by another user with 403 (`api/devices.py:86-141`). |
+| Auth | Email/password → JWT (`api/auth.py:27-135`), HS256, 24 h expiry, `scope`-checked at every consumer (`core/config.py`). |
+| Devices | Two-step registration with ed25519 proof of possession; the key is pinned on first use and replacing it needs a rotation signature from the key on file. A device id owned by another user is a 403 (`api/devices.py:175-282`). |
 | Signaling | `WS /signal`; auth is a first `{"type":"auth"}` message followed by an ed25519 `challenge` / `auth-response` exchange (`api/signal.py:315-413`). The `?token=` query parameter was removed — it wrote credentials into access logs — and a request carrying one is refused with `unsupported-client`. |
 | Routing | `ConnectionManager` maps `device_id` → WebSocket (`signal.py:34-100`); one connection per device, older one closed on re-register (`signal.py:53-64`). |
 | Relay coordination | `connect-request` mints a server-side session id and a per-side single-use grant, answered with `connect-request-received` to the target and `connect-request-sent` to the requester (`signal.py:516-571`); a client-supplied `relay_session_id` is ignored. `connect-ack` is rewritten to `connect-ack-received` (`signal.py:496-500`). |
@@ -537,19 +543,19 @@ app code and requires it to move.
 | Relay **auto-fallback** | **Not working** | `webrtc_client.py:704-743`, `:69` ([#12](https://github.com/lem-app/lem/issues/12)) |
 | Local API authentication | **Implemented** | `server/app/security.py` — CSRF header always on, bearer token required unless a loopback-only bind was verified from the socket. PR [#25](https://github.com/lem-app/lem/pull/25) merged; the posture/bind decoupling in [#29](https://github.com/lem-app/lem/issues/29) is fixed |
 | Cloud authorization (session / device ownership) | **Implemented** | PR [#45](https://github.com/lem-app/lem/pull/45) merged — **breaking**, see below. Signaling routes only to devices you own (`signal.py:480-485`); relay sessions are server-minted and bound by a signed single-use grant to two devices of one account (`cloud/relay/app/core/session_manager.py:125-170`). Closed [#15](https://github.com/lem-app/lem/issues/15) and [#16](https://github.com/lem-app/lem/issues/16) |
-| Ed25519 device authentication | **Cloud side only** | The signaling server requires proof of possession at registration (`cloud/signaling/app/api/devices.py:151-169`) and at `/signal` (`signal.py:395-411`). **No client implements it**: `server/app/api/v1/auth.py:168-171` and `web/remote/src/api/auth.ts:126,136` send no signature, both WS clients never await the challenge (`webrtc_client.py:459-465`, `web/remote/src/lib/webrtc.ts:429-440`), and `server/app/crypto.py:78`/`:102` still have zero call sites ([#17](https://github.com/lem-app/lem/issues/17)) |
+| Ed25519 device authentication | **Implemented** | Verified server-side at registration (`cloud/signaling/app/api/devices.py:222-239`) and at `/signal` (`signal.py:401-413`), and performed by both clients: `server/app/api/v1/auth.py:89-160` and `server/app/tunnel/webrtc_client.py:754-793`; `web/remote/src/api/auth.ts:151-183` and `web/remote/src/lib/webrtc.ts:521-536`. Keys are pinned on first registration; rotation needs a second signature from the key on file. PR [#68](https://github.com/lem-app/lem/pull/68) merged, closing the client half of [#17](https://github.com/lem-app/lem/issues/17) |
 | Peer verification on the tunnel | **Interim gate** | `server/app/tunnel/peer_auth.py` checks the offering `sender_device_id` against the account's registered devices and denies unknown peers. It takes the signaling server's word for the identity; ed25519 proof of possession between peers is unbuilt ([#29](https://github.com/lem-app/lem/issues/29)) |
-| End-to-end encryption on the relay path | **Planned, not shipped** | plaintext to the relay (`relay_client.py:139-152`); the relay sees and meters the traffic ([#12](https://github.com/lem-app/lem/issues/12)) |
+| End-to-end encryption on the relay path | **Planned, not shipped** | plaintext to the relay (`relay_client.py:223-235`); the relay sees and meters the traffic ([#12](https://github.com/lem-app/lem/issues/12)) |
 | CI | **Implemented** | `.github/workflows/ci.yml` — 7 check runs incl. DCO, license headers, per-service coverage floors. PR [#26](https://github.com/lem-app/lem/pull/26) merged. The green-baseline half of [#20](https://github.com/lem-app/lem/issues/20) is still open: format/lint gates are currently red |
 
 **PR #45 (`fix/cloud-authz`) was a breaking signaling/relay protocol change, and it is merged.**
 It replaced the guessable `${browserDeviceId}-${targetDeviceId}` relay session id with a
 server-minted one, requires a per-side single-use session grant instead of the account token at
 the relay, and added an ed25519 challenge/response to both device registration and the `/signal`
-handshake. **The clients were not updated with it**, so on `main` today a Lem client cannot
-complete either handshake: it registers without a signature and treats the signaling socket as
-authenticated the moment it sends `auth`. That is the client half of
-[#17](https://github.com/lem-app/lem/issues/17). The contract is documented in
+handshake. **PR #68 (`feat/ed25519-proof-of-possession`) then taught both clients to speak it**
+and pinned each device's key on first registration, closing the client half of
+[#17](https://github.com/lem-app/lem/issues/17). Anything written against the pre-#45 handshake
+needs rewriting; the contract is documented in
 [`cloud/signaling/README.md`](../cloud/signaling/README.md) and
 [`cloud/relay/README.md`](../cloud/relay/README.md), reflected in
 [`api.md`](./api.md) §12–13, and the client-side work is enumerated in

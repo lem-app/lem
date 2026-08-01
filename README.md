@@ -69,17 +69,22 @@ Lem consists of five main components:
   their size ([`cloud/relay`](./cloud/relay/README.md#security)). End-to-end
   encryption on the relay path is on the roadmap, **not shipped**
   ([#12](https://github.com/lem-app/lem/issues/12))
-- **JWT authentication**: account access to the cloud services. This is the
-  authentication that is actually in force today for a user account
-- **Device authentication**: ed25519 challenge/response — the signaling server
-  requires a device to prove possession of its private key when it registers
-  and when it connects to signaling
-  ([`cloud/signaling`](./cloud/signaling/README.md#security)).
-  **Not yet implemented in the clients**: neither the local server nor the
-  remote dashboard signs the challenge, and `server/app/crypto.py`'s loading
-  helpers still have no call sites, so device registration against a current
-  signaling deployment does not yet succeed
-  ([#17](https://github.com/lem-app/lem/issues/17))
+- **JWT authentication**: account access to the cloud services (email/password).
+  This authenticates the *account*; the device key below authenticates the
+  *device*, and both are required
+- **Device authentication**: ed25519 challenge/response, implemented on every
+  client and verified by the server. A device signs a single-use challenge to
+  register and signs a fresh one each time it connects to signaling; the
+  signaling server checks both against the key on file and refuses otherwise
+  ([`cloud/signaling`](./cloud/signaling/README.md#security)). The key is pinned
+  on first registration — replacing it requires a second signature from the key
+  already on file, so holding your account password is not enough to swap a
+  device's identity
+- **What device authentication does not yet cover**: a tunnel peer is authorized
+  by asking the signaling server which devices your account owns, not by making
+  the peer prove key possession directly to your machine. That check trusts the
+  signaling server's answer. Peer-to-peer proof of possession is tracked in
+  [#29](https://github.com/lem-app/lem/issues/29)
 - **Session authorization**: relay sessions are bound by a signed grant to two
   devices of one account; signaling only routes between devices you own
 - **Open source**: Full transparency, audit the code yourself
