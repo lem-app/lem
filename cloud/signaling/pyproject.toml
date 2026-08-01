@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
-    "python-jose[cryptography]>=3.3.0",
+    "python-jose[cryptography]>=3.5.0",
     # bcrypt is used directly. passlib 1.7.4 is unmaintained and probes
     # bcrypt.__about__, which bcrypt removed in 4.1, spewing an error on
     # every hash; using bcrypt directly removes the version coupling.
