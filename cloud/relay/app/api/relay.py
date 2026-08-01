@@ -16,106 +16,155 @@
 """WebSocket relay endpoint."""
 
 import asyncio
+import contextlib
 import json
 import logging
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
-from ..core.security import validate_token
-from ..core.session_manager import session_manager
+from ..core.security import InvalidGrantError, SessionGrant, decode_session_grant
+from ..core.session_manager import JoinRejectedError, session_manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/relay", tags=["relay"])
+
+# Seconds a client has to send its auth message after connecting.
+AUTH_TIMEOUT_SECONDS = 10.0
+
+# Longest accepted auth frame. The grant is a JWT, so this is generous.
+MAX_AUTH_FRAME_BYTES = 8 * 1024
+
+
+async def close_with_error(websocket: WebSocket, message: str, code: int) -> None:
+    """Send an error frame then close the connection.
+
+    Args:
+        websocket: Connection to close.
+        message: Human-readable reason.
+        code: WebSocket close code.
+    """
+    with contextlib.suppress(Exception):
+        await websocket.send_json({"type": "error", "message": message})
+    with contextlib.suppress(Exception):
+        await websocket.close(code=code)
+
+
+async def authenticate(
+    websocket: WebSocket, session_id: str, token: str | None
+) -> SessionGrant | None:
+    """Read and verify the caller's session grant.
+
+    Args:
+        websocket: Accepted WebSocket connection.
+        session_id: Session identifier from the request path.
+        token: Grant supplied as a query parameter, if any.
+
+    Returns:
+        The verified grant, or None if the connection was closed.
+    """
+    grant_token = token
+
+    if grant_token is None:
+        try:
+            auth_data = await asyncio.wait_for(
+                websocket.receive_text(), timeout=AUTH_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            logger.warning(f"Session {session_id}: Auth timeout")
+            with contextlib.suppress(Exception):
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return None
+        except WebSocketDisconnect:
+            return None
+
+        if len(auth_data.encode("utf-8")) > MAX_AUTH_FRAME_BYTES:
+            await close_with_error(
+                websocket, "Auth message too large", status.WS_1009_MESSAGE_TOO_BIG
+            )
+            return None
+
+        try:
+            auth_msg = json.loads(auth_data)
+        except json.JSONDecodeError:
+            await close_with_error(
+                websocket, "Invalid JSON in auth message", status.WS_1008_POLICY_VIOLATION
+            )
+            return None
+
+        if not isinstance(auth_msg, dict) or auth_msg.get("type") != "auth":
+            await close_with_error(
+                websocket, "First message must be auth message", status.WS_1008_POLICY_VIOLATION
+            )
+            return None
+
+        grant_token = auth_msg.get("token")
+
+    if not isinstance(grant_token, str) or not grant_token:
+        await close_with_error(
+            websocket, "Auth message missing token", status.WS_1008_POLICY_VIOLATION
+        )
+        return None
+
+    try:
+        return decode_session_grant(grant_token, session_id)
+    except InvalidGrantError as e:
+        # Log the reason, but tell the client nothing that would help it probe
+        # for valid session ids.
+        logger.warning(f"Session {session_id}: grant rejected: {e}")
+        await close_with_error(
+            websocket, "Authentication failed", status.WS_1008_POLICY_VIOLATION
+        )
+        return None
 
 
 @router.websocket("/{session_id}")
 async def relay_websocket(
     websocket: WebSocket,
     session_id: str,
-    token: str | None = None,
+    token: str | None = Query(
+        None, description="Relay session grant (deprecated, use auth message)"
+    ),
 ) -> None:
     """WebSocket relay endpoint.
 
-    Connects two WebSocket clients via a relay session. Frames from one client
+    Connects the two devices named in a relay session grant. Frames from one
     are forwarded to the other bidirectionally.
 
-    Authentication can be provided via:
-    1. Query parameter (deprecated, token visible in logs)
-    2. First message with type "auth" (preferred, more secure)
+    The grant is minted by the signaling server after it has confirmed that
+    both devices belong to the same account. It names the session, the bearer
+    and the single permitted peer, so an unrelated account holding a perfectly
+    valid login token cannot join.
+
+    Authentication is provided by either:
+    1. A ``token`` query parameter (deprecated, token visible in logs).
+    2. A first message ``{"type": "auth", "token": "<grant>"}`` (preferred).
 
     Args:
         websocket: WebSocket connection.
-        session_id: Unique session identifier (shared by both clients).
-        token: JWT access token for authentication (optional, deprecated).
-
-    Raises:
-        HTTPException: If authentication fails.
+        session_id: Session identifier, minted by the signaling server.
+        token: Relay session grant (optional, deprecated).
     """
-    auth_token: str | None = token
-
-    # Accept connection first (auth can happen after)
     await websocket.accept()
 
-    # If no token in query params, wait for auth message
-    if auth_token is None or not validate_token(auth_token):
-        if auth_token is None:
-            try:
-                # Wait for auth message with 10 second timeout
-                auth_data = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=10.0
-                )
-                auth_msg = json.loads(auth_data)
-
-                if auth_msg.get("type") != "auth":
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "First message must be auth message"
-                    })
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
-
-                auth_token = auth_msg.get("token")
-
-            except TimeoutError:
-                logger.warning(f"Session {session_id}: Auth timeout")
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
-            except json.JSONDecodeError:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "Invalid JSON in auth message"
-                })
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
-
-        # Validate the token
-        if auth_token is None or not validate_token(auth_token):
-            logger.warning(f"Session {session_id}: Authentication failed")
-            await websocket.send_json({
-                "type": "error",
-                "message": "Authentication failed"
-            })
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-
-    logger.info(f"Session {session_id}: WebSocket connection authenticated")
+    grant = await authenticate(websocket, session_id, token)
+    if grant is None:
+        return
 
     try:
-        # Get or create session
-        session = await session_manager.get_or_create_session(session_id)
+        session, connection = await session_manager.join(session_id, grant, websocket)
+    except JoinRejectedError as e:
+        logger.warning(f"Session {session_id}: join rejected for {grant.device_id}: {e.reason}")
+        await close_with_error(websocket, e.reason, e.code)
+        return
 
-        # Add this WebSocket to the session
-        both_connected = session.add_connection(websocket)
+    logger.info(f"Session {session_id}: {grant.device_id} authenticated")
 
-        # Start forwarding (will wait if needed)
-        await session.start_forwarding(both_connected)
-
+    try:
+        await session.run(connection)
     except WebSocketDisconnect:
         logger.info(f"Session {session_id}: WebSocket disconnected")
     except Exception as e:
         logger.error(f"Session {session_id}: Error in relay: {e}", exc_info=True)
     finally:
-        # Clean up session
-        await session_manager.remove_session(session_id)
+        await session_manager.leave(session_id, session)

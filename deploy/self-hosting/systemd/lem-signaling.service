@@ -13,11 +13,24 @@ WorkingDirectory=/opt/lem/cloud/signaling
 Environment="PATH=/opt/lem/.local/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/opt/lem/cloud/signaling/.env
 
-# Start command using uvicorn with uv
+# Start command using uvicorn with uv.
+#
+# --workers MUST stay at 1. The connection registry that routes signaling
+# messages between devices is an in-process dictionary, and so are the
+# challenge store and the rate limiters. With more than one worker each
+# process gets its own copy: a device connected to worker 1 is invisible to
+# worker 3, so messages are silently dropped depending on which worker
+# happens to terminate the socket, and per-IP limits are multiplied by the
+# worker count. Scaling horizontally requires a shared store (Redis or
+# equivalent) for all three; see deploy/self-hosting/README.md.
+#
+# --ws-max-size caps WebSocket frames at the transport, before the
+# application buffers or parses them. uvicorn's default is 16 MB.
 ExecStart=/opt/lem/.local/bin/uv run uvicorn app.main:app \
     --host ${HOST} \
     --port ${PORT} \
-    --workers 4 \
+    --workers 1 \
+    --ws-max-size 65536 \
     --loop uvloop \
     --log-level info
 

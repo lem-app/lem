@@ -16,6 +16,8 @@
 """Main FastAPI application for relay server."""
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,22 +33,37 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Log startup and shutdown.
+
+    Args:
+        _app: The application being started.
+
+    Yields:
+        None, once startup is complete.
+    """
+    logger.info("Relay server started")
+    yield
+    logger.info("Relay server shutting down")
+
+
 # Create FastAPI app
 app = FastAPI(
     title="Lem Relay Server",
     description="WebSocket relay server for fallback connectivity",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
-# Parse CORS origins from settings
-cors_origins = (
-    ["*"] if settings.cors_origins == "*" else settings.cors_origins.split(",")
-)
-
-# Add CORS middleware
+# CORS. settings validation rejects an empty list and any "*" entry: this API
+# is credentialed, and Starlette answers a wildcard-plus-credentials config by
+# reflecting the caller's own Origin, which lets any site call it with the
+# user's credentials attached.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=settings.cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,15 +72,3 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router)
 app.include_router(relay.router)
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    """Initialize on startup."""
-    logger.info("Relay server started")
-
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    """Cleanup on shutdown."""
-    logger.info("Relay server shutting down")

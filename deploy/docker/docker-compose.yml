@@ -38,16 +38,23 @@ services:
       HOST: 0.0.0.0
       PORT: 8000
 
-      # JWT settings
-      SECRET_KEY: dev-secret-key-change-in-production
+      # JWT settings. Mandatory and read from deploy/docker/.env, which is
+      # not committed. `docker compose up` fails with the message below if it
+      # is unset, rather than falling back to a key published in this repo.
+      SECRET_KEY: "${LEM_SECRET_KEY:?Set LEM_SECRET_KEY in deploy/docker/.env - generate one with openssl rand -hex 32}"
       ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: 1440
 
       # Database
       DATABASE_URL: postgresql+asyncpg://lemadmin:dev-password@postgres:5432/signaling
 
-      # CORS
-      CORS_ORIGINS: "*"
+      # CORS. An explicit origin list is mandatory: this API is credentialed,
+      # and "*" with credentials makes the server reflect the caller's Origin.
+      CORS_ORIGINS: "${LEM_CORS_ORIGINS:-http://localhost:5173,http://localhost:5174}"
+
+      # The compose stack terminates at nginx, which appends the real client
+      # address to X-Forwarded-For, so per-IP limits can trust its last entry.
+      TRUST_X_FORWARDED_FOR: "true"
 
       # Relay URL
       RELAY_URL: ws://relay:8001
@@ -77,12 +84,13 @@ services:
       HOST: 0.0.0.0
       PORT: 8001
 
-      # JWT settings (must match signaling)
-      SECRET_KEY: dev-secret-key-change-in-production
+      # JWT settings. Must be identical to the signaling server: it mints the
+      # session grants this server verifies.
+      SECRET_KEY: "${LEM_SECRET_KEY:?Set LEM_SECRET_KEY in deploy/docker/.env - generate one with openssl rand -hex 32}"
       ALGORITHM: HS256
 
-      # CORS
-      CORS_ORIGINS: "*"
+      # CORS. See the note on the signaling service above.
+      CORS_ORIGINS: "${LEM_CORS_ORIGINS:-http://localhost:5173,http://localhost:5174}"
 
       # Session settings
       SESSION_TIMEOUT: 300
@@ -104,9 +112,14 @@ services:
   nginx:
     image: nginx:alpine
     container_name: lem-nginx
+    # Port 443 is deliberately not published. This stack ships no
+    # certificates and nginx.conf defines no TLS server block, so mapping 443
+    # only advertised an encrypted endpoint that did not exist. This is a
+    # local development stack: everything on port 80 is plaintext, including
+    # JWTs and relayed tunnel traffic. Use the self-hosting nginx configs,
+    # which terminate TLS properly, for anything reachable from a network.
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:

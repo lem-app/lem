@@ -16,16 +16,39 @@
 """Pydantic models for API requests and responses."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
+
+from ..core.security import BCRYPT_MAX_PASSWORD_BYTES
 
 
 class UserCreate(BaseModel):
     """User creation request."""
 
     email: EmailStr
-    password: str = Field(min_length=8)
+    # bcrypt hashes only the first 72 bytes of its input. Bound the field so
+    # two different long passwords can never collide into the same hash.
+    password: str = Field(min_length=8, max_length=BCRYPT_MAX_PASSWORD_BYTES)
+
+    @model_validator(mode="after")
+    def validate_password_bytes(self) -> Self:
+        """Reject passwords longer than bcrypt's input limit once encoded.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If the UTF-8 encoding exceeds bcrypt's limit.
+        """
+        # max_length counts characters; bcrypt counts bytes. Non-ASCII
+        # passwords can pass the field constraint and still be too long.
+        if len(self.password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+            raise ValueError(
+                f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes "
+                "when UTF-8 encoded"
+            )
+        return self
 
 
 class UserLogin(BaseModel):
@@ -42,11 +65,33 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
-class DeviceRegister(BaseModel):
-    """Device registration request."""
+class DeviceChallengeRequest(BaseModel):
+    """Request for a device registration challenge."""
+
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class DeviceChallengeResponse(BaseModel):
+    """Challenge a device must sign to prove it holds its private key."""
 
     device_id: str
-    pubkey: str
+    challenge: str = Field(description="Base64 challenge bytes to sign")
+    context: str = Field(description="Domain separation prefix for the signed message")
+    expires_in: int = Field(description="Seconds until the challenge stops being redeemable")
+
+
+class DeviceRegister(BaseModel):
+    """Device registration request.
+
+    ``challenge`` and ``signature`` prove possession of the private key that
+    matches ``pubkey``. Without them the stored key would be decorative and
+    device identity would rest entirely on the account token.
+    """
+
+    device_id: str = Field(min_length=1, max_length=128)
+    pubkey: str = Field(description="Base64-encoded raw ed25519 public key (32 bytes)")
+    challenge: str = Field(description="Challenge issued by POST /devices/challenge")
+    signature: str = Field(description="Base64-encoded ed25519 signature over the challenge")
 
 
 class DeviceResponse(BaseModel):
@@ -78,16 +123,29 @@ class HealthResponse(BaseModel):
 
 
 class ConnectRequest(BaseModel):
-    """Connection request with transport preference."""
+    """Connection request with transport preference.
+
+    Note that there is no ``relay_session_id`` field. Session ids are minted by
+    the server; a client-chosen id let anyone name (and therefore join) a
+    session belonging to someone else.
+    """
 
     type: Literal["connect-request"]
-    target_device_id: str = Field(description="Target device ID")
+    target_device_id: str = Field(description="Target device ID, must be owned by the sender")
     preferred_transport: Literal["webrtc", "relay", "auto"] = Field(
         default="auto", description="Preferred transport mode"
     )
-    relay_session_id: str | None = Field(
-        default=None, description="Relay session ID if using relay transport"
-    )
+
+
+class ConnectRequestSent(BaseModel):
+    """Confirmation to the requester, carrying its own relay session grant."""
+
+    type: Literal["connect-request-sent"]
+    target_device_id: str = Field(description="Device the request was delivered to")
+    relay_session_id: str = Field(description="Server-minted relay session ID")
+    relay_url: str | None = Field(default=None, description="Relay server WebSocket URL")
+    relay_token: str = Field(description="Single-use grant authorizing this device to join")
+    relay_token_expires_in: int = Field(description="Grant lifetime in seconds")
 
 
 class ConnectRequestReceived(BaseModel):
@@ -98,12 +156,12 @@ class ConnectRequestReceived(BaseModel):
     preferred_transport: Literal["webrtc", "relay", "auto"] = Field(
         description="Preferred transport mode"
     )
-    relay_session_id: str | None = Field(
-        default=None, description="Relay session ID if using relay transport"
-    )
+    relay_session_id: str = Field(description="Server-minted relay session ID")
     relay_url: str | None = Field(
         default=None, description="Relay server WebSocket URL"
     )
+    relay_token: str = Field(description="Single-use grant authorizing this device to join")
+    relay_token_expires_in: int = Field(description="Grant lifetime in seconds")
 
 
 class ConnectAck(BaseModel):

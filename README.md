@@ -61,10 +61,18 @@ Lem consists of five main components:
 
 ## 🔐 Security
 
-- **P2P by default**: Direct WebRTC connections when possible
-- **End-to-end encryption**: All remote traffic is encrypted
-- **JWT authentication**: Secure access to cloud services
-- **Device registration**: ed25519 public key authentication
+- **P2P by default**: Direct WebRTC connections when possible, with DTLS
+  encryption on that path
+- **Encryption in transit**: TLS to the cloud services, DTLS on the P2P path.
+  On the relay fallback path the relay terminates TLS and sees plaintext, so
+  it is trusted with your traffic. End-to-end encryption on the relay path is
+  on the roadmap, not shipped
+- **JWT authentication**: Account access to the cloud services
+- **Device authentication**: ed25519 challenge/response — a device proves
+  possession of its private key when it registers and when it connects to
+  signaling
+- **Session authorization**: relay sessions are bound by a signed grant to two
+  devices of one account; signaling only routes between devices you own
 - **Open source**: Full transparency, audit the code yourself
 
 ### Network exposure

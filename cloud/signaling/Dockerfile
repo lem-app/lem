@@ -49,5 +49,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 8000
 
-# Run with uvicorn
-CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop"]
+# Run with uvicorn.
+#
+# Single worker: the connection registry, challenge store and rate limiters
+# are all in-process, so a second worker would silently break routing and
+# multiply the limits. --ws-max-size rejects oversized WebSocket frames at
+# the transport rather than buffering uvicorn's 16 MB default first.
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--ws-max-size", "65536", \
+     "--loop", "uvloop"]

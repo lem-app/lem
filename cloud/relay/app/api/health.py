@@ -17,20 +17,22 @@
 
 from fastapi import APIRouter
 
-from ..core.session_manager import session_manager
-
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-async def health_check() -> dict[str, str | int]:
+async def health_check() -> dict[str, str]:
     """Health check endpoint.
 
+    Deliberately reports nothing beyond liveness. This endpoint is
+    unauthenticated and reachable from the internet, and the active session
+    count told anyone who asked how many tunnels were open and when.
+    Session counts are available to operators in the metering log stream.
+
     Returns:
-        Health status and active session count.
+        Health status.
     """
     return {
         "status": "healthy",
         "service": "relay",
-        "active_sessions": session_manager.get_session_count(),
     }

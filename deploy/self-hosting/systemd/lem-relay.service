@@ -13,11 +13,17 @@ WorkingDirectory=/opt/lem/cloud/relay
 Environment="PATH=/opt/lem/.local/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/opt/lem/cloud/relay/.env
 
-# Start command using uvicorn with uv
+# Start command using uvicorn with uv.
+#
+# --workers MUST stay at 1. Relay sessions live in an in-process dictionary,
+# so two peers that land on different worker processes never pair: the first
+# waits out its pairing timeout while the second creates a second, separate
+# session with the same id. Scaling horizontally requires a shared session
+# store; see deploy/self-hosting/README.md.
 ExecStart=/opt/lem/.local/bin/uv run uvicorn app.main:app \
     --host ${HOST} \
     --port ${PORT} \
-    --workers 2 \
+    --workers 1 \
     --loop uvloop \
     --log-level info
 
