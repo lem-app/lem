@@ -51,6 +51,13 @@ hardware the user already owns point one way, and every company that has held bo
 drifted toward renting GPUs. **That is the strongest argument for Lem being open source, and
 the strongest argument against expecting it to fund itself.**
 
+And one correction that changes the marketing more than the roadmap: **the r/LocalLLaMA power
+user is not the buyer.** That audience has already solved remote access for itself and answers
+new mechanisms with "just use Tailscale." The buyer is the person who is the de-facto IT
+department for other people — who can handle Docker but is really trying to get a phone into a
+family member's hands. The pitch is not "secure remote access", it is **"the people you live
+with can use it"** (§3).
+
 **The one move I would make first:** stop building features and close #15, #16, #7. Not
 because security is virtuous, but because *authenticated remote access is now the entire
 product*, and Lem currently has an unauthenticated one.
@@ -181,7 +188,9 @@ to fix it.
 | **[LM Studio + LM Link](https://lmstudio.ai/blog/locally-lm-link)** | Runtime + desktop + **iPhone app** | Yes — for its own runtime | **Yes**, since 4 Jun 2026 | Yes, via Tailscale identity | No — single runtime | **Proprietary** ("exclusive property of Element Labs"; no SaaS/redistribution) | Category leader |
 | **[Harbor](https://github.com/av/harbor)** | CLI + desktop app for a whole local AI stack | **Yes — the best in class** | **Yes** — `harbor tunnel` (cloudflared) | **No** — "⚠️ Ensure to configure authentication for the service" | **Yes — 89 services, 252 integrations** | Apache-2.0 | **3,150 stars**, 215 forks, v0.5.4 (20 Jul 2026) |
 | **[Tailscale](https://tailscale.com/pricing)** | Mesh VPN | **No** — explicitly | Yes, excellent | Yes, excellent | No | Clients BSD-3, control plane proprietary | Category leader; free ≤6 users |
-| **[Pangolin](https://github.com/fosrl/pangolin)** | Self-hosted tunnel + reverse proxy | No | Yes | Yes | No | AGPL-3 (CE) | **22,000+ stars** |
+| **[Pangolin](https://github.com/fosrl/pangolin)** | Self-hosted tunnel + reverse proxy | No | Yes | Yes | No | AGPL-3 CE + commercial | **21,954 stars**; YC 2025; $4–9/user/mo |
+| **[NetBird](https://github.com/netbirdio/netbird)** | WireGuard overlay + SSO/MFA | No | Yes | Yes | No | **BSD-3 client / AGPL server** — Lem's exact split | **27,973 stars**; $10M Series A (Jan 2026) |
+| **[Cosmos Server](https://github.com/azukaar/Cosmos-Server)** | *"All in one secure reverse-proxy, container manager with app store, integrated VPN, authentication provider"* | **Yes** | **Yes** | **Yes** | Yes (general self-hosting) | Source-available | **6,084 stars**; release posts reliably clear 170 pts in r/selfhosted (509 for v0.16) |
 | **[Pinokio](https://desktop.pinokio.co/)** | "AI browser" / one-click app launcher | Yes — JSON install scripts | **LAN only** — v8 (8 Jul 2026) added a "Home Server" with QR phone access | No | Yes | MIT (shell) | 7.8k stars but **41,670 Discord members**; 41k Windows downloads in 2 weeks |
 | **[Jan](https://jan.ai/docs/desktop/api-server)** | Desktop app + local API server | Models only | LAN only | **Yes — API keys, trusted-host allowlist, CORS; binds `127.0.0.1` by default** | No | Apache-2.0 + attribution request | 43.8k stars; claims 6.1M downloads |
 | **[LocalAI](https://localai.io/docs/features/authentication/)** | OpenAI-compatible inference engine | Models only | No first-party remote product | **Yes — OIDC, GitHub OAuth, per-user API keys and quotas** | No | MIT | 48.1k stars; 5.84M Docker pulls |
@@ -289,19 +298,38 @@ exposure*, and it is currently answered with tutorials rather than products.
 
 | Signal | Evidence | Reading |
 |---|---|---|
-| **Exposing local AI safely is an unsolved, actively harmful problem** | Tailscale, [Sept 2025](https://tailscale.com/blog/AI-endpoints-on-public-web), cites Cisco Talos finding **1,100+ exposed Ollama endpoints** via Shodan — ~1,000 found in ten minutes; ~20% actively serving models, the rest empty but writable | People *are* exposing local AI to the internet, and doing it badly. This is the single strongest argument for Lem's authenticated-by-default position. |
+| **Exposing local AI safely is an unsolved, actively harmful problem** | Tailscale, [Sept 2025](https://tailscale.com/blog/AI-endpoints-on-public-web), cites Cisco Talos finding **1,100+ exposed Ollama endpoints** via Shodan. By Jan 2026 the figure reported on HN was **[175,000+ publicly exposed Ollama instances](https://news.ycombinator.com/item?id=46831784)**. The Cisco/Shodan thread ([166 pts, 72 comments](https://news.ycombinator.com/item?id=45113418)) diagnoses the cause: tutorials that bind `0.0.0.0`, and Docker rewriting firewall rules | People *are* exposing local AI to the internet, at scale, and doing it badly. The strongest argument for Lem's authenticated-by-default position. |
+| **Ollama has declined to solve it** | [ollama#849 "How to secure the API with api key"](https://github.com/ollama/ollama/issues/849) closed; [#3203](https://github.com/ollama/ollama/issues/3203) and [#11941 "Secure Mode"](https://github.com/ollama/ollama/issues/11941) open with single-digit reactions | The category leader is not going to close this gap soon. That is the opening. |
+| **Reverse-proxy pain is the *single largest* issue in Open WebUI's history** | [#8074 "infra: Network Problem 0.5+"](https://github.com/open-webui/open-webui/issues/8074) has **203 comments** — the most-commented issue in a 9,190-issue tracker — and its mirror [discussion #12216](https://github.com/open-webui/open-webui/discussions/12216) has another 205. Maintainer's diagnosis: *"you have a network misconfiguration (most likely your reverse proxy)"*. Plus **238 discussions** matching "reverse proxy" | Not a long tail of small complaints — the number-one support burden on the leading local AI UI is *getting to it from somewhere else*. |
+| **Native mobile client is one of the most-wanted features** | [#8414 "feat: native companion mobile app"](https://github.com/open-webui/open-webui/issues/8414) — **51 reactions, open**, the 3rd most-reacted open issue in the repo; [discussion #3031 "Mobile App"](https://github.com/open-webui/open-webui/discussions/3031) — **106 reactions, 67 comments**, asking for *"an actual application… allow users to enter the address to their Open WebUI service"* | That is close to a verbatim spec for Lem's remote client. Note the contested counter-view: a vocal contingent says the existing PWA is sufficient. |
+| **Someone will pay ~$6 for it** | Conduit, a third-party Open WebUI mobile client, is a paid iOS app with an active user base | The only hard willingness-to-pay datapoint in the entire corpus — and it is for the *client*, not the tunnel. |
 | **Harbor itself binds to the world by default, and it is a known open complaint** | [Harbor #231](https://github.com/av/harbor/issues/231), "Harbor up should be private by default (bind to 127.0.0.1)", opened **14 Apr 2026**, showing `0.0.0.0:33801->8080/tcp`. Asks to "Listen to 127.0.0.1 by default", "Document the security concerns". **Open, no maintainer response, no label** | Harbor's security posture is a real gap its maintainer has not prioritized in ~4 months. This is the clearest evidence that Lem's differentiation has room — and a warning, since Lem's local server has the same defect (#7). |
 | **Reverse-proxy / HTTPS setup is chronic pain** | **34 issues** with "reverse proxy" in the title in the Open WebUI tracker, spanning Nov 2023 → May 2026 — e.g. [#1233 "Help Needed for Production Reverse Proxy Setup"](https://github.com/open-webui/open-webui/issues/1233), [#87 "Doesn't work behind Cloudflare + reverse proxy"](https://github.com/open-webui/open-webui/issues/87), [#3054 "CORS problems with reverse proxy using HTTPS, tools, and websockets"](https://github.com/open-webui/open-webui/issues/3054) | Three years of unresolved "how do I reach this from outside" friction on the leading local AI UI. |
 | **The answer is currently a blog post, not a product** | Tailscale publishes [*Self-host a local AI stack and access it from anywhere*](https://tailscale.com/blog/self-host-a-local-ai-stack) (May 2025), plus a cottage industry of third-party Tailscale+Ollama guides ([KDnuggets](https://www.kdnuggets.com/accessing-local-llms-remotely-using-tailscale-a-step-by-step-guide), [logarithmicspirals](https://logarithmicspirals.com/blog/using-tailscale-to-access-private-llms/), [glukhov.org](https://www.glukhov.org/llm-hosting/ollama/ollama-remote-access/)) — all requiring the user to hand-edit `OLLAMA_HOST=0.0.0.0:11434` into a systemd unit | The volume of tutorials *is* the demand signal. Tutorials exist where products do not. |
 | **Mobile clients want it and punt on it** | [Enchanted](https://github.com/gluonfield/enchanted) (6.0k stars) tells users to "install ngrok and forward your Ollama server"; [Conduit](https://github.com/cogwheel0/conduit) (1.9k) points at Tailscale, Cloudflare Tunnel, oauth2-proxy, Authelia, Authentik; [Reins](https://github.com/ibrahimcetin/reins) markets "Remote Server Access… from anywhere" and ships zero networking | Every mobile client treats connectivity as the user's problem. That is the seam. |
 | **Even Harbor's install has friction** | [Harbor #234](https://github.com/av/harbor/issues/234), "Install script fails due to HARBOR_* environment variable causing empty path" (4 comments) | Install is hard for everyone; it is table stakes, not a differentiator (see §8, thesis 1). |
 
-**Counter-signal, stated honestly:** Harbor has **3,150 stars but only 56 open issues**, most
-with zero comments, and 19 watchers. Open WebUI has 147k stars and its remote-access issues
-mostly attract single-digit comment counts. **The pain is broad but shallow** — many people
-hit it, few are angry enough to organize around it. That argues against expecting the fix to
-go viral on its own, and against a "security-first" pitch as the acquisition message. It is a
-retention argument, not a headline.
+**Three counter-signals, stated honestly, because they are more strategically consequential
+than the positive ones:**
+
+1. **The "app store for local AI" has weak — arguably negative — demand in this specific
+   audience.** Harbor's own r/LocalLLaMA reception has declined release over release, it has
+   ~100 Discord members against 3,150 stars, and a competing project's author publicly
+   described Harbor's catalog breadth as *"overwhelming."* The catalog demand that clearly
+   exists is for **models** and for a **small set of working defaults** — not for 137 services.
+   Contrast Cosmos Server, whose comparable pitch reliably clears 170 points *in r/selfhosted*.
+   **Breadth may be a liability with the local-AI crowd and an asset with the self-hosting
+   crowd**, which is a positioning decision, not a feature decision.
+2. **Willingness to pay is close to unevidenced.** One paid $6 mobile client is the whole
+   corpus. Every adjacent project — Harbor, Pinokio, LocalAI, Jan — has no monetization at
+   all. When Open WebUI added commercial licensing the response included a 641-point thread
+   objecting to it.
+3. **The most technical segment believes this problem is already solved** and reacts to new
+   mechanisms with "just use Tailscale." That is not a reason to abandon the product; it is a
+   reason not to launch it to them (§3).
+
+Taken together: the pain is real and well-evidenced, the *catalog* framing is not, and the
+"security-first" message is a retention argument rather than an acquisition one.
 
 ### 2.6 The precedent nobody talks about — Backyard AI already built this and retreated
 
@@ -349,37 +377,72 @@ and "centralize AI infrastructure without cloud vendor lock-in" (`README.md:16-2
 describe a team-infrastructure product. The code describes a single-user homelab tool. The
 code is right; the README should change.
 
-### The real user
+### The real user — and the correction that matters most in this document
 
-**A technically confident individual who already owns a GPU and already runs local AI.**
-They have Docker. They have used Ollama. They may already run Harbor or Open WebUI. They are
-on r/LocalLLaMA. They are not a Kubernetes operator and they are not a beginner — beginners
-do not have a 12 GB GPU sitting at home.
+The intuitive answer is "a technically confident individual who already owns a GPU, has
+Docker, uses Ollama, and reads r/LocalLLaMA." **The evidence says that person is not the
+buyer, and is in fact actively hostile to this product.**
 
-Critically: **they already solved "local AI" and are annoyed by the tenth thing, not the
-first.** Lem's competition for their attention is not "no solution"; it is "a solution that
-already works well enough."
+The demand research surfaced a consistent pattern in r/LocalLLaMA: posts announcing new
+remote-access mechanisms get dismissed rather than welcomed, with the top replies amounting to
+*"you're reinventing the wheel — I set up Tailscale on my router in 15 minutes."* In at least
+one such thread the commenter arguing that setup takes a non-expert an hour and may not work
+was **downvoted below zero**. Meanwhile the dissenting voices in those same threads identify
+the actual buyer without being asked — they describe setting this up *for someone else*: a
+parent, a grandparent, a household.
+
+*(Provenance note: these are archived Reddit threads reported by a research pass; Reddit
+blocks direct fetching and the specific threads were not in the archive mirror I could query,
+so treat the quotes as reported rather than independently verified. The strategic conclusion
+below does not rest on them alone — see the corroboration that follows.)*
+
+**Corroborating, and independently verified:**
+
+- **Cosmos Server** — *"All in one secure Reverse-proxy, container manager with app store,
+  integrated VPN, authentication provider, and Monitoring"* — is essentially Lem's concept for
+  general self-hosting. Its release post scored **509 points with 180 comments in
+  r/selfhosted** (archive-verified), and it has **6,084 GitHub stars**. The concept sells — in
+  the self-hosting community.
+- **Harbor's** r/LocalLLaMA reception has gone the other way over time, and it has ~100 Discord
+  members against 3,150 stars (§7 Risk 1).
+- **Pinokio** — the "app store for AI" — has **41,670 Discord members** against 7,803 stars.
+  Its users are not the GitHub-star demographic.
+
+**So the real user is: the technically confident person who is the de-facto IT department for
+other people.** They own the GPU and can handle Docker — but the *value* they are buying is
+not for themselves. It is being able to hand a phone to someone who will never read a README
+and have it work. That reframes several things:
+
+- The pitch is not "secure remote access." It is **"the people you live with can use it."**
+- The success metric is not stars. It is **second-device activations per install**.
+- **Do not launch on r/LocalLLaMA.** It is the wrong room: the audience there has already
+  solved this for themselves and treats a new mechanism as noise. r/selfhosted, where Cosmos
+  reliably clears 170 points per release, is the better room — as are homelab and
+  privacy-oriented communities.
 
 Two secondary users, both worth naming and both worth *deferring*:
 
-- **The privacy-motivated non-expert** who wants ChatGPT without OpenAI. Real, growing, and
-  the reason install experience matters — but they will not get past Docker as a prerequisite,
-  so they are a v1.0+ audience at best.
-- **The small team** wanting shared local inference. This is where money is, and it is
+- **The privacy-motivated non-expert** who wants ChatGPT without OpenAI. Real and growing, and
+  the ultimate end-user above — but they will not install Docker themselves, so they are
+  reached *through* the primary user, not directly.
+- **The small team** wanting shared local inference. This is where money is (§6), and it is
   irresponsible to pursue before #15/#16 are closed and an ownership model exists.
 
 ### Top 3 jobs to be done
 
-**JTBD 1 — "I want to use my own hardware from my phone without exposing it to the internet."**
-This is the primary job and the reason to exist. Evidence in §2.5: 1,100+ Ollama endpoints
-already sitting exposed on the public internet, 34 reverse-proxy issues on Open WebUI, a
-cottage industry of Tailscale+Ollama tutorials, and LM Studio spending an acquisition on it.
-The pain is real. The catch: it is now partly served, and the emphasis belongs on **"without
-exposing it"** — the unserved half — rather than on "from my phone", which LM Studio ships.
+**JTBD 1 — "I want the people in my house to use my hardware, from their phones, without me
+putting it on the internet."** This is the primary job and the reason to exist. Evidence in
+§2.5: up to 175,000 exposed Ollama instances, Ollama declining to add authentication, the
+most-commented issue in Open WebUI's entire history being a reverse-proxy failure, and
+LM Studio spending an acquisition on the mobile half. The emphasis belongs on **"without
+putting it on the internet"** and **"the people in my house"** — the unserved halves — not on
+"from my phone", which LM Studio already ships.
 
 **JTBD 2 — "I want to try a new AI service without spending an evening on Docker Compose."**
-This is Harbor's job, and Harbor does it well. Lem inherits it. It is table stakes, not
-differentiation, and Lem should say so rather than claiming the catalog as its own innovation.
+This is Harbor's job and Harbor does it well; Lem inherits it. Table stakes, not
+differentiation. **And the demand for it is weaker than it looks** (§2.5 counter-signal 1) —
+this audience wants a few things that work, not a catalogue of 137. Lem should present a
+curated default and let the rest be discoverable, rather than leading with the number.
 
 **JTBD 3 — "I want one door into my whole AI stack, that I control, and can close."**
 This is the synthesis and the only defensible one: not one model, not one tunnel per service,
@@ -529,33 +592,74 @@ worse than they look:
 |---|---|---|---|---|
 | **Hosted signalling + relay, free tier + paid** | Low | High (ops, abuse, geo-distribution, 24/7) | Good | **Run it free as infrastructure; do not expect revenue.** It removes the biggest onboarding blocker — nobody self-hosts a signalling server to try a product. Treat as a customer-acquisition cost, not a product. |
 | **Commercial/OEM licensing** (`README.md:108`) | Medium, lumpy | Low until a deal appears | **Fragile — see below** | Keep the offer. Do not plan around it. |
-| **Sponsorship / GitHub Sponsors** | **Near zero** | Very low | Perfect | Set it up (there is currently no funding link on the repo), but expect nothing. Plausible measured **$30 in donations over six months** against **$8,500+ MRR** from their hosted product over the same period ([Plausible](https://plausible.io/blog/open-source-saas)). Donations are not a funding model. |
+| **Sponsorship / GitHub Sponsors** | **Near zero** | Very low | Perfect | Set it up (there is no funding link on the repo today), but budget $0. The scaling is brutal: **Uptime Kuma, ~90,000 stars → ~$1,580/yr**; **Immich, ~109,000 stars → $438 lifetime** on Open Collective; Plausible measured **$30 in donations over six months** against $8,500+ MRR from hosting. There is even evidence receiving sponsorship *reduces* output ([NBER WP 31668](https://www.nber.org/papers/w31668)). |
 | **Paid "team" tier** (shared devices, SSO, audit) | Medium-high | Very high | Good | The only real business here — and unreachable until #15/#16 are closed and bus factor > 1. **Not now.** |
 | **Paid native mobile app** | Low | High | Poor — AGPL source-provision obligations complicate app stores | **No.** |
 | **Support contracts** | Low at this scale | Medium | Good | Requires users first. |
 | **Hardware bundles** | — | Extreme | — | **No.** YAGNI. |
 
-### Why the obvious comparable does not apply
+### The right comparables
 
-The natural model to copy is **Plausible Analytics**: AGPL, self-host free, hosted paid,
-bootstrapped to **$1M ARR with 7,000+ paying subscribers** and no venture capital
-([Plausible](https://plausible.io/blog/open-source-saas)). They relicensed MIT → AGPL for the
-same reason Lem chose AGPL: *"we became aware of the risks associated with a permissive open
-source license and of the corporations happy to take advantage of this."*
+**Not Plausible.** Plausible (AGPL, self-host free, hosted paid, ~$1M ARR bootstrapped) is the
+obvious model, but the analogy breaks where it matters: their hosted product is genuinely
+expensive to run — ingestion, storage, retention for a billion page views a month — and
+customers pay to *not* operate it. Lem's hosted product is a byte pipe. **You can sell managed
+complexity; you cannot sell a commodity three larger companies give away.** Worth noting that
+even Plausible's AGPL did not stop the free-riding it was adopted to stop — four years on they
+were still writing *"We face threats both from single-tenant and multi-tenant hosts and
+resellers"* ([Plausible CE](https://plausible.io/blog/community-edition)); what worked was
+trademark plus withholding features.
 
-**The analogy breaks at the point that matters.** Plausible's hosted product is genuinely
-valuable and genuinely expensive to run — ingestion, storage, retention, dashboards for a
-billion page views a month. Customers pay to *not* operate it. Lem's hosted product would be
-a byte pipe and a WebSocket, competing against a free Tailscale tier and a free Cloudflare
-Tunnel. **You can sell managed complexity; you cannot sell a commodity that three larger
-companies give away.**
+**The template is Nabu Casa / Home Assistant.** Apache-2.0 software, free forever, plus a
+**$6.50/month** subscription ([nabucasa.com/pricing](https://www.nabucasa.com/pricing/)) whose
+anchor is remote access but whose *value* is the bundle around it — voice assistant
+integration, text-to-speech, and funding the project. It reportedly converts ~30% of reporting
+installs and funds a 50+ person organisation. **Remote access is the hook; it is not the
+product.** If Lem ever charges, this is the shape.
 
-The cautionary case runs the other way: **Sentry abandoned open source licensing entirely**,
-moving BSD-3 → BSL because *"if we continue to use a fully permissive license, we face real
-competitive elements that threaten the future of Sentry"*
-([Sentry](https://blog.sentry.io/relicensing-sentry/)). AGPL protects Lem better than BSD
-protected Sentry, but the lesson stands: licensing does not create a business, and a project
-that cannot fund itself eventually changes its licence or stops.
+One technical detail from that comparable is worth adopting regardless of business model:
+Home Assistant's relay ([SNITun](https://github.com/NabuCasa/snitun)) decrypts *only* the
+multiplexer framing needed to route, leaving the payload end-to-end encrypted. **You can
+operate a relay without becoming a data custodian.** Lem's relay currently cannot — it "sees
+plaintext" (`cloud/relay/README.md:74`) — and fixing that is a prerequisite for both trust and
+the liability in §7 Risk 6.
+
+**The closest structural comparables are NetBird and Pangolin**, and both are instructive:
+
+| | NetBird | Pangolin |
+|---|---|---|
+| Stars | **27,973** | **21,954** |
+| Licence | **BSD-3 client / AGPL `management`, `signal`, `relay`** | AGPL-3 CE + commercial licence |
+| Pricing | Free 5 users → €6 → €12/user/mo | Free 5 users/sites → $4 → $9/user/mo |
+| Funding | **$10M Series A, Jan 2026** | **YC 2025** |
+| Contributor agreement | **CLA** | **CLA** |
+
+Two things follow. First, **NetBird's licence split is exactly the one Lem should consider** —
+permissive client, copyleft server — and it independently solves the mobile app-store problem
+(§below). Second, **both of the closest comparables use a CLA, and Lem does not.**
+
+**The cautionary case:** Sentry abandoned open source licensing entirely, moving BSD-3 → BSL →
+FSL because *"if we continue to use a fully permissive license, we face real competitive
+elements that threaten the future of Sentry"*
+([Sentry](https://blog.sentry.io/relicensing-sentry/)). They could do that because they had
+the rights to. Licensing does not create a business — but the *ability to change* licensing is
+an option worth preserving, and it is the one Lem is currently spending.
+
+### AGPL does less than the README implies
+
+`AGPL-FAQ.md` overstates the protection. AGPL §13 obligations fire only on **modification** —
+*"**If you modify the Program**, your modified version must prominently offer all users
+interacting with it remotely… the Corresponding Source"*
+([AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.en.html)). **Anyone may take Lem verbatim,
+run it as a paid commercial service, and owe nothing beyond an offer of already-public
+source.** AGPL stops proprietary *forks*; it does not stop *competition*. This is precisely why
+MongoDB invented SSPL and why Sentry's FSL FAQ calls AGPL insufficient.
+
+There is a cost on the other side too: [Google forbids AGPL code
+entirely](https://opensource.google/documentation/reference/using/agpl-policy), including
+installing AGPL programs on company devices. That closes the enterprise door §6 identifies as
+the only real business — another reason the NetBird split (permissive client, AGPL server) is
+worth serious consideration.
 
 ### The licensing trap nobody has noticed
 
@@ -568,31 +672,57 @@ so he holds the entire copyright and can dual-license freely. **The moment an ex
 contributor's code merges under DCO, that code cannot be relicensed without their
 permission** — DCO certifies origin, it does not assign or grant relicensing rights.
 
-Every external contribution therefore erodes the commercial-licensing option. This is not an
-argument for switching to a CLA — a CLA would be an honest signal that contributors' work may
-be relicensed, and many contributors reasonably refuse. It is an argument for **deciding
-deliberately, now, before the first outside PR lands**, and writing the decision down.
-Note that ZeroTier ([GPLv3 → BSL](https://www.zerotier.com/news/on-the-gpl-to-bsl-transition/))
-and Open WebUI (BSD-3 + branding restriction) both moved to restricted licences to protect a
-commercial position; whether Lem wants that door open is a choice with an expiry date.
+This is not speculation. The GNU project answers it directly: asked whether an author who
+wants to relicense a GPL work needs the permission of a later contributor, the
+[GPL FAQ](https://www.gnu.org/licenses/gpl-faq.html) says **"Yes."** And RMS on commercial
+exceptions: *"Someone else, who received the code under the GNU GPL or another copyleft
+license, **cannot** grant an exception"*
+([selling exceptions](https://www.gnu.org/philosophy/selling-exceptions.html)).
+
+**What it costs to get this wrong — VLC.** VideoLAN kept no CLA. Relicensing meant contacting
+**230+ developers**, took roughly a year, and **~25 modules had to be dropped or rewritten**
+where contributors could not be reached ([LWN](https://lwn.net/Articles/525718/)). Jean-Baptiste
+Kempf: *"to change the license, one must contact **every** author, even small contributors."*
+
+Every project in this analysis that successfully relicensed held a CLA. Both of Lem's closest
+comparables (NetBird, Pangolin) hold one. Pangolin's is
+[two sentences in a PR comment](https://github.com/fosrl/pangolin/blob/main/CONTRIBUTING.md).
+GitLab's split — [DCO for the open core, CLA only for proprietary
+directories](https://about.gitlab.com/community/contribute/dco-cla/) — is the most defensible
+structure if the commercial door is to stay open.
+
+**This document does not recommend which way to decide.** A CLA has a real cost: as Drew
+DeVault [argues](https://drewdevault.com/blog/Dont-sign-a-CLA/), it grants the ability to
+relicense *"up to and including making it entirely closed source"*, and many good contributors
+decline on principle. The recommendation is that **the decision be made deliberately and
+published before the first outside PR merges** — because after that it is no longer Lem's
+decision alone, and `AGPL-FAQ.md` currently promises both outcomes at once.
 
 ### Recommendation
 
 1. **Accept that there is no business model yet, and stop designing one.** There are 3 stars.
    The correct revenue plan for the next six months is "none".
 2. **Add GitHub Sponsors anyway** — it costs an afternoon — but budget $0 from it.
-3. **Run hosted signalling and relay free, with rate limits, as onboarding infrastructure.**
-   Nobody self-hosts a signalling server to try a product; this is the single biggest
-   removable barrier to a first user. Budget it as marketing spend. Requires #18 and #19.
-4. **Decide the CLA/DCO question and write it down before accepting external contributions.**
-   This is the only decision here with a hard deadline.
-5. **Do not build billing, metering, quotas, or tiers.** YAGNI.
-6. **Revisit in 12 months, at 1,000+ users, with a team tier** — the only option in the table
-   with real revenue potential, and it is gated on #15/#16 and on bus factor > 1.
+3. **Run hosted signalling and relay free, with hard rate limits, as onboarding
+   infrastructure.** Nobody self-hosts a signalling server to try a product; this is the
+   single biggest removable barrier to a first user. Budget it as marketing spend. Requires
+   #18 and #19 — **and the abuse controls in §7 Risk 6, which are not optional.**
+4. **Decide the CLA/DCO question and publish the decision before accepting external
+   contributions.** The only decision here with a hard deadline.
+5. **Evaluate NetBird's licence split** — permissive client, AGPL server. It preserves the
+   copyleft where it matters (the hosted components), removes the AGPL blocker for enterprise
+   and app-store distribution, and is what the closest comparable converged on independently.
+6. **Do not build billing, metering, quotas, or tiers.** YAGNI.
+7. **Revisit in 12 months, at 1,000+ users, with either a team tier or the Nabu Casa
+   bundle** — the only options with real revenue potential, both gated on #15/#16 and on
+   bus factor > 1.
 
 ---
 
-## 7. Top 5 risks
+## 7. Top risks
+
+Five were asked for; a sixth emerged from the research and is arguably the most
+under-appreciated of the set.
 
 ### Risk 1 — Harbor makes Lem redundant *(likelihood: high · impact: existential)*
 
@@ -710,6 +840,42 @@ of the time. It should be evaluated honestly rather than dismissed.
 *Mitigation:* Before more tunnel work, timebox a spike that runs the Lem dashboard over
 Tailscale and compare effort-to-working against finishing #6 + #12 + #15 + #16.
 
+### Risk 6 — Running a free relay makes you malware infrastructure *(likelihood: high if launched as designed · impact: existential)*
+
+This risk was absent from the original thesis and is the most under-appreciated item here.
+Every free tunnel/relay at scale has been abused into criminal infrastructure:
+
+- **ngrok is catalogued as [MITRE ATT&CK S0508](https://attack.mitre.org/software/S0508/)**,
+  used by OilRig, Ember Bear, Scattered Spider, LazyScripter and Fox Kitten. Their response:
+  an interstitial warning page, deliberate deanonymization (origin IP encoded into the
+  hostname) because *"anonymity incentivizes the use of ngrok to host malicious content"*
+  ([ngrok abuse policy](https://ngrok.com/abuse)) — and **a free tier of 1 GB/month**. That
+  number is a decade of abuse data expressed as a quota.
+- **TryCloudflare** (no account required) was abused through 2024 to deliver Xworm, AsyncRAT,
+  VenomRAT and Remcos at the scale of *"tens of thousands of messages"*
+  ([Proofpoint](https://www.proofpoint.com/us/blog/threat-insight/threat-actor-abuses-cloudflare-tunnels-deliver-rats)).
+- **TURN servers specifically are an SSRF/open-proxy pivot.** Enable Security reached AWS
+  metadata at `169.254.169.254` *through Slack's TURN server* with ordinary credentials and
+  port-scanned Slack's internal range
+  ([writeup](https://www.enablesecurity.com/blog/slack-webrtc-turn-compromise-and-bug-bounty/)).
+- **In the wild, Dec 2025:** `Backdoor.Turn` (DragonForce) abuses Microsoft Teams' TURN relays
+  to mask C2 traffic.
+
+**Lem's cloud is currently configured exactly the way every one of those incidents began:**
+open unauthenticated registration with no verification and no rate limiting (#18), a relay
+that forwards frames in plaintext (`cloud/relay/README.md:74`), no session authorization
+(#15), and a peer-controlled path that already turns the local server into a pivot (#8).
+
+The asymmetry is what makes this existential: a solo maintainer with no company behind them,
+named in an abuse report or a threat-intel writeup, has no legal budget and no press function.
+This is a plausible project-ending event that has nothing to do with product-market fit.
+
+*Mitigations, in order:* end anonymous provisioning; add a per-account byte cap from day one
+(ngrok chose 1 GB/month — start there, not unlimited); implement E2E through the relay on the
+SNITun model so Lem cannot see payloads and is not a custodian of them; publish an abuse
+contact and policy before the relay is public. **None of this is optional if the hosted relay
+ships.**
+
 ### Also worth naming
 
 - **Harbor version drift** — pinned v0.3.20 vs upstream v0.5.4; Lem parses Harbor's compose
@@ -740,7 +906,7 @@ Tailscale and compare effort-to-working against finishing #6 + #12 + #15 + #16.
 | 1 | Install experience is the top adoption blocker | **Refined** | Real, and Lem is worse than its own dependency: `https://lem.gg/install` returns **404**, and under a pipe `${BASH_SOURCE[0]}` evaluates to `main`, so the script silently treats the user's CWD as the repo root and exits 1 telling them to `git clone`. But Harbor already ships a working piped installer — so fixing this achieves **parity, not advantage**. It is the entry fee, not the moat, and it is not the *top* priority: the security debt is, because that is a liability rather than a missed opportunity. |
 | 2 | The moat is the intersection of management and remote access | **Refuted as stated; refined** | [LM Studio shipped LM Link on 4 Jun 2026](https://lmstudio.ai/blog/locally-lm-link) — runtime + iPhone app + Tailscale transport — and **Harbor already has `harbor tunnel`, `harbor qr`, and a desktop GUI**. Pinokio v8 added a phone-accessible "Home Server" on 8 Jul 2026. Both flanks of the intersection are occupied, and a third entrant arrived last month. The genuinely unoccupied position is narrower: **authenticated, identity-bound access to a multi-service catalog**. Harbor's tunnel warns *"⚠️ Ensure to configure authentication for the service"*, Pinokio's server is LAN-only, and LM Link reaches only LM Studio's own models. That three-way gap is the whole opportunity. |
 | 3 | The killer demo is mobile; go mobile-first PWA | **Confirmed as direction; refuted as differentiator** | LM Studio already ships the demo, free. Open WebUI is already a PWA. So do it — `web/remote/` has ~10 responsive utility classes, no manifest, and no service worker, which is indefensible for a product whose headline is phone access — but do not market it as the wedge, because it is table stakes as of June 2026. |
-| 4 | The 89-service catalog is an underexploited "app store" | **Confirmed as underexploited; refuted as Lem's asset** | It is **Harbor's** catalog, and it is bigger than 89 — Harbor's wiki lists ~137 services; 89 is merely what Lem's scanner finds in the pinned v0.3.20 checkout, alongside **252 cross-service integration files** (verified locally). Harbor's own desktop App already presents it. Lem's exploitable edge is not the catalog but **generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for every other. Fix that — and update the pin — and Lem has something Harbor does not. |
+| 4 | The 89-service catalog is an underexploited "app store" | **Refuted twice over** | (a) It is **Harbor's** catalog, not Lem's, and it is bigger than 89 — Harbor's wiki lists ~137; the 89 is what Lem's scanner finds in the pinned v0.3.20 checkout, alongside 252 cross-service integration files (verified locally). Harbor's own desktop App already presents it. (b) **More damaging: the demand is not there.** Harbor's r/LocalLLaMA reception has declined release over release, it has ~100 Discord members against 3,150 stars, and a competing maintainer called its breadth *"overwhelming"* — while the comparable pitch in r/selfhosted (Cosmos Server) reliably clears 170 points. This audience wants a few things that work. **Lem's exploitable edge is not the catalog at all — it is generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for every other. |
 | 5 | Hosted signalling/relay is the natural revenue line | **Refuted on economics; keep as infrastructure** | Cloudflare TURN is [$0.05/GB after 1 TB free](https://developers.cloudflare.com/realtime/turn/) and LLM text is tiny, so there is almost no cost to mark up; meanwhile [Tailscale is free forever for 6 users](https://tailscale.com/pricing) and Cloudflare Tunnel has been free since 2021. Worse, relay users are precisely those with the worst networks. Decisively: **Backyard AI gave exactly this away free in Feb 2024, then deprecated the whole desktop product and moved to selling hosted inference at $12–35/mo** (§2.6). Run the relay free as onboarding infrastructure. The plausible business is a **team tier**, blocked on #15/#16 and on bus factor. |
 
 ---
@@ -764,6 +930,13 @@ YAGNI, applied to strategy. Each of these should be actively declined:
 7. **Enterprise or team sales.** Not with a bus factor of 1, 19% coverage, and no CI.
 8. **A second frontend framework, a desktop app, or a rewrite.** The scope is already too
    wide for one maintainer.
+9. **Launching on r/LocalLLaMA.** Not a feature, but the same category of mistake. That
+   audience has solved this for itself and reliably answers new remote-access mechanisms with
+   "just use Tailscale" (§3). r/selfhosted, homelab and privacy communities are the right
+   rooms — Cosmos Server's comparable pitch clears 170+ points there every release.
+10. **Leading with the service count.** "89 services" (or 137) is the weakest part of the
+    pitch to this audience, not the strongest (§2.5 counter-signal 1). Lead with one thing
+    that works and someone else in the house using it.
 
 ---
 

@@ -313,6 +313,7 @@ trigger (`server/app/tunnel/webrtc_client.py:722`, `:732`).
 | 3.9 | A revoked device cannot reconnect, and its in-flight tunnel is torn down within 5 s. |
 | 3.10 | Model responses **stream** token-by-token over the tunnel — this requires working proxied WebSockets, which today never open because no `WS_CONNECT_ACK` frame exists (`server/app/tunnel/ws_proxy.py:146`, `web/remote/src/lib/ws-proxy.ts:444`). (#6) |
 | 3.11 | Works from cellular data with the phone's Wi-Fi off — the true test that this is not just LAN access. |
+| 3.12 | **The pairing flow works when the phone belongs to someone else.** Per [`positioning.md`](./positioning.md) §3, the buyer is usually setting this up *for another person* — a partner, a parent, a housemate. That person must reach a working chat from a scanned code without touching a terminal, without an account of their own, and without understanding what a tunnel is. This is the product's real success metric: **second-device activations per install.** |
 
 ---
 
