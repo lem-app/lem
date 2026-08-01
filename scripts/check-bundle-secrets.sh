@@ -267,12 +267,20 @@ printf '%s\n' "${ASSET_SHA256_ALLOWLIST[@]}" > "$HASH_FILE"
 # ---------------------------------------------------------------------------
 
 # SHA-256 of a string, on GNU (sha256sum) or BSD/macOS (shasum -a 256).
+#
+# Returns non-zero rather than an empty string if it cannot produce a digest.
+# The caller relies on that: an empty digest fed to `grep -qxF` is a pattern
+# that can match, which would turn a hashing hiccup into a SILENCED FINDING.
+# A secret scanner may fail loudly; it may not fail quiet.
 sha256_of() {
+  local digest
   if command -v sha256sum > /dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+    digest="$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"
   else
-    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+    digest="$(printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1)"
   fi
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$digest"
 }
 
 # Drop candidates whose SHA-256 is a vouched-for asset. Reads candidates on
@@ -281,9 +289,15 @@ sha256_of() {
 # Hashing happens last, after the cheap filters, so in practice this runs zero
 # or one times per file rather than once per long identifier in the bundle.
 filter_asset_hashes() {
-  local line
+  local line digest
   while IFS= read -r line; do
-    if ! grep -qxF -- "$(sha256_of "$line")" "$HASH_FILE"; then
+    if ! digest="$(sha256_of "$line")"; then
+      # Unhashable: report it. Every path out of this function that is not a
+      # confirmed match against the allowlist has to keep the finding.
+      printf '%s\n' "$line"
+      continue
+    fi
+    if ! grep -qxF -- "$digest" "$HASH_FILE"; then
       printf '%s\n' "$line"
     fi
   done
@@ -335,9 +349,9 @@ verify_invisible_class_is_current() {
   fi
 
   if ! python3 "$generator" --check; then
-    fail "the committed invisible-character class disagrees with Unicode $(python3 -c 'import unicodedata; print(unicodedata.unidata_version)' 2>/dev/null). Regenerate scripts/invisible-class.sh (see the diff above)."
+    fail 'the committed invisible-character class does not cover everything Unicode classifies as invisible (listed above). A literal split by one of those characters would not be reassembled.'
   fi
-  printf '  invisible-character class: %s code points, matches Unicode %s.\n' \
+  printf '  invisible-character class: %s code points (generated from Unicode %s), covers everything this interpreter knows about.\n' \
     "$INVISIBLE_CLASS_SIZE" "$INVISIBLE_UNICODE_VERSION"
 }
 
@@ -567,9 +581,19 @@ verify_scanner_detects_canaries() {
   rm -rf "$canary_dir"
 
   missing=0
+  local -a missed_list=()
   for canary in "${must_detect[@]}"; do
-    printf '%s' "$found" | grep -qF -- "$canary" || missing=$((missing + 1))
+    if ! printf '%s' "$found" | grep -qF -- "$canary"; then
+      missing=$((missing + 1))
+      missed_list+=("$canary")
+    fi
   done
+  if [[ "$missing" -ne 0 ]]; then
+    # Name them. A bare count says something broke but not what, and the
+    # canaries are indexed by their position in the invisible-character class,
+    # so the identity is exactly what tells you which rule stopped working.
+    printf '    missed canary: %s\n' "${missed_list[@]}" >&2
+  fi
 
   spurious=0
   for canary in "${must_not_detect[@]}"; do

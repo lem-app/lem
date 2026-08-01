@@ -56,7 +56,7 @@ Usage:
 """
 
 import pathlib
-import subprocess
+import re
 import sys
 import unicodedata
 
@@ -182,37 +182,80 @@ def render() -> str:
     return '\n'.join(lines) + '\n'
 
 
+def parse_committed(text: str) -> set[int]:
+    """Recover the class from a generated shell fragment.
+
+    Args:
+        text: Contents of invisible-class.sh
+
+    Returns:
+        The code points it encodes
+
+    Raises:
+        SystemExit: if the file cannot be parsed
+    """
+    ascii_match = re.search(r"INVISIBLE_ASCII=\$'([^']*)'", text)
+    utf8_match = re.search(r"INVISIBLE_UTF8_RE=\$'([^']*)'", text)
+    if ascii_match is None or utf8_match is None:
+        sys.exit(f'{OUTPUT} does not define INVISIBLE_ASCII and INVISIBLE_UTF8_RE.')
+
+    def unescape(chunk: str) -> bytes:
+        return bytes(int(pair, 16) for pair in re.findall(r'\\x([0-9a-fA-F]{2})', chunk))
+
+    found = {byte for byte in unescape(ascii_match.group(1))}
+    for sequence in utf8_match.group(1).split('|'):
+        if sequence:
+            found.add(ord(unescape(sequence).decode('utf-8')))
+    return found
+
+
 def main() -> int:
     """Entry point.
 
     Returns:
         Process exit code
     """
-    rendered = render()
-
     if '--check' in sys.argv[1:]:
         if not OUTPUT.exists():
             print(f'{OUTPUT} does not exist; run this generator to create it.', file=sys.stderr)
             return 1
-        committed = OUTPUT.read_text(encoding='utf-8')
-        if committed == rendered:
-            return 0
-        print(
-            f'{OUTPUT} is out of date with respect to Unicode '
-            f'{unicodedata.unidata_version}.\n'
-            'Regenerate it:\n'
-            '  ./scripts/gen-invisible-class.py > scripts/invisible-class.sh',
-            file=sys.stderr,
-        )
-        subprocess.run(
-            ['diff', '-u', str(OUTPUT), '-'],
-            input=rendered,
-            text=True,
-            check=False,
-        )
-        return 1
 
-    sys.stdout.write(rendered)
+        # Compare the CLASS, not the rendered file. The provenance comment names
+        # the Unicode version that produced it, which legitimately differs
+        # between a contributor's interpreter and CI's - and a byte comparison
+        # would turn that harmless difference into a failed security gate.
+        committed = parse_committed(OUTPUT.read_text(encoding='utf-8'))
+        derived = set(derive_class())
+
+        # The safety property is one-directional: the committed class must cover
+        # everything the local Unicode knows about. Missing a character is the
+        # U+0085 gap and fails. Containing EXTRA characters means the file was
+        # generated against a newer Unicode than this interpreter has, which is
+        # strictly safer - worth saying out loud, not worth blocking on.
+        missing = sorted(derived - committed)
+        if missing:
+            print(
+                f'{OUTPUT} is missing {len(missing)} character(s) that Unicode '
+                f'{unicodedata.unidata_version} classifies as invisible:\n'
+                + '\n'.join(
+                    f'    U+{cp:04X} {unicodedata.name(chr(cp), "<unnamed>")}' for cp in missing
+                )
+                + '\nA literal split by one of these would not be reassembled. Regenerate:\n'
+                '  ./scripts/gen-invisible-class.py > scripts/invisible-class.sh',
+                file=sys.stderr,
+            )
+            return 1
+
+        extra = sorted(committed - derived)
+        if extra:
+            print(
+                f'  NOTE: {OUTPUT.name} covers {len(extra)} character(s) unknown to this '
+                f'interpreter (Unicode {unicodedata.unidata_version}); it was generated '
+                'against a newer release. Superset, so nothing is missed.'
+            )
+        return 0
+
+    sys.stdout.write(render())
     return 0
 
 
