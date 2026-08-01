@@ -15,44 +15,62 @@
 # Public License for more details.
 
 """
-Derive the invisible-character class used by scripts/check-bundle-secrets.sh.
+Derive the non-advancing-character class used by check-bundle-secrets.sh.
 
 Writes a shell fragment to stdout; scripts/invisible-class.sh is that output,
-committed. The scanner sources it and, on every run, regenerates and compares -
+committed. The scanner sources it and, on every run, re-derives and compares -
 so a Unicode update that adds a character fails a check instead of silently
 opening a gap.
 
 WHY THIS EXISTS. The scanner's join pass reassembles a literal that has been
-split by something invisible, so it needs "every character that can sit between
-two halves of a string without being content". Three successive hand-written
-versions of that list each missed a case nobody had enumerated: first only
-``\\n``, then ``\\n`` plus tab and CR, then everything a reviewer had tried -
-which still missed U+0085 NEL, a genuine ``White_Space=Yes`` character. The
-list is now derived from Unicode itself rather than maintained by hand.
+split, so it needs "every character that can sit between two halves without
+being content". Four successive versions of that idea each lost to a case
+outside it: only "\\n"; then "\\n" plus tab and CR; then every whitespace
+character anyone had demonstrated, which still missed U+0085 NEL; then
+White_Space plus Cf, which missed category Mn (combining marks - a live,
+confirmed separator, since the scanner renders nothing and only needs bytes
+outside the credential alphabet).
 
-THE CLASS is ``White_Space=Yes`` union general category ``Cf`` (format), minus
-U+0020 SPACE:
+THE PRINCIPLE, stated so the members follow from it rather than the reverse:
+a character can hide a split if it DOES NOT ADVANCE THE CURSOR. That is
+exactly Unicode's separators, formats, and marks that combine onto a base:
 
-* ``White_Space`` is the obvious half, and is what the scanner's docstring used
-  to claim. U+0085 is in it. So is every character any reviewer has planted.
-* ``Cf`` covers the invisible characters that are *not* whitespace but separate
-  text just as effectively - U+200B ZERO WIDTH SPACE, U+200C/D joiners, U+2060
-  WORD JOINER, U+FEFF. The old list already contained U+FEFF, which is ``Cf``
-  and not ``White_Space``, so the stated scope never matched the code; taking
-  the whole category makes the claim true rather than narrowing it to fit.
-* U+0020 SPACE is excluded, and that exclusion is measured rather than assumed:
-  stripping it fuses adjacent Tailwind class names into runs that trip the
-  opaque-literal rule. See the measurement note in invisible-class.sh.
+    White_Space=Yes  union  Cf (format)  union  Mn (nonspacing mark)
+                     union  Me (enclosing mark)        minus  U+0020 SPACE
 
-Deliberately NOT included: general category ``Cc`` beyond the whitespace
-controls already in ``White_Space``. Those are arbitrary control bytes, and
-stripping them from a binary asset under dist/ would fuse unrelated bytes into
-spurious long runs. Whitespace and format characters are enough to reassemble a
-split *literal*, which is what the join pass is for.
+Mn and Me are zero-width BY DEFINITION - they compose onto a preceding base
+character - so they belong to "invisible" for a reason that has nothing to do
+with which ones a reviewer happened to try. Mc (spacing combining mark) is
+excluded: it advances.
+
+U+0020 SPACE is excluded, and that exclusion is measured, not assumed. See the
+measurement note in the generated file.
+
+WHY NOT THE FULLY GENERAL RULE. The general case is "a credential-shaped run
+interrupted by a short run of characters outside the credential alphabet",
+which would cover every separator including ones nobody has thought of. It was
+implemented and measured against real builds of both apps, counting extra
+opaque-literal findings over baseline, for a minimum context length L on each
+side and a maximum gap N:
+
+    L=4    N=1..3     36-65 (web/local)    42-70 (web/remote)
+    L=8    N=1..3     10-15                15-19
+    L=12   N=1..3      6-8                  9-10
+    L=16   N=1..3      3-4                  6
+    L=20   N=1..3      0                    1-2
+
+Rejected on those numbers. The only configuration approaching zero is L=20, and
+it fails in both directions at once. The residual findings on web/remote are
+ordinary minified code whose punctuation was eaten -
+`connectAckPromise=nullCONNECT_ACK_TIMEOUT_MS=3e4` - a shape that gets MORE
+common as the apps grow. And requiring 20 characters of context on each side
+would miss a 32-character secret split evenly in two, which is precisely the
+case the join pass exists for. Worse coverage plus a growing false-positive
+tax. The derived class costs zero findings and covers its members exactly.
 
 Usage:
     ./scripts/gen-invisible-class.py            # write the fragment to stdout
-    ./scripts/gen-invisible-class.py --check    # diff against the committed file
+    ./scripts/gen-invisible-class.py --check    # verify the committed file
 """
 
 import pathlib
@@ -61,19 +79,24 @@ import sys
 import unicodedata
 
 # Unicode defines White_Space as the separator categories plus these six
-# controls. Deriving it this way rather than hardcoding the code points means a
-# future addition to Zs/Zl/Zp is picked up automatically; the cross-check below
-# is what guards the hardcoded half.
+# controls. Deriving the rest from category data means a future addition to
+# Zs/Zl/Zp is picked up automatically; the cross-check below guards the
+# hardcoded half.
 WHITESPACE_CONTROLS = frozenset({0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x85})
 
 # str.isspace() is True for White_Space plus these four legacy separators, and
-# nothing else. Asserting that relationship checks our derivation against a
-# completely separate implementation inside CPython: if either drifts, the
-# generator fails loudly instead of emitting a quietly wrong class.
+# nothing else. Asserting that relationship checks the derivation against a
+# separate implementation inside CPython.
 ISSPACE_EXTRAS = frozenset({0x1C, 0x1D, 0x1E, 0x1F})
 
-SPACE = 0x20
+# Categories that do not advance the cursor.
+NON_ADVANCING = ('Zs', 'Zl', 'Zp', 'Cf', 'Mn', 'Me')
 
+# Categories an "extra" member may legitimately have: things this interpreter
+# cannot classify, which is what a future Unicode addition looks like from here.
+UNASSIGNED = ('Cn', 'Co', 'Cs')
+
+SPACE = 0x20
 MAX_CODEPOINT = 0x110000
 
 OUTPUT = pathlib.Path(__file__).with_name('invisible-class.sh')
@@ -83,55 +106,164 @@ def derive_white_space() -> frozenset[int]:
     """Code points with Unicode White_Space=Yes.
 
     Returns:
-        The White_Space property set.
+        The White_Space property set
 
     Raises:
         SystemExit: if the derivation disagrees with str.isspace()
     """
     separators = {
-        cp
-        for cp in range(MAX_CODEPOINT)
-        if unicodedata.category(chr(cp)) in ('Zs', 'Zl', 'Zp')
+        cp for cp in range(MAX_CODEPOINT) if unicodedata.category(chr(cp)) in ('Zs', 'Zl', 'Zp')
     }
     white_space = frozenset(separators | WHITESPACE_CONTROLS)
 
     isspace = {cp for cp in range(MAX_CODEPOINT) if chr(cp).isspace()}
-    expected = white_space | ISSPACE_EXTRAS
-    if isspace != expected:
-        missing = sorted(isspace - expected)
-        extra = sorted(expected - isspace)
+    if isspace != white_space | ISSPACE_EXTRAS:
         sys.exit(
-            'White_Space derivation disagrees with str.isspace() on '
-            f'Python {sys.version_info.major}.{sys.version_info.minor} '
-            f'(Unicode {unicodedata.unidata_version}).\n'
-            f'  in isspace() but not derived: {[hex(c) for c in missing]}\n'
-            f'  derived but not in isspace(): {[hex(c) for c in extra]}\n'
-            'Unicode has changed in a way this generator did not anticipate. '
-            'Re-read the White_Space definition before touching this.'
+            'White_Space derivation disagrees with str.isspace() on Unicode '
+            f'{unicodedata.unidata_version}. Re-read the White_Space definition '
+            'before touching this.'
         )
     return white_space
 
 
 def derive_class() -> list[int]:
-    """The full invisible-character class, minus SPACE.
+    """The non-advancing class, minus SPACE.
 
     Returns:
-        Sorted code points to strip in the join pass.
+        Sorted code points to strip in the join pass
     """
-    formats = {cp for cp in range(MAX_CODEPOINT) if unicodedata.category(chr(cp)) == 'Cf'}
-    return sorted((derive_white_space() | formats) - {SPACE})
+    categorised = {
+        cp for cp in range(MAX_CODEPOINT) if unicodedata.category(chr(cp)) in NON_ADVANCING
+    }
+    return sorted((derive_white_space() | categorised) - {SPACE})
 
 
-def shell_quote_bytes(raw: bytes) -> str:
-    """Render bytes as a bash ANSI-C quoted string.
+def to_ranges(values: list[int]) -> list[tuple[int, int]]:
+    """Collapse a sorted list into inclusive ranges.
 
     Args:
-        raw: The bytes to render
+        values: Sorted, unique integers
 
     Returns:
-        A $'...' literal
+        (first, last) pairs
     """
-    return "$'" + ''.join(f'\\x{byte:02x}' for byte in raw) + "'"
+    ranges: list[tuple[int, int]] = []
+    for value in values:
+        if ranges and value == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], value)
+        else:
+            ranges.append((value, value))
+    return ranges
+
+
+def render_ranges(ranges: list[tuple[int, int]]) -> str:
+    """Render ranges as the compact hex form stored in the shell fragment.
+
+    Args:
+        ranges: Inclusive (first, last) pairs
+
+    Returns:
+        Comma-separated "aaaa" or "aaaa-bbbb" items
+    """
+    return ','.join(f'{lo:x}' if lo == hi else f'{lo:x}-{hi:x}' for lo, hi in ranges)
+
+
+def parse_ranges(text: str) -> list[int]:
+    """Inverse of render_ranges.
+
+    Args:
+        text: Comma-separated hex items
+
+    Returns:
+        Sorted code points
+    """
+    out: set[int] = set()
+    for item in text.split(','):
+        if not item:
+            continue
+        if '-' in item:
+            lo, hi = item.split('-', 1)
+            out.update(range(int(lo, 16), int(hi, 16) + 1))
+        else:
+            out.add(int(item, 16))
+    return sorted(out)
+
+
+def build_regex(code_points: list[int]) -> str:
+    """Build the ERE alternation matching the multi-byte members.
+
+    Sequences sharing a UTF-8 prefix and differing only in their final byte are
+    emitted as one bracket expression, which keeps a ~2000-member class down to
+    a regex sed can compile and run quickly. Final bytes of multi-byte UTF-8 are
+    always 0x80-0xBF, so a bracket range can never capture ']', '^' or '-'.
+
+    Args:
+        code_points: Sorted code points; ASCII members are ignored here
+
+    Returns:
+        An alternation of \\xNN escapes, for bash $'...' interpolation
+    """
+    groups: dict[bytes, list[int]] = {}
+    for cp in code_points:
+        if cp < 0x80:
+            continue
+        encoded = chr(cp).encode('utf-8')
+        groups.setdefault(encoded[:-1], []).append(encoded[-1])
+
+    def esc(raw: bytes) -> str:
+        return ''.join(f'\\x{byte:02x}' for byte in raw)
+
+    alternatives: list[str] = []
+    for prefix in sorted(groups):
+        for lo, hi in to_ranges(sorted(groups[prefix])):
+            if lo == hi:
+                alternatives.append(esc(prefix) + esc(bytes([lo])))
+            else:
+                alternatives.append(f'{esc(prefix)}[{esc(bytes([lo]))}-{esc(bytes([hi]))}]')
+    return '|'.join(alternatives)
+
+
+def build_ascii(code_points: list[int]) -> str:
+    """Render the single-byte members for `tr -d`.
+
+    Args:
+        code_points: Sorted code points
+
+    Returns:
+        A \\xNN escape sequence string
+    """
+    return ''.join(f'\\x{cp:02x}' for cp in code_points if cp < 0x80)
+
+
+def build_canary_separators(code_points: list[int]) -> list[str]:
+    """One representative multi-byte member per emitted regex alternative.
+
+    The self-test plants a split canary for each of these. Testing every one of
+    the ~2200 members would dominate the scanner's runtime for no extra signal:
+    the alternative is the unit that can actually break, since each is a
+    separate branch of the compiled regex, and a broken branch takes its whole
+    byte range with it. Emitting them here rather than parsing byte ranges back
+    out in bash keeps the shell free of UTF-8 arithmetic.
+
+    Args:
+        code_points: Sorted code points
+
+    Returns:
+        \\xNN escape strings, one per alternative
+    """
+    groups: dict[bytes, list[int]] = {}
+    for cp in code_points:
+        if cp < 0x80:
+            continue
+        encoded = chr(cp).encode('utf-8')
+        groups.setdefault(encoded[:-1], []).append(encoded[-1])
+
+    separators: list[str] = []
+    for prefix in sorted(groups):
+        for lo, _hi in to_ranges(sorted(groups[prefix])):
+            raw = prefix + bytes([lo])
+            separators.append(''.join(f'\\x{byte:02x}' for byte in raw))
+    return separators
 
 
 def render() -> str:
@@ -141,13 +273,6 @@ def render() -> str:
         The complete file contents
     """
     code_points = derive_class()
-    ascii_bytes = bytes(cp for cp in code_points if cp < 0x80)
-    multibyte = [cp for cp in code_points if cp >= 0x80]
-
-    alternation = '|'.join(
-        ''.join(f'\\x{byte:02x}' for byte in chr(cp).encode('utf-8')) for cp in multibyte
-    )
-
     lines = [
         '# SPDX-License-Identifier: AGPL-3.0-or-later',
         '# Copyright (c) 2025 Lem',
@@ -155,26 +280,40 @@ def render() -> str:
         '# GENERATED FILE - DO NOT EDIT BY HAND.',
         '# Regenerate with: ./scripts/gen-invisible-class.py > scripts/invisible-class.sh',
         '#',
-        '# The invisible-character class for check-bundle-secrets.sh: Unicode',
-        f'# White_Space=Yes union general category Cf, minus U+0020 SPACE. '
-        f'{len(code_points)} code',
-        f'# points, derived from Unicode {unicodedata.unidata_version} '
-        f'(Python {sys.version_info.major}.{sys.version_info.minor}).',
+        '# Characters that do not advance the cursor, and so can hide a split inside a',
+        '# credential: Unicode White_Space=Yes plus general categories Cf, Mn and Me,',
+        f'# minus U+0020 SPACE. {len(code_points)} code points, derived from Unicode',
+        f'# {unicodedata.unidata_version}. See gen-invisible-class.py for the reasoning,',
+        '# including the measurements that rejected the fully general "short gap',
+        '# between long runs" rule.',
         '#',
-        '# SPACE is the one omission and it is a measured one, not a guess:',
-        '# stripping it fuses adjacent Tailwind class names into runs that trip the',
-        '# opaque-literal rule. Point-in-time measurement, on the tree as it stood',
-        '# when this was written - web/local 28 findings, web/remote 45. Those',
-        '# numbers move whenever the apps gain UI and are recorded to show the cost',
-        '# is large and obvious, NOT as a current guarantee; re-measure before',
-        '# relying on either figure.',
+        '# SPACE is the one omission and it is measured, not guessed: stripping it',
+        '# fuses adjacent Tailwind class names into runs that trip the opaque-literal',
+        '# rule. Point-in-time measurement on the tree as it stood when this was',
+        '# written - web/local 28 findings, web/remote 45. Those numbers move whenever',
+        '# the apps gain UI; they are recorded to show the cost is large and obvious,',
+        '# NOT as a current guarantee. Re-measure before relying on either figure.',
+        '',
+        '# Canonical membership, as hex code-point ranges. This is what --check',
+        '# verifies and what the self-test enumerates; the two compiled forms below',
+        '# are built from it and checked against it.',
+        f"INVISIBLE_RANGES='{render_ranges(to_ranges(code_points))}'",
         '',
         '# Single-byte members, for tr -d.',
-        f'INVISIBLE_ASCII={shell_quote_bytes(ascii_bytes)}',
+        f"INVISIBLE_ASCII=$'{build_ascii(code_points)}'",
         '',
         '# Multi-byte members as an ERE alternation of raw UTF-8 byte sequences,',
         '# for a single sed pass under LC_ALL=C.',
-        f"INVISIBLE_UTF8_RE=$'{alternation}'",
+        f"INVISIBLE_UTF8_RE=$'{build_regex(code_points)}'",
+        '',
+        '# One representative member per regex alternative, for the self-test to plant',
+        '# split canaries with. See build_canary_separators() for why per-alternative',
+        '# rather than per-code-point.',
+        'INVISIBLE_CANARY_SEPS=(',
+    ]
+    lines += [f"  $'{sep}'" for sep in build_canary_separators(code_points)]
+    lines += [
+        ')',
         '',
         f'INVISIBLE_CLASS_SIZE={len(code_points)}',
         f"INVISIBLE_UNICODE_VERSION='{unicodedata.unidata_version}'",
@@ -182,31 +321,98 @@ def render() -> str:
     return '\n'.join(lines) + '\n'
 
 
-def parse_committed(text: str) -> set[int]:
-    """Recover the class from a generated shell fragment.
-
-    Args:
-        text: Contents of invisible-class.sh
+def check() -> int:
+    """Verify the committed fragment against Unicode and against itself.
 
     Returns:
-        The code points it encodes
-
-    Raises:
-        SystemExit: if the file cannot be parsed
+        Process exit code
     """
+    if not OUTPUT.exists():
+        print(f'{OUTPUT} does not exist; run this generator to create it.', file=sys.stderr)
+        return 1
+    text = OUTPUT.read_text(encoding='utf-8')
+
+    ranges_match = re.search(r"INVISIBLE_RANGES='([^']*)'", text)
+    regex_match = re.search(r"INVISIBLE_UTF8_RE=\$'([^']*)'", text)
     ascii_match = re.search(r"INVISIBLE_ASCII=\$'([^']*)'", text)
-    utf8_match = re.search(r"INVISIBLE_UTF8_RE=\$'([^']*)'", text)
-    if ascii_match is None or utf8_match is None:
-        sys.exit(f'{OUTPUT} does not define INVISIBLE_ASCII and INVISIBLE_UTF8_RE.')
+    if ranges_match is None or regex_match is None or ascii_match is None:
+        print(f'{OUTPUT} is missing one of its generated variables.', file=sys.stderr)
+        return 1
 
-    def unescape(chunk: str) -> bytes:
-        return bytes(int(pair, 16) for pair in re.findall(r'\\x([0-9a-fA-F]{2})', chunk))
+    committed = parse_ranges(ranges_match.group(1))
+    derived = derive_class()
 
-    found = {byte for byte in unescape(ascii_match.group(1))}
-    for sequence in utf8_match.group(1).split('|'):
-        if sequence:
-            found.add(ord(unescape(sequence).decode('utf-8')))
-    return found
+    # One-directional on purpose: the committed class must cover everything the
+    # local Unicode knows about. A character it lacks is the U+0085 gap.
+    missing = sorted(set(derived) - set(committed))
+    if missing:
+        print(
+            f'{OUTPUT} is missing {len(missing)} character(s) that Unicode '
+            f'{unicodedata.unidata_version} treats as non-advancing:\n'
+            + '\n'.join(
+                f'    U+{cp:04X} {unicodedata.name(chr(cp), "<unnamed>")}' for cp in missing[:20]
+            )
+            + '\nA literal split by one of these would not be reassembled. Regenerate:\n'
+            '  ./scripts/gen-invisible-class.py > scripts/invisible-class.sh',
+            file=sys.stderr,
+        )
+        return 1
+
+    # Extras are tolerated - the file may have been generated against a newer
+    # Unicode than this interpreter has - but NOT unconditionally. Review showed
+    # the previous version accepting 'A' as a "harmless superset". Anything this
+    # interpreter can classify as a real, advancing character is not a plausible
+    # future member, and stripping it would corrupt content.
+    extras = sorted(set(committed) - set(derived))
+    implausible = [cp for cp in extras if unicodedata.category(chr(cp)) not in UNASSIGNED]
+    if implausible:
+        print(
+            f'{OUTPUT} contains {len(implausible)} character(s) that Unicode '
+            f'{unicodedata.unidata_version} says DO advance, so they cannot be future '
+            'additions to the class:\n'
+            + '\n'.join(
+                f'    U+{cp:04X} category {unicodedata.category(chr(cp))} '
+                f'{unicodedata.name(chr(cp), "<unnamed>")}'
+                for cp in implausible[:20]
+            )
+            + '\nStripping those from build output would corrupt it. Regenerate.',
+            file=sys.stderr,
+        )
+        return 1
+    if extras:
+        print(
+            f'  NOTE: {OUTPUT.name} covers {len(extras)} code point(s) unassigned in '
+            f'Unicode {unicodedata.unidata_version}; it was generated against a newer '
+            'release. Superset of what this interpreter knows, so nothing is missed.'
+        )
+
+    # The regex and the tr set are compiled artefacts of the canonical ranges.
+    # Rebuild both from the COMMITTED ranges - not from local Unicode - so this
+    # catches hand-editing without being sensitive to the interpreter's version.
+    if regex_match.group(1) != build_regex(committed):
+        print(
+            f'{OUTPUT}: INVISIBLE_UTF8_RE does not match INVISIBLE_RANGES. The regex was '
+            'hand-edited, or the file is half-regenerated.',
+            file=sys.stderr,
+        )
+        return 1
+    if ascii_match.group(1) != build_ascii(committed):
+        print(
+            f'{OUTPUT}: INVISIBLE_ASCII does not match INVISIBLE_RANGES.',
+            file=sys.stderr,
+        )
+        return 1
+
+    committed_seps = re.findall(r"^  \$'([^']*)'$", text, re.MULTILINE)
+    if committed_seps != build_canary_separators(committed):
+        print(
+            f'{OUTPUT}: INVISIBLE_CANARY_SEPS does not match INVISIBLE_RANGES, so the '
+            'self-test would not exercise every branch of the regex.',
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
 
 
 def main() -> int:
@@ -216,45 +422,7 @@ def main() -> int:
         Process exit code
     """
     if '--check' in sys.argv[1:]:
-        if not OUTPUT.exists():
-            print(f'{OUTPUT} does not exist; run this generator to create it.', file=sys.stderr)
-            return 1
-
-        # Compare the CLASS, not the rendered file. The provenance comment names
-        # the Unicode version that produced it, which legitimately differs
-        # between a contributor's interpreter and CI's - and a byte comparison
-        # would turn that harmless difference into a failed security gate.
-        committed = parse_committed(OUTPUT.read_text(encoding='utf-8'))
-        derived = set(derive_class())
-
-        # The safety property is one-directional: the committed class must cover
-        # everything the local Unicode knows about. Missing a character is the
-        # U+0085 gap and fails. Containing EXTRA characters means the file was
-        # generated against a newer Unicode than this interpreter has, which is
-        # strictly safer - worth saying out loud, not worth blocking on.
-        missing = sorted(derived - committed)
-        if missing:
-            print(
-                f'{OUTPUT} is missing {len(missing)} character(s) that Unicode '
-                f'{unicodedata.unidata_version} classifies as invisible:\n'
-                + '\n'.join(
-                    f'    U+{cp:04X} {unicodedata.name(chr(cp), "<unnamed>")}' for cp in missing
-                )
-                + '\nA literal split by one of these would not be reassembled. Regenerate:\n'
-                '  ./scripts/gen-invisible-class.py > scripts/invisible-class.sh',
-                file=sys.stderr,
-            )
-            return 1
-
-        extra = sorted(committed - derived)
-        if extra:
-            print(
-                f'  NOTE: {OUTPUT.name} covers {len(extra)} character(s) unknown to this '
-                f'interpreter (Unicode {unicodedata.unidata_version}); it was generated '
-                'against a newer release. Superset, so nothing is missed.'
-            )
-        return 0
-
+        return check()
     sys.stdout.write(render())
     return 0
 

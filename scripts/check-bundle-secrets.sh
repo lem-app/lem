@@ -98,17 +98,20 @@
 # deliberate obfuscation - a formatter wrapping a long string does it by
 # accident.
 #
-# Three versions of this were written by hand and all three lost to a character
-# nobody had enumerated: first only "\n" (broken by a TAB through ordinary
-# bundling, and by "\r\n" through public/, where `tr -d '\n'` deletes the
-# newline and LEAVES THE \r behind as a residual separator); then a list of
-# every whitespace character anyone had demonstrated, which still omitted
-# U+0085 NEL - plainly White_Space=Yes, and a live bypass.
+# Four versions of this lost to a character outside them: first only "\n"
+# (broken by a TAB through ordinary bundling, and by "\r\n" through public/,
+# where `tr -d '\n'` deletes the newline and LEAVES THE \r behind as a residual
+# separator); then a list of every whitespace character anyone had demonstrated,
+# which omitted U+0085 NEL; then White_Space plus Cf, which omitted category Mn.
+# Combining marks separate bytes perfectly well - this scanner renders nothing.
 #
-# So the class is no longer written down here. It is DERIVED from Unicode's own
-# property data by scripts/gen-invisible-class.py, committed as
-# scripts/invisible-class.sh, and re-derived and compared on every run. The next
-# character Unicode adds turns a check red instead of quietly reopening the gap.
+# So the class is not written down here. It is DERIVED by
+# scripts/gen-invisible-class.py from a principle rather than a list -
+# characters that DO NOT ADVANCE THE CURSOR, which is White_Space plus Cf, Mn
+# and Me - committed as scripts/invisible-class.sh, and re-derived and compared
+# on every run. The next character Unicode adds turns a check red instead of
+# quietly reopening the gap. The generator also records the measurements that
+# rejected the fully general "short gap between two long runs" rule.
 # See the generator's docstring for the definition and for why SPACE stays in.
 #
 # public/ IS THE AWKWARD PATH. Vite copies it into dist/ verbatim, bypassing
@@ -308,13 +311,13 @@ filter_asset_hashes() {
 # Unicode's own property data, and verify_invisible_class_is_current() below
 # regenerates and compares on every run.
 #
-# It is derived rather than listed because three successive hand-written
-# versions each missed a character nobody had enumerated - first everything but
-# "\n", then "\n" plus tab and CR, then a list that still omitted U+0085 NEL,
-# which is plainly White_Space=Yes. Enumeration kept losing to the case outside
-# the enumeration, exactly as it did with the MIME table before it. See the
-# generator's docstring for what the class contains and why SPACE is the one
-# member left in.
+# It is derived rather than listed because four successive hand-written versions
+# each missed a character nobody had enumerated - everything but "\n", then "\n"
+# plus tab and CR, then a list omitting U+0085 NEL, then White_Space plus Cf
+# omitting category Mn. Enumeration kept losing to the case outside the
+# enumeration, exactly as it did with the MIME table before it. See the
+# generator's docstring for the principle the members follow from, why SPACE is
+# the one left in, and the measurements that rejected the fully general rule.
 # shellcheck source=invisible-class.sh
 . "${REPO_ROOT}/scripts/invisible-class.sh"
 
@@ -450,7 +453,24 @@ verify_scanner_detects_canaries() {
 
   rm -rf "$canary_dir"
   cp -r "$dir" "$canary_dir"
-  target="$(find "$canary_dir" -type f -name '*.js' | head -1)"
+
+  # Pick the real bundle chunk, deterministically.
+  #
+  # This was `find ... -name '*.js' | head -1` with no sort. find's order is
+  # filesystem-dependent, and on web/remote it consistently returned
+  # lem-app-sw.js - a 1000-line service worker copied verbatim from public/ -
+  # instead of the minified Vite chunk. So for that app every split canary was
+  # being tested against an unrepresentative file, deterministically, for as
+  # long as the check has existed. Review found that while chasing an
+  # intermittent single-canary loss.
+  #
+  # Vite emits the entry chunk under assets/, so prefer that and sort for
+  # determinism; fall back to any .js. The chosen file is printed, so a repeat
+  # of this class of problem is one line of log rather than 82 trials.
+  target="$(find "$canary_dir" -type f -path '*/assets/*' -name '*.js' | sort | head -1)"
+  if [[ -z "$target" ]]; then
+    target="$(find "$canary_dir" -type f -name '*.js' | sort | head -1)"
+  fi
   [[ -n "$target" ]] || fail "self-test could not run: no .js file under ${dir}."
 
   # --- opaque-literal, positive -------------------------------------------
@@ -525,11 +545,10 @@ verify_scanner_detects_canaries() {
     separators+=("${INVISIBLE_ASCII:$ascii_index:1}")
     ascii_index=$((ascii_index + 1))
   done
-  # Multi-byte members: the generated ERE is a '|'-separated list of raw
-  # sequences, so splitting on '|' recovers exactly the class.
-  local -a utf8_members=()
-  IFS='|' read -ra utf8_members <<< "$INVISIBLE_UTF8_RE"
-  separators+=("${utf8_members[@]}")
+  # Multi-byte members: one per branch of the compiled regex, emitted by the
+  # generator so the shell never has to do UTF-8 arithmetic. A branch is the
+  # unit that can break, and a broken branch takes its whole byte range with it.
+  separators+=("${INVISIBLE_CANARY_SEPS[@]}")
 
   for sep in "${separators[@]}"; do
     [[ -n "$sep" ]] || continue
@@ -580,19 +599,20 @@ verify_scanner_detects_canaries() {
   found="$(scan_tree "$canary_dir")"
   rm -rf "$canary_dir"
 
-  missing=0
-  local -a missed_list=()
-  for canary in "${must_detect[@]}"; do
-    if ! printf '%s' "$found" | grep -qF -- "$canary"; then
-      missing=$((missing + 1))
-      missed_list+=("$canary")
-    fi
-  done
+  # One pass rather than a grep per canary: with ~400 of them the per-canary
+  # loop was the dominant cost of the whole scan.
+  local wanted="${TMP_DIR}/canary-wanted" seen="${TMP_DIR}/canary-seen"
+  printf '%s\n' "${must_detect[@]}" | sort -u > "$wanted"
+  printf '%s' "$found" | grep -oFf "$wanted" | sort -u > "$seen" || true
+
+  local missed_list
+  missed_list="$(comm -23 "$wanted" "$seen")"
+  missing="$(printf '%s' "$missed_list" | grep -c . || true)"
   if [[ "$missing" -ne 0 ]]; then
-    # Name them. A bare count says something broke but not what, and the
-    # canaries are indexed by their position in the invisible-character class,
-    # so the identity is exactly what tells you which rule stopped working.
-    printf '    missed canary: %s\n' "${missed_list[@]}" >&2
+    # Name them. A bare count says something broke but not what, and the split
+    # canaries are indexed by their position in the class, so the identity is
+    # exactly what tells you which branch stopped working.
+    printf '%s\n' "$missed_list" | sed 's/^/    missed canary: /' >&2
   fi
 
   spurious=0
@@ -610,8 +630,9 @@ verify_scanner_detects_canaries() {
   fi
   canary_positive="${#must_detect[@]}"
   canary_negative="${#must_not_detect[@]}"
-  printf '  self-test: %d/%d boundary canaries detected, %d/%d correctly ignored.\n' \
-    "$canary_positive" "$canary_positive" "$canary_negative" "$canary_negative"
+  printf '  self-test: %d/%d boundary canaries detected, %d/%d correctly ignored (target: %s).\n' \
+    "$canary_positive" "$canary_positive" "$canary_negative" "$canary_negative" \
+    "${target#"$canary_dir"/}"
 }
 
 # ---------------------------------------------------------------------------
@@ -739,7 +760,8 @@ PASS. Checked, across ${#APPS[@]} app(s):
     type or file signature; genuine assets are cleared by SHA-256 of the whole
     payload instead
   - the same rules again over a copy with the invisible-character class removed
-    (Unicode White_Space plus category Cf, minus SPACE - ${INVISIBLE_CLASS_SIZE} code points,
+    (characters that do not advance the cursor: Unicode White_Space plus
+    categories Cf, Mn and Me, minus SPACE - ${INVISIBLE_CLASS_SIZE} code points,
     derived from Unicode ${INVISIBLE_UNICODE_VERSION}, re-checked this run), so a literal split by
     any of them is not invisible
   - the value scan itself, per app, against ${canary_positive} boundary canaries that must be
