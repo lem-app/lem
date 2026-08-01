@@ -268,6 +268,42 @@ jobs:
         run: ./scripts/check-license-headers.sh
 
   # --------------------------------------------------------------------------
+  # The installer is the first thing a new user runs and it is shell, so it
+  # gets the same shape of gate as everything else: parse, lint, test.
+  #
+  # No install is performed here. `scripts/tests/install_test.sh` sources
+  # install.sh with LEM_INSTALL_SH_SOURCE_ONLY=1 (which suppresses main) and
+  # exercises its functions against temporary directories -- it touches no
+  # $HOME, starts no server, and reaches no network.
+  # --------------------------------------------------------------------------
+  installer:
+    name: installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Parse check (bash -n)
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/lem
+          bash -n scripts/tests/install_test.sh
+
+      # ShellCheck ships on the ubuntu-24.04 runner image. If that ever stops
+      # being true this step fails loudly, which is the correct signal -- much
+      # better than a silently skipped linter.
+      - name: Lint (shellcheck)
+        if: '!cancelled()'
+        run: |
+          shellcheck --version
+          shellcheck -s bash scripts/install.sh scripts/lem scripts/tests/install_test.sh
+
+      - name: Tests
+        if: '!cancelled()'
+        run: ./scripts/tests/install_test.sh
+
+  # --------------------------------------------------------------------------
   # DCO: CONTRIBUTING.md requires every commit to carry a Signed-off-by line
   # (`git commit -s`).
   # --------------------------------------------------------------------------

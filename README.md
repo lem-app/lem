@@ -22,31 +22,80 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 
 ## 📦 Installation
 
-### Prerequisites
+```bash
+curl -fsSL https://raw.githubusercontent.com/lem-app/lem/main/scripts/install.sh | bash
+```
 
-- **Docker** and Docker Compose
-- **Python 3.11+** (recommended: [uv](https://github.com/astral-sh/uv))
-- **[Node.js](https://nodejs.org/) 20+** and [pnpm](https://pnpm.io/)
+**Docker is the only prerequisite.** The installer brings its own Python
+toolchain (`uv`) and downloads the Harbor CLI it drives. Everything lands under
+`~/.lem`, owned by you — there is no `sudo` step and nothing is installed
+system-wide:
 
-### Quick Start
+| Path | What |
+| --- | --- |
+| `~/.lem/src` | Lem's source (a symlink to your checkout, when you install from one) |
+| `~/.lem/harbor` | Harbor CLI, pinned to a known-good tag |
+| `~/.lem/bin/lem` | the `lem` CLI |
+| `~/.lem/bin/lem-server` | generated launcher — the only place the server command line is written |
+| `~/.lem/config/server.env` | your configuration (`LEM_HOST`, `LEM_PORT`, …) |
+| `~/.lem/{data,logs,run}` | runtime state |
+| systemd `--user` unit, or a macOS LaunchAgent | starts the server when you log in |
+
+When it finishes, the server is listening on `http://127.0.0.1:5142` — loopback
+only, by design; see [Network exposure](#network-exposure).
 
 ```bash
-# Clone the repository
+lem status     # health, ports, where everything lives
+lem logs       # follow the server log
+lem stop
+```
+
+Re-running the installer is safe: it upgrades in place and never duplicates a
+PATH entry, a service, or a config file you have edited.
+
+### Installer options
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lem-app/lem/main/scripts/install.sh | bash -s -- --dry-run
+
+./scripts/install.sh --help         # every option
+./scripts/install.sh --uninstall    # service, ~/.lem, PATH entry, symlink
+```
+
+> **`https://lem.gg/install.sh` does not exist yet** — it returns 404. Use the
+> raw GitHub URL above until lem.gg serves a redirect to it.
+
+### From a checkout (contributors)
+
+```bash
 git clone https://github.com/lem-app/lem.git
 cd lem
+./scripts/install.sh
+```
 
-# Start the local server (loopback only - see "Network exposure" below)
+The installer finds the checkout at or above your working directory and points
+`~/.lem/src` at it with a symlink, so your edits are live. Re-run it whenever
+you pull.
+
+### Running the pieces by hand
+
+Needs [uv](https://github.com/astral-sh/uv), [Node.js](https://nodejs.org/) 20+
+and [pnpm](https://pnpm.io/):
+
+```bash
+# Local server, loopback only - see "Network exposure" below
 cd server
 uv sync
 uv run lem-serve
 
-# In another terminal, from the repository root, start the web dashboard
+# In another terminal, from the repository root, the web dashboard
 cd web/local
 pnpm install
 pnpm run dev
 ```
 
-Open http://localhost:5174 in your browser.
+Open http://localhost:5174 in your browser. (The server does not serve the
+dashboard yet, so this dev server is still how you reach the UI.)
 
 ## 🏗️ Architecture
 
