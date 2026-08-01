@@ -396,8 +396,8 @@ have the right thing on it.
 | 3 | Open the service catalog | Services listed with real statuses | **Passes** |
 | 4 | Start a stopped service from B | It starts on A | **Passes** |
 | 5 | **Click Launch on Open WebUI** | Open WebUI's UI renders inside the dashboard | **FAILS** — `ClientViewer.tsx:281-286` renders `<iframe src="http://127.0.0.1:33801">`, so B loads **its own** loopback. Connection refused, or an unrelated local service. [#6](https://github.com/lem-app/lem/issues/6) |
-| 6 | Open WebUI's WebSocket connects | socket.io session established | **Unverified** — the ack, the `ProxiedWebSocket` state machine and the injected shim landed in Phase 5, and are covered in-suite; whether socket.io itself establishes needs a real browser. Run §4.1 C. [#6](https://github.com/lem-app/lem/issues/6) |
-| 7 | Send a chat message | Reply streams token by token | **Unverified** — the wire can carry it now (Phases 2–3 made responses chunked and incremental), and logging in works now that `Set-Cookie` crosses ([#72](https://github.com/lem-app/lem/issues/72)). "Visibly incremental" is a browser observation: run §4.1 D |
+| 6 | Open WebUI's WebSocket connects | socket.io session established | **Blocked** — the ack, the `ProxiedWebSocket` state machine and the injected shim all landed in Phase 5 and are covered in-suite, but socket.io runs *after* login, and login cannot work until cookie transport is redesigned ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2). Run §4.1 B/C to verify the shim half independently. [#6](https://github.com/lem-app/lem/issues/6) |
+| 7 | Send a chat message | Reply streams token by token | **Blocked by 6** — the wire can carry it (Phases 2–3 made responses chunked and incremental) and the shim is in place, but an unauthenticated session never reaches a chat. §4.1 D is the procedure once it does |
 | 8 | Load a binary asset (font, PNG, wasm) | Byte-identical | **FAILS** — bodies are UTF-8 `str` (`http_proxy.py:154`, `http_frame.py:80`, `:211`, `:189`) |
 | 9 | Block UDP on B's network and reconnect | Falls back to the relay within ~10 s | **FAILS** — auto-fallback cannot trigger: `webrtc_client.py:722` resets the attempt counter every cycle, and `relay_url` defaults to `ws://localhost:8001` (`webrtc_client.py:69`), never overridden (`manager.py:81`). [#12](https://github.com/lem-app/lem/issues/12) |
 | 10 | Force a 500 from the proxy | Error appears immediately | **FAILS** — the error frame is addressed to request id `0x01000000` because `http_proxy.py:115` reads `data[:4]` instead of `data[1:5]`, so the browser hangs the full 30 s (`proxy-fetch.ts:179-182`) |
@@ -447,13 +447,24 @@ and the suite says so in the tests that touch them:
 Run the §4 setup first: machine A at home with Open WebUI and Ollama running and a small model
 pulled, machine B on a different network. Everything below happens on **B**.
 
-**A. Login survives — the cookie rewrite.**
+**A. Login — expected to FAIL, and this step is how you confirm why.**
+
+> **Do not run this step expecting a pass.** A Service Worker cannot deliver `Set-Cookie` to the
+> browser: it is a forbidden response-header name, and a worker-synthesised `Response` never
+> reaches the algorithm that would parse it. See `tunnel-proxy-spec.md` §5.6.2. The steps below
+> are written to *localise* the failure, so that when the cookie transport is redesigned there is
+> a procedure that already distinguishes "the rewrite is wrong" from "the browser dropped it".
 
 1. Launch Open WebUI from the remote dashboard and sign in with your Open WebUI account.
-2. **Expected:** the sign-in succeeds and the app lands on the chat view. Before #72 it looped
-   back to the login form, because the session cookie was stripped on the way out.
+2. **Expected today:** the sign-in does **not** stick — the app returns to the login form. If it
+   *does* stick, the cookie reached the jar by some route §5.6.2 says is impossible; that is worth
+   investigating and reporting, not celebrating.
 3. Open DevTools → Application → Cookies → the dashboard's origin.
-   **Expected:** Open WebUI's session cookie is listed with **`Path` = `/app/<deviceId>/webui/`**
+   **Expected today: the cookie is absent** — dropped by the browser, not by this proxy. To see
+   that the proxy did its part, open the Network panel entry for the login response: the
+   `Set-Cookie` the worker produced is visible there even though nothing stored it.
+   **Expected once the cookie transport works:** the session cookie is listed with
+   **`Path` = `/app/<deviceId>/webui/`**
    (the ids from the iframe's URL), and with **no `Domain`** value of its own. `HttpOnly` and
    `SameSite` read exactly as Open WebUI set them.
 4. In DevTools → Network, reload the frame and pick any request the app made.
@@ -461,6 +472,25 @@ pulled, machine B on a different network. Everything below happens on **B**.
    its requests. **Expected:** it carries **no** Open WebUI cookie.
 5. Reload the dashboard itself and look at any dashboard-originated request (`/v1/services`).
    **Expected:** no framed app's cookie on it.
+6. **The decisive check, and the one no test here can make: did the cookie reach the upstream?**
+   On **A**, watch the service's own access log (`docker logs -f <container>` for the Harbor
+   container) while doing something authenticated on **B**.
+   **Expected:** the request arrives carrying `Cookie: <the app's session cookie>`.
+
+   This step exists because the browser attaches `Cookie` *after* the Service Worker sees the
+   request, so what the worker forwards is whatever `event.request.headers` happens to contain.
+   Whether that includes `Cookie` is a browser behaviour this repository cannot observe — jsdom
+   has no cookie jar wired to `Request` — and the suite therefore *supplies* the header rather
+   than proving the browser did. If this step fails while step 3 shows the cookie correctly
+   stored, the defect is on the request path, not in the `Set-Cookie` rewrite, and the fix
+   belongs with whatever mechanism the worker uses to read cookies.
+7. **`__Host-` cookies specifically.** If the service sets one (Open WebUI does not; many
+   hardened apps do), DevTools → Application → Cookies shows it stored as
+   **`__Lem-Host-<name>`**, and the dashboard console carries a
+   `[sw-bridge] Renamed __Host-… to __Lem-Host-…` warning.
+   **Expected on A:** the upstream still logs the cookie under its **original** `__Host-` name.
+   A `__Host-` cookie that appears in DevTools *unrenamed* and with a per-service `Path` is a
+   bug — the browser will refuse to store it and login will fail with no other symptom.
 
 **B. The shim is in the document, and it is first.**
 
@@ -511,9 +541,13 @@ pulled, machine B on a different network. Everything below happens on **B**.
    ;({ mutations: s.length, spanMs: s.at(-1) - s[0] })
    ```
 
-   **Expected:** `mutations` in the tens or hundreds and `spanMs` of the same order as the
-   generation you just watched — seconds, not milliseconds. **Failure looks like** `mutations`
-   in the low single digits, or a `spanMs` under ~200 ms: that is one buffered paint at the end.
+   **Pass:** `mutations >= 20` **and** `spanMs >= 1000`. **Fail:** anything else — including the
+   middle ground (say 8 mutations over 300 ms), which is a coarsely-buffered stream, not a
+   token-by-token one, and is a regression against G4 even though it is not a single paint.
+   There is deliberately no "inconclusive" band: if the reply took several seconds to generate,
+   a working stream produces mutations across those seconds, and anything that does not is a
+   failure to investigate rather than a judgement call. If the reply genuinely finished in under
+   a second, the prompt was too short — ask for more and re-run rather than scoring it.
 
 **E. A refused upstream fails fast, not after ten seconds.**
 

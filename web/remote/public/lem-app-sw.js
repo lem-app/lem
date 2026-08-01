@@ -572,6 +572,25 @@ function isStartTag(bytes, index, name) {
 }
 
 /**
+ * Does a `<` at `index` open a markup construct at all?
+ *
+ * The HTML tokenizer's tag-open state: a `<` followed by an ASCII letter, `/`,
+ * `!` or `?` starts something; anything else (`a < b` in prose) is just text.
+ * Distinguishing them matters because the scanner skips *over* a construct once
+ * it recognises one, and skipping over ordinary text would step past markup.
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} index Index of the `<`
+ * @returns {boolean}
+ */
+function isMarkupOpen(bytes, index) {
+  const next = lowerAt(bytes, index + 1)
+  if (next === undefined) return false
+  if (next >= 0x61 && next <= 0x7a) return true
+  return next === 0x2f || next === 0x21 || next === 0x3f
+}
+
+/**
  * End of a start tag, respecting quoted attribute values.
  *
  * @param {Uint8Array} bytes
@@ -647,35 +666,80 @@ function endOfPreamble(bytes, exhausted) {
  * preamble otherwise, which is still ahead of the first `<script>` or `<body>`
  * (the parser fosters a pre-`<html>` script into the head it synthesises).
  *
+ * **Two invariants, and the second was learned the hard way.**
+ *
+ * 1. *Never scan into a tag's attribute region.* An earlier tag whose attribute
+ *    value contains the bytes `<head…>` - a `data-*` holding example markup, a
+ *    JSON blob, user content - is not a `<head>`. A scanner that advances one
+ *    byte at a time past `<html …>` never leaves that tag, reads the fake match
+ *    as real, and splices the shim **inside the quotes**. The document is then
+ *    corrupt, the shim is not a script, and `window.WebSocket` stays the native
+ *    one - which is issue #6's defect #1 reappearing silently. So a recognised
+ *    markup construct is skipped whole, quote-aware, never walked into.
+ *
+ * 2. *A decidable preamble means a safe answer always exists.* Inserting at the
+ *    end of the preamble is ordering-correct unconditionally: it is after the
+ *    doctype (so the document stays out of quirks mode) and before every tag.
+ *    So anything undecidable *after* the preamble - an unterminated tag or
+ *    comment at the end of the sniff window - falls back to that rather than
+ *    guessing a position. `skip` is reserved for the one case where no position
+ *    is safe: a preamble that cannot be delimited, where the shim might land in
+ *    front of the doctype.
+ *
  * @param {Uint8Array} bytes Everything buffered so far
  * @param {boolean} exhausted No more bytes are coming, or the sniff window is full
  * @returns {{ kind: 'insert', at: number } | { kind: 'wait' } | { kind: 'skip' }}
  */
 export function findShimInsertionPoint(bytes, exhausted) {
   const preamble = endOfPreamble(bytes, exhausted)
+  // The only unsafe case: we cannot tell where the doctype ends, so we cannot
+  // tell whether any offset is in front of it.
   if (preamble === -1) return exhausted ? { kind: 'skip' } : { kind: 'wait' }
+
+  /** Safe fallback for anything we run out of bytes to decide (invariant 2). */
+  const undecided = exhausted
+    ? /** @type {{ kind: 'insert', at: number }} */ ({ kind: 'insert', at: preamble })
+    : /** @type {{ kind: 'wait' }} */ ({ kind: 'wait' })
 
   let index = preamble
   while (index < bytes.length) {
+    if (bytes[index] !== 0x3c) {
+      index += 1
+      continue
+    }
+
     if (matchesAt(bytes, index, '<!--')) {
       const end = indexOfAscii(bytes, '-->', index + 4)
-      if (end === -1) return exhausted ? { kind: 'skip' } : { kind: 'wait' }
+      if (end === -1) return undecided
       index = end + 3
       continue
     }
-    if (bytes[index] === 0x3c) {
-      if (isStartTag(bytes, index, 'head')) {
-        const end = endOfStartTag(bytes, index)
-        if (end === -1) return exhausted ? { kind: 'skip' } : { kind: 'wait' }
-        return { kind: 'insert', at: end }
-      }
-      if (isStartTag(bytes, index, 'script') || isStartTag(bytes, index, 'body')) {
-        return { kind: 'insert', at: preamble }
-      }
-      // `<scr` at the end of a chunk must not be read as "not a script".
-      if (!exhausted && bytes.length - index < 8) return { kind: 'wait' }
+
+    // `<scr` at the end of a chunk must not be read as "not a script", and
+    // `<!-` must not be read as "not a comment". `<script` plus one boundary
+    // byte is the longest lookahead any decision below needs.
+    if (!exhausted && bytes.length - index < 8) return { kind: 'wait' }
+
+    if (isStartTag(bytes, index, 'head')) {
+      const end = endOfStartTag(bytes, index)
+      if (end === -1) return undecided
+      return { kind: 'insert', at: end }
     }
-    index += 1
+    if (isStartTag(bytes, index, 'script') || isStartTag(bytes, index, 'body')) {
+      return { kind: 'insert', at: preamble }
+    }
+
+    if (!isMarkupOpen(bytes, index)) {
+      // A bare `<` in prose. Stepping over the whole "tag" here would run to
+      // some later `>` and could step past the real `<head>`.
+      index += 1
+      continue
+    }
+
+    // Invariant 1: skip the construct whole, attribute values included.
+    const end = endOfStartTag(bytes, index)
+    if (end === -1) return undecided
+    index = end
   }
 
   if (!exhausted) return { kind: 'wait' }
@@ -768,6 +832,62 @@ export function shouldInjectShim(isNavigation, headers) {
 // -- cookies -----------------------------------------------------------------
 
 /**
+ * The `__Host-` prefix, and what this proxy substitutes for it.
+ *
+ * A cookie whose name begins with `__Host-` is accepted by a browser **only**
+ * if it carries `Secure`, carries no `Domain`, and has `Path=/` exactly
+ * (RFC 6265bis §4.1.3.2). Path-scoping it to `/app/<deviceId>/<serviceId>/`
+ * therefore produces a cookie every browser silently refuses to store - no
+ * error, no console entry, just a session that never exists. That is precisely
+ * the shape of failure #72 was opened to remove.
+ *
+ * The two behaviours cannot both hold on a shared origin; that conflict is what
+ * per-service origins (Phase 7) resolves. Until then the cookie is **renamed
+ * across the boundary**: only the leading `__` becomes `__Lem-`, so the rest of
+ * the name keeps its exact bytes and the transform is reversible. The browser
+ * stores an unprefixed, path-scoped cookie; the upstream server sees the name
+ * it set, restored on the request path.
+ *
+ * Rejected alternatives, for the record:
+ *
+ * - **Pass `__Host-` through with `Path=/`.** No path isolation for exactly the
+ *   cookies that most need it, and worse: `__Host-session` is the canonical
+ *   name, so two services using it would collide on (name, path, host) and each
+ *   login would destroy the other's session.
+ * - **Refuse and error.** Visible, but login stays broken, which is the thing
+ *   #72 exists to fix.
+ *
+ * The cost is real and bounded: JavaScript in the frame reading
+ * `document.cookie` sees `__Lem-Host-session`, not `__Host-session`. `__Host-`
+ * cookies are overwhelmingly `HttpOnly` and server-read, so this is usually
+ * invisible - but it is a rename, not a no-op, and the page is told each time
+ * one happens.
+ */
+export const HOST_PREFIX = '__Host-'
+
+/** What `__` becomes for a `__Host-` cookie. Reversible, casing-preserving. */
+export const HOST_PREFIX_SUBSTITUTE = '__Lem-'
+
+/**
+ * `__Secure-` needs only `Secure`, which passes through untouched, so it needs
+ * no special handling at all. Recorded because "we checked the other prefix" is
+ * worth more than silence.
+ */
+export const SECURE_PREFIX = '__Secure-'
+
+/**
+ * Name of the cookie one `Set-Cookie` sets.
+ *
+ * @param {string} setCookie
+ * @returns {string}
+ */
+export function cookieName(setCookie) {
+  const first = setCookie.split(';')[0]
+  const equals = first.indexOf('=')
+  return (equals === -1 ? first : first.slice(0, equals)).trim()
+}
+
+/**
  * Re-scope one upstream `Set-Cookie` to the service that set it.
  *
  * `Path` is replaced - not appended to - with `/app/<deviceId>/<serviceId>/`,
@@ -775,6 +895,9 @@ export function shouldInjectShim(isNavigation, headers) {
  * `HttpOnly` and `Secure` and `SameSite` included, is passed through byte for
  * byte: an app that deliberately sets a cookie its own JavaScript reads needs
  * it readable, and a proxy that quietly adds flags breaks that.
+ *
+ * A `__Host-`-prefixed name is renamed as described above, because a
+ * path-scoped `__Host-` cookie is one no browser will store.
  *
  * **This is functional isolation, not a security boundary.** Path-scoping
  * controls what the browser *sends* on its own. It does not stop same-origin
@@ -789,7 +912,7 @@ export function shouldInjectShim(isNavigation, headers) {
  */
 export function rewriteSetCookie(value, deviceId, serviceId) {
   const segments = value.split(';')
-  const kept = [segments[0]]
+  const kept = [renameHostPrefix(segments[0])]
   for (let index = 1; index < segments.length; index += 1) {
     const segment = segments[index]
     const name = segment.split('=')[0].trim().toLowerCase()
@@ -801,10 +924,72 @@ export function rewriteSetCookie(value, deviceId, serviceId) {
 }
 
 /**
+ * Swap `__` for `__Lem-` in a `name=value` pair whose name is `__Host-`-prefixed.
+ *
+ * The prefix is matched case-insensitively, because the browser rule is, but
+ * only the leading `__` is replaced - so `__HOST-x` becomes `__Lem-HOST-x` and
+ * round-trips back to `__HOST-x`, not to a case the server never sent.
+ *
+ * @param {string} pair Leading `name=value` segment of a `Set-Cookie`
+ * @returns {string}
+ */
+function renameHostPrefix(pair) {
+  const leading = pair.length - pair.trimStart().length
+  const name = pair.slice(leading)
+  if (!name.slice(0, HOST_PREFIX.length).toLowerCase().startsWith(HOST_PREFIX.toLowerCase())) {
+    return pair
+  }
+  return `${pair.slice(0, leading)}${HOST_PREFIX_SUBSTITUTE}${name.slice(2)}`
+}
+
+/**
+ * Undo {@link renameHostPrefix} on the request path, so the upstream server
+ * sees the cookie name it set.
+ *
+ * Narrow on purpose: only `__Lem-Host-…` is restored, not every `__Lem-…`, so a
+ * framed app that happens to set a cookie called `__Lem-anything` is untouched.
+ * A cookie literally named `__Lem-Host-x` is the one collision this cannot
+ * distinguish, and it is documented rather than guessed at.
+ *
+ * @param {string} header Raw `Cookie` request-header value
+ * @returns {string}
+ */
+export function restoreCookieHeader(header) {
+  return header
+    .split(';')
+    .map((pair) => {
+      const equals = pair.indexOf('=')
+      const name = equals === -1 ? pair : pair.slice(0, equals)
+      const leading = name.length - name.trimStart().length
+      const bare = name.slice(leading)
+      if (!bare.startsWith(HOST_PREFIX_SUBSTITUTE)) return pair
+      const rest = bare.slice(HOST_PREFIX_SUBSTITUTE.length)
+      if (!rest.toLowerCase().startsWith('host-')) return pair
+      return `${name.slice(0, leading)}__${rest}${equals === -1 ? '' : pair.slice(equals)}`
+    })
+    .join(';')
+}
+
+/**
+ * Restore renamed cookie names in a request's header pairs.
+ *
+ * @param {[string, string][]} headers
+ * @returns {[string, string][]}
+ */
+export function restoreRequestCookies(headers) {
+  return headers.map(([name, value]) =>
+    name.toLowerCase() === 'cookie'
+      ? /** @type {[string, string]} */ ([name, restoreCookieHeader(value)])
+      : /** @type {[string, string]} */ ([name, value])
+  )
+}
+
+/**
  * Build the `Headers` for a proxied response.
  *
  * @param {[string, string][]} pairs Upstream header pairs, in order
- * @param {{ deviceId: string, serviceId: string, upstreamPath: string }} context
+ * @param {{ deviceId: string, serviceId: string, upstreamPath: string,
+ *          onCookieRenamed?: (from: string, to: string) => void }} context
  * @returns {Headers}
  */
 export function buildResponseHeaders(pairs, context) {
@@ -813,7 +998,13 @@ export function buildResponseHeaders(pairs, context) {
     const lower = name.toLowerCase()
     if (STRIPPED_RESPONSE_HEADERS.has(lower)) continue
     if (lower === 'set-cookie') {
-      headers.append(name, rewriteSetCookie(value, context.deviceId, context.serviceId))
+      const rewritten = rewriteSetCookie(value, context.deviceId, context.serviceId)
+      // A rename is a real, if usually invisible, change to what the frame's
+      // own JavaScript can look up by name. Never silent.
+      const before = cookieName(value)
+      const after = cookieName(rewritten)
+      if (before !== after && context.onCookieRenamed) context.onCookieRenamed(before, after)
+      headers.append(name, rewritten)
       continue
     }
     if (lower === 'location') {
@@ -1317,7 +1508,12 @@ export class LemAppServiceWorker {
       body = await request.arrayBuffer()
     }
 
-    const headers = /** @type {[string, string][]} */ ([...request.headers.entries()])
+    // The other half of the `__Host-` rename: whatever the browser attached is
+    // named the way *the browser* was told to store it, and the upstream server
+    // has to see the name *it* set.
+    const headers = restoreRequestCookies(
+      /** @type {[string, string][]} */ ([...request.headers.entries()])
+    )
     const reqId = this.nextRequestId
     this.nextRequestId = this.nextRequestId >= 0xffffffff ? 1 : this.nextRequestId + 1
 
@@ -1408,6 +1604,14 @@ export class LemAppServiceWorker {
               deviceId: exchange.deviceId,
               serviceId: exchange.serviceId,
               upstreamPath: exchange.upstreamPath,
+              onCookieRenamed: (from, to) => {
+                bridge.postMessage({
+                  type: 'LEM_COOKIE_RENAMED',
+                  serviceId: exchange.serviceId,
+                  from,
+                  to,
+                })
+              },
             })
             if (BODYLESS_STATUSES.has(status)) {
               resolve(new Response(null, { status, headers: responseHeaders }))

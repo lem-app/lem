@@ -208,6 +208,68 @@ describe('splicing the shim into a document', () => {
     expect(delivered).toContain('<!-- <head> is not here -->')
   })
 
+  // The scanner used to advance one byte at a time past any tag it did not
+  // recognise, so it never left `<html …>` and read markup inside that tag's
+  // own quoted attribute as real. The splice landed inside the quotes: the
+  // document was corrupted, the shim never became a script, and - because the
+  // "no native WebSocket fallback" rule lives only in the shim's own JS -
+  // `window.WebSocket` stayed native. That is issue #6's defect #1 returning
+  // silently, on nothing more than a byte pattern in someone's `data-*`.
+  it.each([
+    {
+      label: 'a data-* attribute holding example markup',
+      html:
+        '<!doctype html><html lang="en" data-x="<head>fake</head>">' +
+        '<head><title>Real</title></head><body>hi</body></html>',
+      attribute: '<head>fake</head>',
+    },
+    {
+      label: 'a single-quoted attribute',
+      html:
+        "<!doctype html><html data-x='<head>fake'>" +
+        '<head><title>Real</title></head><body>hi</body></html>',
+      attribute: '<head>fake',
+    },
+    {
+      label: 'an attribute holding a whole fake document',
+      html:
+        '<!doctype html><html data-tpl="<html><head><script>evil()</scr' +
+        'ipt></head></html>">' +
+        '<head><title>Real</title></head><body>hi</body></html>',
+      attribute: '<html><head><script>evil()</scr' + 'ipt></head></html>',
+    },
+  ])('is not fooled by $label', async ({ html, attribute }) => {
+    let skipped = 0
+    const delivered = await inject(html, Number.MAX_SAFE_INTEGER, () => {
+      skipped += 1
+    })
+    const parsed = new DOMParser().parseFromString(delivered, 'text/html')
+
+    // The shim is a real element in the real head, not text inside a quote.
+    const shim = parsed.querySelector(`head > script[${SHIM_MARKER_ATTRIBUTE}]`)
+    expect(shim).not.toBeNull()
+    expect(shim?.textContent).toBe(WS_SHIM_SOURCE)
+    expect(scriptsOf(delivered)[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+    // The attribute that carried the decoy survives byte for byte.
+    expect(
+      parsed.documentElement.getAttribute('data-x') ??
+        parsed.documentElement.getAttribute('data-tpl')
+    ).toBe(attribute)
+    expect(parsed.title).toBe('Real')
+    expect(skipped).toBe(0)
+  })
+
+  it('is not fooled by a bare < in prose before the head', async () => {
+    // A `<` that opens nothing must be stepped over one byte at a time. Reading
+    // it as a tag and skipping to the next `>` would step past the real head.
+    const delivered = await inject(
+      '<!doctype html><html><body>a < b and c > d<script>1</' + 'script></body></html>'
+    )
+
+    expect(scriptsOf(delivered)[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+    expect(delivered).toContain('a < b and c > d')
+  })
+
   it('does not read <header> as <head>', async () => {
     const delivered = await inject(
       '<!doctype html><html><body><header>x</header><script>1</' + 'script></body></html>'
@@ -269,9 +331,30 @@ describe('splicing the shim into a document', () => {
     expect(decoder.decode(out)).not.toContain('�')
   })
 
-  it('gives up rather than guessing when the head tag never closes', async () => {
+  it('falls back to the safe position when the head tag never closes', async () => {
+    // Undecidable *after* the preamble. There is still an ordering-correct
+    // answer - after the doctype, before every tag - so take it rather than
+    // guess a position or drop the shim.
     let skipped = 0
     const source = `<!doctype html><html><head data-x="${'y'.repeat(HTML_SNIFF_BYTES)}">`
+
+    const delivered = await inject(source, 4096, () => {
+      skipped += 1
+    })
+
+    expect(skipped).toBe(0)
+    expect(delivered.startsWith('<!doctype html><script')).toBe(true)
+    // Still the first script once parsed: the parser fosters a pre-<html>
+    // script into the head it synthesises.
+    expect(scriptsOf(delivered)[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+  })
+
+  it('skips, and says so, when the preamble itself cannot be delimited', async () => {
+    // The one position-less case: an unterminated comment before the doctype.
+    // Every offset in this buffer might be in front of a doctype that has not
+    // arrived, and a script in front of a doctype means quirks mode.
+    let skipped = 0
+    const source = `<!-- ${'y'.repeat(HTML_SNIFF_BYTES)}`
 
     const delivered = await inject(source, 4096, () => {
       skipped += 1

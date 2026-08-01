@@ -505,7 +505,7 @@ app code and requires it to move.
 | Local dashboard | **Implemented** | `web/local/` |
 | WebRTC signaling + DataChannel | **Implemented** | `webrtc_client.py`, `cloud/signaling/` |
 | Remote JSON API access | **Implemented** | `proxy-fetch.ts`, `http_proxy.py` |
-| Remote **app viewing** | **Implemented, unverified end to end** | `lem-app-sw.js`, `sw-bridge.ts`, `ClientViewer.tsx`; needs [`testing_checklist.md`](./testing_checklist.md) §4.1 ([#6](https://github.com/lem-app/lem/issues/6)) |
+| Remote **app viewing** | **Partial** — anonymous apps load; anything needing a login does not | `lem-app-sw.js`, `sw-bridge.ts`, `ClientViewer.tsx`; cookie transport is blocked ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2, [#72](https://github.com/lem-app/lem/issues/72)) |
 | Proxied WebSockets | **Implemented, unverified end to end** | `ws-proxy.ts`, `ws-bridge.ts`, `ws_proxy.py`; ack + shim covered in-suite, socket.io needs a browser ([#6](https://github.com/lem-app/lem/issues/6)) |
 | Relay transport | **Implemented** | `relay_client.py`, `cloud/relay/` |
 | Relay **auto-fallback** | **Not working** | `webrtc_client.py:704-743`, `:69` ([#12](https://github.com/lem-app/lem/issues/12)) |
