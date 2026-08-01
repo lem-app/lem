@@ -20,7 +20,7 @@ Set DATABASE_URL environment variable to use PostgreSQL.
 """
 
 import os
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, Iterable
 from typing import Any, Protocol
 
 import aiosqlite
@@ -112,6 +112,7 @@ def _parse_postgres_url(url: str) -> dict[str, Any]:
     url = url.replace("postgresql+asyncpg://", "postgresql://")
 
     from urllib.parse import parse_qs, urlparse
+
     parsed = urlparse(url)
 
     params: dict[str, Any] = {
@@ -137,13 +138,18 @@ async def _get_pg_pool() -> Any:
     global _pg_pool
     if _pg_pool is None:
         import asyncpg
+
         params = _parse_postgres_url(DATABASE_URL)
         _pg_pool = await asyncpg.create_pool(**params, min_size=2, max_size=10)
     return _pg_pool
 
 
-async def get_db() -> AsyncIterator[DBConnection]:
+async def get_db() -> AsyncGenerator[DBConnection, None]:
     """Get database connection.
+
+    Declared as an AsyncGenerator rather than an AsyncIterator so callers
+    outside FastAPI's dependency system can drive it directly and call
+    aclose() to hand the connection back to the pool.
 
     Yields:
         Database connection (aiosqlite.Connection or asyncpg.Connection).
@@ -162,6 +168,7 @@ async def get_db() -> AsyncIterator[DBConnection]:
 async def init_db() -> None:
     """Initialize the database with required tables."""
     import logging
+
     logger = logging.getLogger(__name__)
 
     if USE_POSTGRES:

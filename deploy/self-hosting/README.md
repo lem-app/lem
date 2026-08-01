@@ -61,16 +61,27 @@ exit
 
 ### 3. Configure Environment Variables
 
+Both services **refuse to start** without `SECRET_KEY` and `CORS_ORIGINS`.
+That is deliberate: this repository is public and HS256 is symmetric, so a
+default key would let any reader forge a token for any account. The shipped
+`.env.example` files leave `SECRET_KEY` empty for the same reason.
+
 ```bash
+# Generate ONE key and use it for BOTH services. The signaling server mints
+# the relay session grants that the relay verifies, so they must match
+# byte for byte.
+LEM_SECRET_KEY="$(openssl rand -hex 32)"
+
 # Signaling server
 sudo cp cloud/signaling/.env.example /opt/lem/cloud/signaling/.env
 sudo nano /opt/lem/cloud/signaling/.env
-# Update: SECRET_KEY, DATABASE_URL, CORS_ORIGINS, RELAY_URL
+# Set: SECRET_KEY (the value above), DATABASE_URL, CORS_ORIGINS, RELAY_URL
+# Set: TRUST_X_FORWARDED_FOR=true (the nginx configs below sit in front)
 
 # Relay server
 sudo cp cloud/relay/.env.example /opt/lem/cloud/relay/.env
 sudo nano /opt/lem/cloud/relay/.env
-# Update: SECRET_KEY, CORS_ORIGINS
+# Set: SECRET_KEY (the SAME value), CORS_ORIGINS
 
 # Ensure correct ownership
 sudo chown lem:lem /opt/lem/cloud/signaling/.env
@@ -163,29 +174,67 @@ sudo journalctl -u lem-relay -f
 ### Signaling Server (.env)
 
 ```bash
+# REQUIRED, no default. openssl rand -hex 32
 SECRET_KEY=<generate-strong-random-key>
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
 DATABASE_URL=postgresql+asyncpg://user:password@localhost/signaling
 HOST=0.0.0.0
 PORT=8000
+# REQUIRED, no default. "*" is rejected: the API is credentialed.
 CORS_ORIGINS=https://lem.gg,https://app.lem.gg
 MAX_CONNECTIONS_PER_SECOND=5
+MAX_REGISTRATIONS_PER_HOUR=5
+MAX_LOGINS_PER_MINUTE=10
+# True only because nginx sits in front and appends the real client address.
+TRUST_X_FORWARDED_FOR=true
 RELAY_URL=wss://relay.lem.gg
 ```
 
 ### Relay Server (.env)
 
 ```bash
+# REQUIRED, and byte-for-byte identical to the signaling server's key.
 SECRET_KEY=<same-as-signaling-server>
 ALGORITHM=HS256
 HOST=0.0.0.0
 PORT=8001
+# REQUIRED, no default. "*" is rejected: the API is credentialed.
 CORS_ORIGINS=https://lem.gg,https://app.lem.gg
 SESSION_TIMEOUT=300
+PAIR_TIMEOUT=30
+MAX_SESSIONS=1000
+MAX_SESSIONS_PER_USER=10
 WS_PING_INTERVAL=20
 WS_PING_TIMEOUT=10
 ```
+
+## Scaling: why both units run a single worker
+
+The shipped units set `--workers 1`. This is a correctness requirement, not a
+conservative default.
+
+Four pieces of state are plain in-process dictionaries:
+
+| State | Owner |
+| --- | --- |
+| Connected devices, used to route every signaling message | `cloud/signaling/app/api/signal.py` |
+| Outstanding device-registration challenges | `cloud/signaling/app/api/devices.py` |
+| Per-IP and per-account rate-limit counters | `cloud/signaling/app/core/ratelimit.py` |
+| Active relay sessions and their device pairs | `cloud/relay/app/core/session_manager.py` |
+
+With more than one worker each process gets its own copy. A device connected
+to worker 1 is invisible to worker 3, so signaling messages are silently
+dropped depending on which worker terminated the socket. Relay peers landing
+on different workers never pair: the first waits out its pairing timeout while
+the second creates an unrelated session under the same id. Rate limits are
+effectively multiplied by the worker count.
+
+**To scale beyond one worker per service you must first move all four to a
+shared store** (Redis or equivalent) and add pub/sub for cross-worker message
+delivery. Until then, scale vertically, or run one process per host behind a
+load balancer with sticky sessions *and* accept that two devices of the same
+user must land on the same host.
 
 ## Service Management
 

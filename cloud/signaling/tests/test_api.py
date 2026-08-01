@@ -15,54 +15,25 @@
 
 """API endpoint tests."""
 
-from collections.abc import AsyncIterator
-from pathlib import Path
-
-import pytest
 from fastapi.testclient import TestClient
-from httpx import ASGITransport, AsyncClient
 
-from app.db import database, init_db
-from app.main import app
-
-
-@pytest.fixture(autouse=True)
-def setup_test_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the app at a fresh SQLite database for every test.
-
-    tmp_path is unique per test, so the suite is hermetic and idempotent:
-    it never touches the developer's signaling.db and leaves no state behind.
-    """
-    monkeypatch.setattr(database, "DATABASE_FILE", str(tmp_path / "signaling.db"))
+from app.core.crypto import REGISTER_CONTEXT
+from app.core.security import BCRYPT_MAX_PASSWORD_BYTES
+from tests.conftest import Account, new_device_key
 
 
-@pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
-    """Create test client.
-
-    Yields:
-        Test client.
-    """
-    await init_db()
-    transport = ASGITransport(app=app)  # type: ignore[arg-type]
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-
-
-@pytest.mark.asyncio
-async def test_health_check(client: AsyncClient) -> None:
+def test_health_check(client: TestClient) -> None:
     """Test health check endpoint."""
-    response = await client.get("/health")
+    response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
     assert "timestamp" in data
 
 
-@pytest.mark.asyncio
-async def test_register_user(client: AsyncClient) -> None:
+def test_register_user(client: TestClient) -> None:
     """Test user registration."""
-    response = await client.post(
+    response = client.post(
         "/auth/register",
         json={"email": "test@example.com", "password": "testpass123"},
     )
@@ -72,17 +43,13 @@ async def test_register_user(client: AsyncClient) -> None:
     assert data["token_type"] == "bearer"
 
 
-@pytest.mark.asyncio
-async def test_register_duplicate_user(client: AsyncClient) -> None:
+def test_register_duplicate_user(client: TestClient) -> None:
     """Test registering duplicate user fails."""
-    # Register first user
-    await client.post(
+    client.post(
         "/auth/register",
         json={"email": "test@example.com", "password": "testpass123"},
     )
-
-    # Try to register again
-    response = await client.post(
+    response = client.post(
         "/auth/register",
         json={"email": "test@example.com", "password": "testpass123"},
     )
@@ -90,17 +57,13 @@ async def test_register_duplicate_user(client: AsyncClient) -> None:
     assert "already registered" in response.json()["detail"]
 
 
-@pytest.mark.asyncio
-async def test_login_success(client: AsyncClient) -> None:
+def test_login_success(client: TestClient) -> None:
     """Test successful login."""
-    # Register user
-    await client.post(
+    client.post(
         "/auth/register",
         json={"email": "test@example.com", "password": "testpass123"},
     )
-
-    # Login
-    response = await client.post(
+    response = client.post(
         "/auth/login",
         json={"email": "test@example.com", "password": "testpass123"},
     )
@@ -110,119 +73,132 @@ async def test_login_success(client: AsyncClient) -> None:
     assert data["token_type"] == "bearer"
 
 
-@pytest.mark.asyncio
-async def test_login_wrong_password(client: AsyncClient) -> None:
+def test_login_wrong_password(client: TestClient) -> None:
     """Test login with wrong password fails."""
-    # Register user
-    await client.post(
+    client.post(
         "/auth/register",
         json={"email": "test@example.com", "password": "testpass123"},
     )
-
-    # Try to login with wrong password
-    response = await client.post(
+    response = client.post(
         "/auth/login",
         json={"email": "test@example.com", "password": "wrongpassword"},
     )
     assert response.status_code == 401
 
 
-@pytest.mark.asyncio
-async def test_register_device(client: AsyncClient) -> None:
-    """Test device registration."""
-    # Register and login user
-    register_response = await client.post(
+def test_login_unknown_account(client: TestClient) -> None:
+    """Logging in as an account that does not exist fails the same way."""
+    response = client.post(
+        "/auth/login",
+        json={"email": "nobody@example.com", "password": "testpass123"},
+    )
+    assert response.status_code == 401
+
+
+def test_password_longer_than_bcrypt_accepts_is_rejected(client: TestClient) -> None:
+    """L8 regression: over-long passwords are refused, not silently truncated.
+
+    bcrypt hashes only the first 72 bytes, so without this two different long
+    passwords would authenticate each other.
+    """
+    response = client.post(
         "/auth/register",
-        json={"email": "test@example.com", "password": "testpass123"},
+        json={
+            "email": "long@example.com",
+            "password": "x" * (BCRYPT_MAX_PASSWORD_BYTES + 1),
+        },
     )
-    token = register_response.json()["access_token"]
+    assert response.status_code == 422
 
-    # Register device. The endpoint is an idempotent upsert, so it answers
-    # 200 OK (not 201) for both the create and the update path.
-    response = await client.post(
-        "/devices/register",
-        json={"device_id": "device-123", "pubkey": "test-pubkey-xyz"},
-        headers={"Authorization": f"Bearer {token}"},
+
+def test_multibyte_password_is_measured_in_bytes(client: TestClient) -> None:
+    """A password within the character limit but over the byte limit is refused."""
+    # 40 characters, 120 UTF-8 bytes.
+    response = client.post(
+        "/auth/register",
+        json={"email": "utf8@example.com", "password": "é" * 40 + "é" * 32},
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == "device-123"
-    assert data["pubkey"] == "test-pubkey-xyz"
+    assert response.status_code == 422
 
 
-@pytest.mark.asyncio
-async def test_register_device_unauthorized(client: AsyncClient) -> None:
+def test_register_device(client: TestClient) -> None:
+    """Test device registration with proof of possession."""
+    account = Account(client, "test@example.com")
+    account.register_device("device-123")
+
+    devices = client.get("/devices/", headers=account.headers).json()
+    assert [device["id"] for device in devices] == ["device-123"]
+
+
+def test_register_device_unauthorized(client: TestClient) -> None:
     """Test device registration without auth fails."""
-    response = await client.post(
+    response = client.post(
         "/devices/register",
-        json={"device_id": "device-123", "pubkey": "test-pubkey-xyz"},
+        json={
+            "device_id": "device-123",
+            "pubkey": "test-pubkey-xyz",
+            "challenge": "x",
+            "signature": "y",
+        },
     )
     assert response.status_code == 403  # No authorization header
 
 
-@pytest.mark.asyncio
-async def test_list_devices(client: AsyncClient) -> None:
+def test_list_devices(client: TestClient) -> None:
     """Test listing user devices."""
-    # Register and login user
-    register_response = await client.post(
-        "/auth/register",
-        json={"email": "test@example.com", "password": "testpass123"},
-    )
-    token = register_response.json()["access_token"]
+    account = Account(client, "test@example.com")
+    account.register_device("device-1")
+    account.register_device("device-2")
 
-    # Register two devices
-    await client.post(
-        "/devices/register",
-        json={"device_id": "device-1", "pubkey": "pubkey-1"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    await client.post(
-        "/devices/register",
-        json={"device_id": "device-2", "pubkey": "pubkey-2"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    # List devices
-    response = await client.get(
-        "/devices/",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    response = client.get("/devices/", headers=account.headers)
     assert response.status_code == 200
     devices = response.json()
-    assert len(devices) == 2
-    assert devices[0]["id"] in ["device-1", "device-2"]
-    assert devices[1]["id"] in ["device-1", "device-2"]
+    assert sorted(device["id"] for device in devices) == ["device-1", "device-2"]
 
 
-def test_websocket_connection() -> None:
-    """Test WebSocket signaling connection."""
-    # First, register a user and device
-    sync_client = TestClient(app)
+def test_list_devices_is_scoped_to_the_owner(client: TestClient) -> None:
+    """A user never sees another user's devices."""
+    alice = Account(client, "alice@example.com")
+    alice.register_device("alice-device")
+    mallory = Account(client, "mallory@evil.com")
+    mallory.register_device("mallory-device")
 
-    # Initialize database synchronously for test
-    import asyncio
+    devices = client.get("/devices/", headers=mallory.headers).json()
+    assert [device["id"] for device in devices] == ["mallory-device"]
 
-    asyncio.run(init_db())
 
-    # Register user
-    register_response = sync_client.post(
-        "/auth/register",
-        json={"email": "test@example.com", "password": "testpass123"},
-    )
-    token = register_response.json()["access_token"]
+def test_device_owned_by_another_user_cannot_be_claimed(client: TestClient) -> None:
+    """Registering someone else's device id is refused."""
+    alice = Account(client, "alice@example.com")
+    alice.register_device("alice-device")
 
-    # Register device
-    sync_client.post(
+    mallory = Account(client, "mallory@evil.com")
+    challenge = client.post(
+        "/devices/challenge",
+        json={"device_id": "alice-device"},
+        headers=mallory.headers,
+    ).json()["challenge"]
+
+    key = new_device_key()
+    response = client.post(
         "/devices/register",
-        json={"device_id": "device-ws-test", "pubkey": "pubkey-ws"},
-        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "device_id": "alice-device",
+            "pubkey": key.pubkey_b64,
+            "challenge": challenge,
+            "signature": key.sign(REGISTER_CONTEXT, "alice-device", challenge),
+        },
+        headers=mallory.headers,
     )
+    assert response.status_code == 403
 
-    # Test WebSocket connection
-    with sync_client.websocket_connect(
-        f"/signal?token={token}&device_id=device-ws-test"
-    ) as websocket:
-        # Should receive connection confirmation
-        data = websocket.receive_json()
-        assert data["type"] == "connected"
-        assert data["device_id"] == "device-ws-test"
+
+def test_websocket_connection(client: TestClient) -> None:
+    """Test WebSocket signaling connection with the full handshake."""
+    account = Account(client, "test@example.com")
+    account.register_device("device-ws-test")
+
+    session = account.connect_signaling("device-ws-test")
+    with session:
+        assert session.connected["device_id"] == "device-ws-test"
+        assert "ice_servers" in session.connected

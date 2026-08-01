@@ -15,36 +15,56 @@
 
 """Authentication endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
 
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+
+from ..core.ratelimit import (
+    client_ip,
+    login_account_limiter,
+    login_ip_limiter,
+    register_limiter,
+)
 from ..core.security import create_access_token, get_password_hash, verify_password
 from ..db import USE_POSTGRES, DBConnection, DBRow, as_postgres, as_sqlite, get_db
 from ..models import Token, UserCreate, UserLogin
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
+
+_RATE_LIMITED = "Too many requests. Try again later."
 
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate, db: DBConnection = Depends(get_db)) -> Token:
+async def register(
+    user_data: UserCreate, request: Request, db: DBConnection = Depends(get_db)
+) -> Token:
     """Register a new user.
 
     Args:
         user_data: User registration data.
+        request: Incoming request, used to identify the caller for throttling.
         db: Database connection.
 
     Returns:
         JWT access token.
 
     Raises:
-        HTTPException: If user already exists.
+        HTTPException: If user already exists or the caller is rate limited.
     """
+    # Registration is unauthenticated, so without a limit a single host can
+    # mint unlimited accounts, and an account is all it takes to reach the
+    # tunnel endpoints.
+    source = client_ip(request)
+    if not register_limiter.check(source):
+        logger.warning(f"Registration rate limit exceeded for {source}")
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED)
+
     user_id: int | None
     if USE_POSTGRES:
         # PostgreSQL syntax
         pg = as_postgres(db)
-        existing_user = await pg.fetchrow(
-            "SELECT id FROM users WHERE email = $1", user_data.email
-        )
+        existing_user = await pg.fetchrow("SELECT id FROM users WHERE email = $1", user_data.email)
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -94,19 +114,30 @@ async def register(user_data: UserCreate, db: DBConnection = Depends(get_db)) ->
 
 
 @router.post("/login", response_model=Token)
-async def login(credentials: UserLogin, db: DBConnection = Depends(get_db)) -> Token:
+async def login(
+    credentials: UserLogin, request: Request, db: DBConnection = Depends(get_db)
+) -> Token:
     """Login and get access token.
 
     Args:
         credentials: User login credentials.
+        request: Incoming request, used to identify the caller for throttling.
         db: Database connection.
 
     Returns:
         JWT access token.
 
     Raises:
-        HTTPException: If credentials are invalid.
+        HTTPException: If credentials are invalid or the caller is rate limited.
     """
+    # Throttle per source address and per targeted account: the first stops one
+    # host spraying many accounts, the second stops a botnet brute-forcing one.
+    source = client_ip(request)
+    account = credentials.email.lower()
+    if not login_ip_limiter.check(source) or not login_account_limiter.check(account):
+        logger.warning(f"Login rate limit exceeded for {source}")
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED)
+
     user: DBRow | None
     if USE_POSTGRES:
         # PostgreSQL syntax

@@ -49,5 +49,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 8001
 
-# Run with uvicorn
-CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--loop", "uvloop"]
+# Run with uvicorn.
+#
+# Single worker: relay sessions live in an in-process dictionary, so two peers
+# landing on different workers would never pair.
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8001", \
+     "--workers", "1", \
+     "--loop", "uvloop"]

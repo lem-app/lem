@@ -16,6 +16,8 @@
 """Models module."""
 
 from .schemas import (
+    DeviceChallengeRequest,
+    DeviceChallengeResponse,
     DeviceRegister,
     DeviceResponse,
     HealthResponse,
@@ -29,6 +31,8 @@ __all__ = [
     "UserCreate",
     "UserLogin",
     "Token",
+    "DeviceChallengeRequest",
+    "DeviceChallengeResponse",
     "DeviceRegister",
     "DeviceResponse",
     "SignalingMessage",
