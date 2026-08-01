@@ -50,6 +50,14 @@ from app.drivers.runners.ollama import (
 )
 from app.jobs import JobStatus, get_job, get_recent_jobs
 from app.jobs.queue import init_job_queue, shutdown_job_queue
+from app.security import (
+    ALLOWED_ORIGINS,
+    TOKEN_PATH,
+    LocalApiSecurityMiddleware,
+    ensure_api_token,
+    get_bind_host,
+    is_loopback_host,
+)
 from app.services import (
     get_all_services_with_status,
     get_service_endpoint,
@@ -76,6 +84,12 @@ logger = logging.getLogger(__name__)
 # Global TunnelManager instance
 tunnel_manager: TunnelManager | None = None
 
+# Where the server is bound (LEM_HOST, default loopback). A non-loopback bind
+# publishes a Docker control plane to the network, so it additionally requires a
+# bearer token on every /v1/* request.
+BIND_HOST = get_bind_host()
+LOOPBACK_ONLY = is_loopback_host(BIND_HOST)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -88,6 +102,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Startup: Initialize database
     init_db()
     logger.info("✓ Database initialized at ~/.lem/lem.db")
+
+    # Startup: Ensure the API token exists (never log the token itself)
+    ensure_api_token()
+    logger.info(f"✓ API token available at {TOKEN_PATH}")
+    if LOOPBACK_ONLY:
+        logger.info(f"✓ Listening on {BIND_HOST} (loopback only)")
+    else:
+        logger.warning(
+            f"⚠ Bound to {BIND_HOST}: the Lem API is reachable from the network. "
+            f"Every /v1/* request now requires 'Authorization: Bearer <token>' "
+            f"using the token in {TOKEN_PATH}."
+        )
 
     # Startup: Initialize job queue
     await init_job_queue()
@@ -129,18 +155,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS for local development
-# In v0.1, we allow localhost origins. In production, this will be restricted.
+# Access control. Added first so the CORS middleware wraps it and can still
+# attach CORS headers to rejections.
+app.add_middleware(
+    LocalApiSecurityMiddleware,
+    allowed_origins=ALLOWED_ORIGINS,
+    require_token=not LOOPBACK_ONLY,
+)
+
+# Configure CORS for local development.
+# The allowlist is shared with the CSRF middleware (app.security.ALLOWED_ORIGINS).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Vite dev server (web/remote)
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",  # Vite dev server (web/local)
-        "http://127.0.0.1:5174",
-        "http://localhost:3000",  # Future: served by FastAPI
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

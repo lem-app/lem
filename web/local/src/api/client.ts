@@ -37,6 +37,13 @@ import type {
 // For production builds, set VITE_API_URL to the full backend URL
 const API_BASE_URL = import.meta.env.VITE_API_URL || ''
 
+// The server requires this custom header on every state-changing request.
+// A browser cannot attach a custom header to a cross-origin request without a
+// CORS preflight, so it proves the request came from a real Lem client rather
+// than from a malicious page doing fetch(..., { mode: "no-cors" }).
+const CLIENT_HEADER = 'X-Lem-Client'
+const CLIENT_NAME = 'lem-dashboard'
+
 class ApiError extends Error {
   status: number
   problemDetails?: ProblemDetails
@@ -57,6 +64,7 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
       ...options,
       headers: {
         'Content-Type': 'application/json',
+        [CLIENT_HEADER]: CLIENT_NAME,
         ...options?.headers,
       },
     })

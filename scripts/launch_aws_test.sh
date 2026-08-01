@@ -19,8 +19,12 @@ echo "Starting local services for AWS testing..."
 echo ""
 
 # Start Lem local server with AWS signaling URL override
+# NOTE: this remote-test harness deliberately binds 0.0.0.0, unlike every other
+# launch path (which defaults to 127.0.0.1). LEM_HOST is set to match so the
+# server knows it is network-reachable and enforces bearer-token auth on /v1/*.
+# Read the token from ~/.lem/api_token.
 echo "→ Local Lem Server (port 5142)"
-(cd ../server && LEM_SIGNAL_URL=https://signal.lem.gg uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
+(cd ../server && LEM_SIGNAL_URL=https://signal.lem.gg LEM_HOST=0.0.0.0 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
 sleep 2
 
 # Start local web dashboard with AWS signaling URL as default

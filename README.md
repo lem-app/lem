@@ -35,10 +35,10 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 git clone https://github.com/lem-app/lem.git
 cd lem
 
-# Start the local server
+# Start the local server (loopback only - see "Network exposure" below)
 cd server
 uv sync
-uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
+uv run lem-serve
 
 # In another terminal, from the repository root, start the web dashboard
 cd web/local
@@ -66,6 +66,32 @@ Lem consists of five main components:
 - **JWT authentication**: Secure access to cloud services
 - **Device registration**: ed25519 public key authentication
 - **Open source**: Full transparency, audit the code yourself
+
+### Network exposure
+
+The local server can install, start, stop and remove Docker services, so it
+binds to **127.0.0.1 only** unless you opt in. Set `LEM_HOST` to change that:
+
+```bash
+# Default: reachable from this machine only
+LEM_HOST=127.0.0.1 uv run uvicorn app.main:app --host 127.0.0.1 --port 5142
+
+# Opt in to LAN access (bearer token then required on every /v1/* request)
+LEM_HOST=0.0.0.0 uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
+curl -H "X-Lem-Client: curl" \
+     -H "Authorization: Bearer $(cat ~/.lem/api_token)" \
+     http://<host>:5142/v1/services
+```
+
+- **API token**: generated on first start at `~/.lem/api_token` (mode 0600).
+  Required on `/v1/*` whenever `LEM_HOST` is not a loopback address; accepted
+  but not required on loopback.
+- **CSRF protection**: every state-changing request must send the
+  `X-Lem-Client` header, and any `Origin` it sends must be a localhost
+  dashboard origin. This holds on loopback too - it is what stops a web page
+  you are visiting from POSTing to `http://localhost:5142`.
+- **Secrets at rest**: `~/.lem` is mode 0700 and `lem.db` (plus its WAL/SHM
+  sidecars) and `api_token` are mode 0600.
 
 ## 📖 Documentation
 

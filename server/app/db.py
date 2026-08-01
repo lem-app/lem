@@ -28,15 +28,26 @@ Requirements:
 """
 
 import json
+import logging
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 # Database path: ~/.lem/lem.db
 LEM_HOME = Path.home() / ".lem"
 DB_PATH = LEM_HOME / "lem.db"
+
+# The database holds secrets at rest (Ed25519 private key, signaling JWT), so the
+# directory is owner-only and every database file is 0600.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+# SQLite in WAL mode keeps two sidecar files next to the database.
+DB_SIDECAR_SUFFIXES = ("-wal", "-shm")
 
 
 class DatabaseError(Exception):
@@ -45,15 +56,61 @@ class DatabaseError(Exception):
     pass
 
 
+def secure_lem_home(path: Path | None = None) -> Path:
+    """
+    Create the Lem home directory (if needed) and restrict it to the owner.
+
+    Args:
+        path: Directory to secure (defaults to ~/.lem)
+
+    Returns:
+        Path to the secured directory
+    """
+    target = LEM_HOME if path is None else path
+    target.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+    _chmod(target, DIR_MODE)
+    return target
+
+
+def secure_db_files() -> None:
+    """
+    Restrict the database and its WAL/SHM sidecars to owner read/write.
+
+    Called on every connection open because SQLite recreates the sidecar
+    files with the process umask whenever a WAL transaction starts.
+    """
+    for path in (DB_PATH, *(Path(f"{DB_PATH}{sfx}") for sfx in DB_SIDECAR_SUFFIXES)):
+        if path.exists():
+            _chmod(path, FILE_MODE)
+
+
+def _chmod(path: Path, mode: int) -> None:
+    """
+    Best-effort chmod.
+
+    POSIX permissions are advisory on Windows/WSL mounts, so a failure here is
+    logged rather than fatal - it must not stop the server from starting.
+
+    Args:
+        path: Path to restrict
+        mode: Octal permission bits
+    """
+    try:
+        path.chmod(mode)
+    except OSError as e:
+        logger.warning(f"Could not set permissions {mode:o} on {path}: {e}")
+
+
 def init_db() -> None:
     """
     Initialize database with v0.1 schema.
     Creates tables if they don't exist and enables WAL mode.
     """
-    # Ensure ~/.lem directory exists
-    LEM_HOME.mkdir(parents=True, exist_ok=True)
+    # Ensure ~/.lem exists and is owner-only (it stores secrets)
+    secure_lem_home()
 
     conn = sqlite3.connect(str(DB_PATH))
+    secure_db_files()
     try:
         # Enable WAL mode for concurrent reads
         conn.execute("PRAGMA journal_mode=WAL")
@@ -99,6 +156,7 @@ def init_db() -> None:
 
         conn.commit()
     finally:
+        secure_db_files()
         conn.close()
 
 
@@ -110,9 +168,13 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
     """
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row  # Enable dict-like access
+    # Fix up permissions left behind by an earlier crash...
+    secure_db_files()
     try:
         yield conn
     finally:
+        # ...and on the WAL/SHM files this connection just created.
+        secure_db_files()
         conn.close()
 
 
@@ -173,9 +235,7 @@ def delete_setting(key: str) -> None:
 class Device:
     """Device record."""
 
-    def __init__(
-        self, id: str, pubkey: str, created_at: datetime, privkey: str | None = None
-    ):
+    def __init__(self, id: str, pubkey: str, created_at: datetime, privkey: str | None = None):
         self.id = id
         self.pubkey = pubkey
         self.privkey = privkey
@@ -198,9 +258,7 @@ def get_device() -> Device | None:
         Device or None if not registered
     """
     with get_db() as conn:
-        cursor = conn.execute(
-            "SELECT id, pubkey, privkey, created_at FROM device LIMIT 1"
-        )
+        cursor = conn.execute("SELECT id, pubkey, privkey, created_at FROM device LIMIT 1")
         row = cursor.fetchone()
         if not row:
             return None
@@ -213,9 +271,7 @@ def get_device() -> Device | None:
         )
 
 
-def register_device(
-    device_id: str, pubkey: str, privkey: str | None = None
-) -> Device:
+def register_device(device_id: str, pubkey: str, privkey: str | None = None) -> Device:
     """
     Register this device (insert or replace).
 
@@ -243,9 +299,7 @@ def register_device(
             )
             conn.commit()
 
-            return Device(
-                id=device_id, pubkey=pubkey, privkey=privkey, created_at=created_at
-            )
+            return Device(id=device_id, pubkey=pubkey, privkey=privkey, created_at=created_at)
     except sqlite3.Error as e:
         raise DatabaseError(f"Failed to register device: {e}") from e
 

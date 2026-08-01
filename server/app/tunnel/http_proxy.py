@@ -17,17 +17,134 @@
 
 Receives HTTP request frames over DataChannel, forwards them to the local
 Lem server or client UIs based on routing rules, and sends responses back over DataChannel.
+
+Everything in a request frame is chosen by the remote peer, so the path is
+validated and joined (never concatenated) onto the routed base URL, and the
+forwarded headers are filtered. Without that, a peer could turn this handler
+into an open proxy onto the loopback interface, the LAN, or a cloud metadata
+endpoint.
 """
 
+import json
 import logging
 from typing import Any
 
 import aiohttp
+from yarl import URL
+
+from app.security import CLIENT_HEADER, get_api_token
 
 from .http_frame import HTTPRequestFrame, HTTPResponseFrame, deserialize_request, serialize_response
 from .router import RequestRouter, create_router_with_client_discovery
 
 logger = logging.getLogger(__name__)
+
+# Headers that describe a single hop and must not be forwarded (RFC 7230 §6.1),
+# plus headers that would let a peer retarget or desynchronize the upstream
+# request (Host), and headers aiohttp must recompute for the body it sends.
+HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+    }
+)
+
+# Headers the proxy sets itself; a peer-supplied value is always discarded.
+PROXY_CONTROLLED_HEADERS = frozenset({CLIENT_HEADER, "authorization", "origin", "referer"})
+
+# Generic text returned to the peer; the real reason goes to the server log only.
+GENERIC_PROXY_ERROR = "Proxy error"
+GENERIC_GATEWAY_ERROR = "Bad gateway"
+
+
+def validate_path(path: str) -> str:
+    """Validate a peer-supplied request path.
+
+    Args:
+        path: Path (with optional query string) from the request frame
+
+    Returns:
+        The validated path
+
+    Raises:
+        ValueError: If the path could resolve to a host other than the target
+
+    Examples:
+        A path of ``@evil.example.com/v1/admin`` concatenated onto
+        ``http://localhost:5142`` yields
+        ``http://localhost:5142@evil.example.com/v1/admin`` - userinfo, not a
+        host, so the request goes to evil.example.com. A path of
+        ``//evil.example.com/x`` is protocol-relative and does the same.
+        Both are rejected here.
+    """
+    if not path.startswith("/"):
+        raise ValueError("Path must start with '/'")
+    if path.startswith("//") or path.startswith("/\\"):
+        raise ValueError("Path must not start with a network-path reference")
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in path):
+        raise ValueError("Path must not contain whitespace or control characters")
+    return path
+
+
+def build_target_url(base_url: str, path: str) -> URL:
+    """Join a validated path onto a base URL without letting it change the host.
+
+    Args:
+        base_url: Routed target base URL
+        path: Peer-supplied path (validated by :func:`validate_path`)
+
+    Returns:
+        Absolute URL to request
+
+    Raises:
+        ValueError: If the path is invalid or the join changed the origin
+    """
+    base = URL(base_url)
+    url = base.join(URL(validate_path(path)))
+
+    # Defense in depth: yarl's join must not have moved us off the target.
+    if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
+        raise ValueError("Path resolved to a different origin")
+    return url
+
+
+def filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Drop hop-by-hop and proxy-controlled headers from a peer's request.
+
+    Args:
+        headers: Peer-supplied headers
+
+    Returns:
+        Headers safe to forward upstream
+    """
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in HOP_BY_HOP_HEADERS and name.lower() not in PROXY_CONTROLLED_HEADERS
+    }
+
+
+def error_body(message: str) -> str:
+    """Build a JSON error body.
+
+    Uses json.dumps so a message containing a quote or backslash cannot break
+    out of the JSON string and produce a malformed frame.
+
+    Args:
+        message: Client-facing message
+
+    Returns:
+        JSON document as a string
+    """
+    return json.dumps({"error": message})
 
 
 class HTTPProxyHandler:
@@ -99,12 +216,12 @@ class HTTPProxyHandler:
 
         except Exception as e:
             logger.error(f"Error handling request: {e}")
-            # Return error response
+            # Return error response (details stay in the log, not in the frame)
             error_frame: HTTPResponseFrame = {
                 "request_id": 0,  # Will be overwritten if we can parse request_id
                 "status_code": 500,
                 "headers": {"Content-Type": "application/json"},
-                "body": f'{{"error": "Internal proxy error: {str(e)}"}}',
+                "body": error_body(GENERIC_PROXY_ERROR),
             }
 
             # Try to extract request_id for proper correlation
@@ -134,13 +251,34 @@ class HTTPProxyHandler:
         # Use router to determine target
         target_url = self.router.route(request_frame["path"])
 
-        # Build full URL
-        url = f"{target_url}{request_frame['path']}"
+        # Build full URL from a validated path (never string concatenation)
+        try:
+            url = build_target_url(target_url, request_frame["path"])
+        except ValueError as e:
+            logger.warning(f"Rejected proxy request path {request_frame['path']!r}: {e}")
+            return {
+                "request_id": request_frame["request_id"],
+                "status_code": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": error_body("Invalid request path"),
+            }
+
+        headers = filter_request_headers(request_frame["headers"])
+        # The tunnel is an authenticated datapath, so it presents the local
+        # server's own credentials rather than the peer's.
+        if str(url.origin()) == str(URL(self.local_server_url).origin()):
+            headers[CLIENT_HEADER] = "lem-tunnel"
+            token = get_api_token()
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
 
         # Prepare request parameters
         kwargs: dict[str, Any] = {
-            "headers": request_frame["headers"],
+            "headers": headers,
             "timeout": aiohttp.ClientTimeout(total=30),
+            # Redirects are relayed to the peer, never followed here: following
+            # one would let an upstream Location header pick a new host.
+            "allow_redirects": False,
         }
 
         # Add body if present
@@ -168,20 +306,20 @@ class HTTPProxyHandler:
 
         except aiohttp.ClientError as e:
             logger.error(f"HTTP client error: {e}")
-            # Return 502 Bad Gateway
+            # Return 502 Bad Gateway (details stay in the log)
             return {
                 "request_id": request_frame["request_id"],
                 "status_code": 502,
                 "headers": {"Content-Type": "application/json"},
-                "body": f'{{"error": "Bad Gateway: {str(e)}"}}',
+                "body": error_body(GENERIC_GATEWAY_ERROR),
             }
 
         except Exception as e:
             logger.error(f"Unexpected error forwarding request: {e}")
-            # Return 500 Internal Server Error
+            # Return 500 Internal Server Error (details stay in the log)
             return {
                 "request_id": request_frame["request_id"],
                 "status_code": 500,
                 "headers": {"Content-Type": "application/json"},
-                "body": f'{{"error": "Internal Server Error: {str(e)}"}}',
+                "body": error_body(GENERIC_PROXY_ERROR),
             }

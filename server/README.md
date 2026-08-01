@@ -8,11 +8,34 @@ Local server for Lem v0.1 - AI launcher with remote access.
 # Install dependencies
 uv sync
 
-# Run server (development)
-uv run uvicorn app.main:app --host 0.0.0.0 --port 5142 --reload
+# Run server (development, loopback only)
+uv run uvicorn app.main:app --host 127.0.0.1 --port 5142 --reload
 
 # Test health endpoint
 curl http://localhost:5142/v1/health
+```
+
+## Network exposure & auth
+
+This API controls Docker, so it binds to loopback by default. `LEM_HOST`
+(default `127.0.0.1`) is the documented opt-in for LAN exposure - keep it in
+sync with uvicorn's `--host`:
+
+```bash
+LEM_HOST=0.0.0.0 uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
+```
+
+- **Bearer token** (`~/.lem/api_token`, mode 0600, generated on first start) is
+  required on every `/v1/*` request when `LEM_HOST` is not loopback, and
+  accepted but not required on loopback.
+- **CSRF**: any request whose method is not GET/HEAD/OPTIONS must send
+  `X-Lem-Client: <name>`; if it sends an `Origin`, that origin must be in
+  `app.security.ALLOWED_ORIGINS` (the same list the CORS middleware uses).
+
+```bash
+curl -X POST http://127.0.0.1:5142/v1/services/ollama/start \
+     -H "X-Lem-Client: curl" \
+     -H "Authorization: Bearer $(cat ~/.lem/api_token)"
 ```
 
 ## Development

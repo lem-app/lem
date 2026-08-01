@@ -29,8 +29,11 @@ echo "→ Relay Server (port 8001)"
 sleep 2
 
 # Start Lem local server
+# Binds to loopback by default: this API controls Docker on your machine.
+# Export LEM_HOST=0.0.0.0 to expose it on the LAN (then every /v1/* request
+# needs "Authorization: Bearer $(cat ~/.lem/api_token)").
 echo "→ Local Lem Server (port 5142)"
-(cd ../server && uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
+(cd ../server && LEM_HOST="${LEM_HOST:-127.0.0.1}" uv run uvicorn app.main:app --reload --host "${LEM_HOST:-127.0.0.1}" --port 5142) &
 sleep 2
 
 # Start browser remote app
