@@ -188,23 +188,50 @@ async def fake_signaling() -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
         await task
 
 
-async def test_device_list_is_fetched_from_signaling_and_cached(
+async def test_device_list_is_fetched_from_signaling(
     fake_signaling: tuple[str, dict[str, Any]],
 ) -> None:
-    """The account's devices come over the wire, and are not re-fetched per offer."""
+    """The account's devices come over the wire, and strangers are cached off it."""
     base, control = fake_signaling
     auth = AuthState("user@example.com", "jwt-token", OWN_DEVICE, base)
     verifier = RegisteredDeviceVerifier()
 
     with patch("app.tunnel.peer_auth.get_auth_state", return_value=auth):
         first = await verifier.verify(PeerIdentity(REGISTERED_PEER))
-        second = await verifier.verify(PeerIdentity(UNKNOWN_PEER))
+        stranger = await verifier.verify(PeerIdentity(UNKNOWN_PEER))
         own = await verifier.verify(PeerIdentity(OWN_DEVICE))
 
     assert first.authorized is True
-    assert second.authorized is False
+    assert stranger.authorized is False
     assert own.authorized is True, "this machine's own device belongs to its account"
-    assert control["calls"] == 1, "the device list should be cached across offers"
+    # The stranger was denied straight off the cached list - no second lookup -
+    # while each *authorization* went back to the registry.
+    assert control["calls"] == 2
+
+
+async def test_deregistered_device_is_not_waved_through_by_the_cache(
+    fake_signaling: tuple[str, dict[str, Any]],
+) -> None:
+    """A device removed from the account cannot reconnect on a stale device list.
+
+    The list is cached to keep an offer flood from hammering signaling, but a
+    cached list that would *authorize* is never trusted: the grant path always
+    re-reads the registry. Otherwise revoking a device would take up to
+    DEVICE_CACHE_TTL_SECONDS to take effect on new connections.
+    """
+    base, control = fake_signaling
+    auth = AuthState("user@example.com", "jwt-token", OWN_DEVICE, base)
+    verifier = RegisteredDeviceVerifier()
+
+    with patch("app.tunnel.peer_auth.get_auth_state", return_value=auth):
+        before = await verifier.verify(PeerIdentity(REGISTERED_PEER))
+        # Deregistered on the account, well inside the cache TTL.
+        control["devices"] = []
+        after = await verifier.verify(PeerIdentity(REGISTERED_PEER))
+
+    assert before.authorized is True
+    assert after.authorized is False, "a deregistered device reconnected on cached data"
+    assert "not registered" in after.reason
 
 
 async def test_signaling_error_response_denies(

@@ -32,20 +32,28 @@ answers "is this device registered to my account?" by asking the signaling
 server, which is only as strong as the signaling server's own word.
 
 The endgame is Ed25519 proof-of-possession: the peer signs a fresh challenge
-with the private key behind the public key registered for its device. That work
-is on ``fix/cloud-authz``, which owns the signaling-side challenge/response.
-It drops in here without redesign:
+with the private key behind the public key registered for its device. This
+module is shaped to take that verifier - :func:`build_peer_verifier` is the
+single seam, :attr:`PeerIdentity.proof` carries a signaling-layer proof payload
+through untouched, and any verifier returns the same :class:`PeerDecision`, so
+no call site in ``webrtc_client``/``relay_client`` changes.
 
-* :attr:`PeerIdentity.proof` already carries the peer's signaling-layer proof
-  payload through untouched, so a new verifier can read it without any change
-  to the call sites in ``webrtc_client``/``relay_client``.
-* A ``SignedChallengeVerifier`` implementing :meth:`PeerVerifier.verify` is
-  wired in at the single seam, :func:`build_peer_verifier` - either replacing
-  the registration check or chained behind it (registration first, signature
-  second), since both return the same :class:`PeerDecision`.
-* ``app.crypto.public_key_from_b64`` is the verification primitive it needs;
-  the registered pubkey travels with the device record the signaling server
-  already returns.
+Be precise about how much of that is already available, though:
+
+* A *stronger registration check* is close at hand. ``GET /devices/`` already
+  returns each device's ``pubkey``, so a verifier could require the peer's
+  pubkey to match the registered one as well as its id.
+* An actual ``SignedChallengeVerifier`` is **not** close at hand, and no open
+  work delivers it. ``fix/cloud-authz`` hardens each device's *own* link to the
+  signaling server (it must prove key possession to connect and to register)
+  and scopes routing server-side. Neither gives *this* process a way to check a
+  peer's identity without taking the signaling server's word for it. A real
+  peer-to-peer challenge needs a challenge issued to an as-yet-unconnected
+  peer, a wire format for the response, and somewhere to attach it before a
+  DataChannel exists. That protocol does not exist yet, and designing it spans
+  ``server/``, ``cloud/signaling/`` and ``web/remote/``.
+* ``app.crypto.public_key_from_b64`` is the verification primitive it would
+  need. It has no call sites today.
 
 Escape hatch
 ------------
@@ -72,7 +80,8 @@ ALLOW_UNVERIFIED_ENV_VAR = "LEM_TUNNEL_ALLOW_UNVERIFIED_PEERS"
 # never suggest a real device was verified.
 UNVERIFIED_PEER_LABEL = "<unverified-peer>"
 
-# How long a device list from the signaling server stays usable.
+# How long a device list from the signaling server stays usable *for denials*.
+# It is never used to authorize - see RegisteredDeviceVerifier.verify.
 DEVICE_CACHE_TTL_SECONDS = 30.0
 
 # Cap on how long the signaling lookup may block the offer path.
@@ -134,7 +143,7 @@ class RegisteredDeviceVerifier:
     def __init__(self, cache_ttl: float = DEVICE_CACHE_TTL_SECONDS) -> None:
         """
         Args:
-            cache_ttl: Seconds a fetched device list stays usable
+            cache_ttl: Seconds a fetched device list stays usable for denials
         """
         self.cache_ttl = cache_ttl
         self._cached_ids: frozenset[str] = frozenset()
@@ -143,6 +152,13 @@ class RegisteredDeviceVerifier:
 
     async def verify(self, peer: PeerIdentity) -> PeerDecision:
         """Check the peer against the account's registered devices.
+
+        The cached device list is consulted only to *deny*. A peer that the
+        cache would authorize is always re-checked against the registry, so a
+        device deregistered a moment ago cannot be waved through on stale data
+        for the rest of the cache TTL. Denying on a slightly stale list is
+        safe - the worst case is that a just-registered device waits out the
+        TTL - while authorizing on one is not.
 
         Args:
             peer: Identity claimed for the peer
@@ -157,6 +173,10 @@ class RegisteredDeviceVerifier:
         if auth_state is None:
             return PeerDecision(False, "this machine is not logged in to a Lem account")
 
+        cached = self._cached_device_ids(auth_state)
+        if cached is not None and peer.device_id not in cached:
+            return PeerDecision(False, "device is not registered to this account")
+
         try:
             known = await self._registered_device_ids(auth_state)
         except (aiohttp.ClientError, TimeoutError, ValueError) as e:
@@ -167,8 +187,22 @@ class RegisteredDeviceVerifier:
             return PeerDecision(True, "device is registered to this account")
         return PeerDecision(False, "device is not registered to this account")
 
+    def _cached_device_ids(self, auth_state: AuthState) -> frozenset[str] | None:
+        """Return the cached device list for this account, if still fresh.
+
+        Args:
+            auth_state: Stored account credentials
+
+        Returns:
+            The cached device IDs, or None when there is no usable cache entry
+        """
+        key = (auth_state.signaling_url, auth_state.device_id)
+        if self._cached_key == key and time.monotonic() - self._cached_at < self.cache_ttl:
+            return self._cached_ids
+        return None
+
     async def _registered_device_ids(self, auth_state: AuthState) -> frozenset[str]:
-        """Fetch (and briefly cache) the device IDs registered to this account.
+        """Fetch the device IDs registered to this account from signaling.
 
         Args:
             auth_state: Stored account credentials
@@ -181,11 +215,6 @@ class RegisteredDeviceVerifier:
             TimeoutError: If the lookup takes too long
             ValueError: If the signaling server answers with an error or junk
         """
-        key = (auth_state.signaling_url, auth_state.device_id)
-        now = time.monotonic()
-        if self._cached_key == key and now - self._cached_at < self.cache_ttl:
-            return self._cached_ids
-
         url = f"{auth_state.signaling_url.rstrip('/')}/devices/"
         timeout = aiohttp.ClientTimeout(total=DEVICE_LOOKUP_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -208,8 +237,8 @@ class RegisteredDeviceVerifier:
         ids.add(auth_state.device_id)
 
         self._cached_ids = frozenset(ids)
-        self._cached_key = key
-        self._cached_at = now
+        self._cached_key = (auth_state.signaling_url, auth_state.device_id)
+        self._cached_at = time.monotonic()
         logger.info(f"Loaded {len(self._cached_ids)} registered device(s) for peer authorization")
         return self._cached_ids
 
