@@ -22,7 +22,7 @@ import { WebRTCConnectionManager } from '../lib/webrtc'
 import { RelayClient } from '../lib/relay-client'
 import { HTTPProxy, WebRTCTransport, RelayTransport } from '../lib/proxy-fetch'
 import { WSProxyManager } from '../lib/ws-proxy'
-import { setupWebSocketIntercept, teardownWebSocketIntercept } from '../lib/websocket-intercept'
+import { installWsBridge } from '../lib/ws-bridge'
 import { TunnelSession } from '../lib/tunnel-session'
 import type { ConnectionState, DataChannelState } from '../api/types'
 
@@ -120,16 +120,6 @@ export function useWebRTC(options: UseWebRTCOptions) {
     setDataChannelState('none')
   }, [])
 
-  // Tear WebSocket interception down when the component unmounts. Setup happens
-  // alongside the proxy manager below (this effect used to claim it set up
-  // interception but never called setupWebSocketIntercept).
-  useEffect(() => {
-    return () => {
-      console.log('[useWebRTC] Tearing down WebSocket interception (component unmount)')
-      teardownWebSocketIntercept()
-    }
-  }, [])
-
   // Initialize WebRTC manager
   useEffect(() => {
     if (!options.token || !options.deviceId || !options.targetDeviceId) {
@@ -203,8 +193,11 @@ export function useWebRTC(options: UseWebRTCOptions) {
       session.handleFrame(message)
     }
 
-    // Install (or re-point) WebSocket interception for this proxy manager
-    setupWebSocketIntercept(wsProxyManager)
+    // Publish the bridge on *this* window, now - strictly before any iframe
+    // element exists. A framed app's shim looks it up in its own constructor,
+    // and the app opens its first socket during its boot script, so anything
+    // installed later than this is already too late (spec section 3.7).
+    const uninstallWsBridge = installWsBridge(wsProxyManager, window)
 
     // Poll for DataChannel state changes
     pollingIntervalRef.current = window.setInterval(() => {
@@ -285,7 +278,7 @@ export function useWebRTC(options: UseWebRTCOptions) {
         pollingIntervalRef.current = null
       }
       fallbackToRelayRef.current = null
-      // Clean up connections (but NOT interception - that stays active)
+      uninstallWsBridge()
       teardown()
     }
   }, [

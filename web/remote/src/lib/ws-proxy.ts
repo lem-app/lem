@@ -76,6 +76,20 @@ interface BufferedSend {
   payload: ArrayBuffer
 }
 
+/**
+ * Cross-realm `Blob` test.
+ *
+ * Every `send()` from a framed app arrives from *another realm*: the shim calls
+ * this class directly across the iframe boundary, so `data instanceof Blob`
+ * compares against the dashboard's `Blob` constructor and is false for the
+ * frame's. A `Blob` that fell through to the `ArrayBuffer` branch would be read
+ * as `new Uint8Array(blob)` - length 0, message silently empty. The brand check
+ * does not care which realm minted it.
+ */
+function isBlobLike(value: unknown): value is Blob {
+  return Object.prototype.toString.call(value) === '[object Blob]'
+}
+
 interface PendingMessage {
   opcode: WSOpcodeValue
   parts: Uint8Array[]
@@ -259,7 +273,7 @@ export class ProxiedWebSocket implements EventTarget {
         WSOpcode.TEXT,
         payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
       )
-    } else if (data instanceof Blob) {
+    } else if (isBlobLike(data)) {
       this.enqueueAsync(WSOpcode.BINARY, data.arrayBuffer())
     } else if (ArrayBuffer.isView(data)) {
       // Copy out of the view's window; the buffer may be a SharedArrayBuffer or
@@ -277,15 +291,19 @@ export class ProxiedWebSocket implements EventTarget {
    * Route a payload that is already in hand.
    */
   private enqueue(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+    // The chain is checked *first*, before the CONNECTING branch. An earlier
+    // Blob `send()` is still being read asynchronously; buffering this payload
+    // directly would put it on the wire ahead of the Blob that was sent before
+    // it. Order is the whole contract of a WebSocket.
+    if (this.sendQueue !== null) {
+      this.chainSend(opcode, Promise.resolve(payload))
+      return
+    }
     if (this._readyState === ProxiedWSState.CONNECTING) {
       this.buffer(opcode, payload)
       return
     }
-    if (this.sendQueue === null) {
-      this.sendMessage(opcode, payload)
-      return
-    }
-    this.chainSend(opcode, Promise.resolve(payload))
+    this.sendMessage(opcode, payload)
   }
 
   /** Route a payload that still has to be read (Blob). */

@@ -110,6 +110,24 @@ PROXY_CONTROLLED_HEADERS = frozenset(
 # anything that would hand the peer upstream state. Content-Length and
 # Content-Encoding are recomputed by the frame (aiohttp already decoded the
 # body), so relaying the upstream values would misdescribe what the peer gets.
+#
+# ``set-cookie`` is deliberately **absent**, and this is load-bearing even
+# though nothing consumes it yet. **Do not "clean up" this relay as unused.**
+#
+# It was blocked here until #72, and the consequence was concrete: no framed app
+# could log in, because its session cookie never reached the browser. It now
+# crosses the tunnel verbatim.
+#
+# The browser side does *not* act on it. The Service Worker rewrite #72
+# originally specified turned out to be undeliverable - ``Set-Cookie`` is a
+# forbidden response-header name, so a worker-synthesised ``Response`` cannot
+# carry it (spec section 5.6.2). The design that replaces it has the worker keep
+# its own cookie jar, and that jar reads the header from *these* frames. Strip
+# it here and the jar has nothing to read: this relay is its prerequisite.
+#
+# ``set-cookie2`` stays blocked: RFC 6265 obsoleted RFC 2965, its attribute
+# grammar is a different (quoted) one, and no upstream this proxy fronts emits
+# it.
 RESPONSE_BLOCKED_HEADERS = frozenset(
     {
         "connection",
@@ -122,7 +140,6 @@ RESPONSE_BLOCKED_HEADERS = frozenset(
         "upgrade",
         "content-length",
         "content-encoding",
-        "set-cookie",
         "set-cookie2",
     }
 )
@@ -212,7 +229,13 @@ def filter_response_headers(headers: Iterable[tuple[str, str]]) -> HeaderList:
     """Drop hop-by-hop and upstream-state headers before relaying to the peer.
 
     The mirror of :func:`filter_request_headers`: without it the peer receives
-    whatever the upstream sent, including cookies and internal debug headers.
+    whatever the upstream sent, including internal debug headers.
+
+    ``Set-Cookie`` crosses (#72). Every one of them: they are not foldable into
+    a single header, which is precisely why this takes pairs rather than a
+    mapping. Nothing consumes them on the browser side *yet* - see the note on
+    ``RESPONSE_BLOCKED_HEADERS`` above and spec section 5.6.2 - but the cookie
+    jar that will consume them reads them from these frames.
 
     Takes pairs rather than a mapping, and is fed from aiohttp's ``CIMultiDict``
     via ``.items()``. ``dict(response.headers)`` - what v2 did - collapses every

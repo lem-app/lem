@@ -24,16 +24,20 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
+  FakeNetwork,
   ORIGIN,
   appUrl,
   createHarness,
+  dispatchFetch,
   persistentBindingStore,
   settle,
+  type DispatchOptions,
   type Harness,
   type UpstreamRequest,
 } from '../test/sw-harness'
 import { FrameType, MAX_CHUNK_BYTES } from './http-frame'
 import { TunnelErrorCode } from './tunnel-errors'
+import { HTML_SNIFF_BYTES, SHIM_MARKER_ATTRIBUTE, WS_SHIM_SOURCE } from '../../public/lem-app-sw.js'
 
 const DEVICE_A = 'dev-7f3a'
 const DEVICE_B = 'dev-91c2'
@@ -552,6 +556,226 @@ describe('the same-origin Service Worker proxy', () => {
       expect(harness.tunnel.requests[0].method).toBe('POST')
       expect(new TextDecoder().decode(harness.tunnel.requests[0].body)).toBe('{"prompt":"hello"}')
       expect(await result.response?.text()).toBe('{"prompt":"hello"}')
+    })
+  })
+
+  describe('the harness itself', () => {
+    it('refuses a respondWith made after the fetch listener returned', async () => {
+      // The positive control for the constraint asserted in lem-app-sw.test.ts.
+      // Without this guard, a listener refactored to `async` and awaiting
+      // before `respondWith` would pass every test in this suite and throw
+      // `InvalidStateError` in every real browser (#75).
+      let thrown: unknown = null
+      const network = new FakeNetwork()
+
+      const result = await dispatchFetch(
+        (event) => {
+          setTimeout(() => {
+            try {
+              event.respondWith(new Response('late'))
+            } catch (error) {
+              thrown = error
+            }
+          }, 0)
+        },
+        network,
+        appUrl(DEVICE_A, 'webui')
+      )
+      await settle()
+
+      expect(result.passedThrough).toBe(true)
+      expect((thrown as Error | null)?.message).toMatch(/after the fetch listener returned/)
+    })
+  })
+
+  describe('the WebSocket shim', () => {
+    /** Parse what the frame actually received and list its scripts. */
+    async function scriptsDeliveredFor(url: string, options: DispatchOptions): Promise<Element[]> {
+      const result = await harness.dispatch(url, options)
+      const html = (await result.response?.text()) ?? ''
+      const parsed = new DOMParser().parseFromString(html, 'text/html')
+      return [...parsed.querySelectorAll('script')]
+    }
+
+    it('is the first script in a navigated document', async () => {
+      serveOpenWebUI(harness)
+
+      const scripts = await scriptsDeliveredFor(appUrl(DEVICE_A, 'webui'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+
+      // Asserted on the parse tree, not on the bytes: a shim spliced into a
+      // comment or after a stray `<` is a string match and not a script.
+      expect(scripts.length).toBeGreaterThan(0)
+      expect(scripts[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+      expect(scripts[0].textContent).toBe(WS_SHIM_SOURCE)
+    })
+
+    it('runs ahead of the app own boot script', async () => {
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'text/html; charset=utf-8']],
+        chunks: [
+          '<!doctype html><html><head><script>window.boot=1</',
+          'script></head><body></body></html>',
+        ],
+      }))
+
+      const scripts = await scriptsDeliveredFor(appUrl(DEVICE_A, 'webui'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+
+      expect(scripts).toHaveLength(2)
+      expect(scripts[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+      expect(scripts[1].textContent).toBe('window.boot=1')
+    })
+
+    it('is not spliced into a subresource that merely returns HTML', async () => {
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'text/html']],
+        chunks: ['<div>a fragment</div>'],
+      }))
+      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
+
+      const result = await harness.dispatch(`${ORIGIN}/partials/menu`, { clientId: 'frame-1' })
+
+      // A `fetch()` for an HTML fragment is not a document. Injecting here
+      // would corrupt whatever the app does with the string.
+      expect(await result.response?.text()).toBe('<div>a fragment</div>')
+    })
+
+    it('is not spliced into a navigation that is not HTML', async () => {
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'application/pdf']],
+        chunks: ['%PDF-1.7'],
+      }))
+
+      const result = await harness.dispatch(appUrl(DEVICE_A, 'webui', '/report.pdf'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+
+      expect(await result.response?.text()).toBe('%PDF-1.7')
+    })
+
+    it('tells the page when a document could not be spliced', async () => {
+      // A comment that never closes inside the sniff window, so the preamble
+      // cannot be delimited and no offset is known to be after the doctype.
+      // The only position-less case; HTTP still works for this document,
+      // WebSockets in it will not, and the page is told so.
+      const filler = 'y'.repeat(16 * 1024)
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'text/html']],
+        // Chunked under MAX_CHUNK_BYTES, the way a real body arrives.
+        chunks: ['<!-- ', ...Array<string>(6).fill(filler)],
+      }))
+
+      const result = await harness.dispatch(appUrl(DEVICE_A, 'webui'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+      const html = (await result.response?.text()) ?? ''
+      await settle()
+
+      expect(html.length).toBeGreaterThan(HTML_SNIFF_BYTES)
+      expect(html).not.toContain(SHIM_MARKER_ATTRIBUTE)
+      expect(harness.bridge.shimSkips).toBe(1)
+    })
+
+    it('splices a document of the same size that is decidable - the positive control', async () => {
+      const filler = 'y'.repeat(16 * 1024)
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'text/html']],
+        chunks: ['<!doctype html><html><head></head><body>', ...Array<string>(6).fill(filler)],
+      }))
+
+      const result = await harness.dispatch(appUrl(DEVICE_A, 'webui'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+      const html = (await result.response?.text()) ?? ''
+      await settle()
+
+      expect(html.length).toBeGreaterThan(HTML_SNIFF_BYTES)
+      expect(html).toContain(SHIM_MARKER_ATTRIBUTE)
+      expect(harness.bridge.shimSkips).toBe(0)
+    })
+
+    it('streams the rest of the document after the splice', async () => {
+      // The splice must not turn a streamed document into a buffered one: the
+      // whole point of Phase 3 was that a `<script>` starts executing early.
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [['Content-Type', 'text/html']],
+        chunks: ['<!doctype html><html><head></head><body>', 'first', 'second', '</body></html>'],
+      }))
+
+      const result = await harness.dispatch(appUrl(DEVICE_A, 'webui'), {
+        mode: 'navigate',
+        resultingClientId: 'frame-1',
+      })
+      const reader = result.response?.body?.getReader()
+      const seen: string[] = []
+      for (;;) {
+        const next = await reader?.read()
+        if (next === undefined || next.done) break
+        seen.push(new TextDecoder().decode(next.value))
+      }
+
+      // More than one chunk reached the frame, and the shim rode in the first.
+      expect(seen.length).toBeGreaterThan(1)
+      expect(seen[0]).toContain('<!doctype html><html><head>')
+      expect(seen.join('')).toContain('firstsecond')
+    })
+  })
+
+  // There is no cookie handling in the Service Worker to test, and that is the
+  // point of the single test below. #72 specified a `Set-Cookie` rewrite; it was
+  // built, and then found to be undeliverable. The rewrite is deleted rather
+  // than kept and annotated, so nothing here can be mistaken for working cookie
+  // support - but the *reason* is worth an assertion, because the suite would
+  // otherwise happily agree with a reimplementation of the same mistake.
+  describe('cookies, and why the worker does not handle them', () => {
+    it('cannot be delivered on a worker-synthesised Response - the rule undici does not enforce', () => {
+      // `Set-Cookie` and `Set-Cookie2` are *forbidden response-header names* in
+      // the Fetch Standard - a concept that is current, not removed. A browser's
+      // `new Response(body, { headers })` gives its Headers the "response"
+      // guard, and `validate` drops a forbidden name silently. Even if it
+      // survived, "parse and store response Set-Cookie headers" runs only inside
+      // HTTP-network-or-cache fetch, which a worker-supplied response never
+      // enters.
+      //
+      // Node's undici does not enforce that guard. This assertion pins the
+      // divergence so that a future rewrite cannot be "proved" correct by a
+      // suite that is simply more permissive than the platform.
+      const synthesised = new Response('x', { headers: [['Set-Cookie', 'a=1; Path=/']] })
+      expect(synthesised.headers.getSetCookie()).toEqual(['a=1; Path=/'])
+      // ^ In every browser this is `[]`. See docs/tunnel-proxy-spec.md 5.6.2.
+    })
+
+    it('are dropped by the worker rather than handed to the frame', async () => {
+      // The worker mirrors the browser instead of diverging from it: an upstream
+      // cookie reaches the worker (the server relays it, which the jar design
+      // needs) and goes no further.
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [
+          ['Content-Type', 'text/plain'],
+          ['Set-Cookie', 'session=s3cret; Path=/; HttpOnly'],
+        ],
+        chunks: ['ok'],
+      }))
+      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
+
+      const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
+
+      expect(result.response?.headers.getSetCookie()).toEqual([])
     })
   })
 })

@@ -63,6 +63,15 @@ export const BINDING_TTL_MS = 24 * 60 * 60 * 1000
 export const SUBSTITUTED_CSP = "frame-ancestors 'self'; base-uri 'self'"
 
 /**
+ * How far into an HTML document the worker will look for the shim's insertion
+ * point, and the hard bound on what the injecting transform may buffer.
+ */
+export const HTML_SNIFF_BYTES = 65536
+
+/** Attribute that marks the injected element, for tests and for humans. */
+export const SHIM_MARKER_ATTRIBUTE = 'data-lem-ws-shim'
+
+/**
  * Grammar for `/app/<deviceId>/<serviceId>[/rest]`.
  *
  * Both segments are bounded and restricted to characters that cannot introduce
@@ -111,6 +120,13 @@ const STRIPPED_RESPONSE_HEADERS = new Set([
   'strict-transport-security',
   'public-key-pins',
   'public-key-pins-report-only',
+  // Dropped because a browser drops it anyway: `Set-Cookie` is a forbidden
+  // response-header name, so it cannot survive the `Response` constructor here
+  // (section 5.6.2). Removing it explicitly keeps this worker's output honest -
+  // and keeps the test suite, whose `Response` does *not* enforce that rule,
+  // from showing a header no browser would ever deliver.
+  'set-cookie',
+  'set-cookie2',
 ])
 
 /**
@@ -127,6 +143,212 @@ const STRIPPED_RESPONSE_HEADERS = new Set([
 function isArrayBuffer(value) {
   return Object.prototype.toString.call(value) === '[object ArrayBuffer]'
 }
+
+/**
+ * The WebSocket shim, as source, spliced into every framed HTML document.
+ *
+ * It has to travel as a string: the worker injects it into *another realm's*
+ * document, and that realm's `window.WebSocket` is the only one the app can
+ * see. The dashboard's own realm was what `websocket-intercept.ts` patched,
+ * which is why it never worked.
+ *
+ * Three properties are load-bearing:
+ *
+ * - It **buffers** `send()` calls made before the socket opens. socket.io and
+ *   most hand-written clients call `send()` in the same turn as the
+ *   constructor; v2 threw there, which is the whole of defect #2 in issue #6.
+ * - It **never falls back to a native `WebSocket`**. A native socket from this
+ *   document would connect from the *remote* browser's own network - the user's
+ *   coffee shop, not their home - which is defect #1 wearing a different hat.
+ *   No bridge means close code 4002 (section 7.2).
+ * - It hands binary data to the bridge unchanged and re-wraps inbound binary in
+ *   *this* realm's `Blob`, because `instanceof` across an iframe boundary is
+ *   false for a perfectly good object.
+ *
+ * Contains no backtick and no `</script`; a test asserts both, because either
+ * would break the splice or the template that carries it.
+ */
+export const WS_SHIM_SOURCE = `(function () {
+  'use strict';
+  if (window.__lemWsShimInstalled) return;
+  window.__lemWsShimInstalled = true;
+
+  var NativeWebSocket = window.WebSocket;
+  var attached = null;
+
+  // Belt and braces (spec 3.7 step 4): the parent pushes the bridge here on
+  // load, which covers a dashboard that is itself framed. Never the primary
+  // route - by load the app has already opened its first socket.
+  window.__lemAttachWsBridge = function (bridge) {
+    if (bridge && typeof bridge.connect === 'function') attached = bridge;
+  };
+
+  function findBridge() {
+    if (attached !== null) return attached;
+    try {
+      var host = window.parent;
+      if (host && host !== window) {
+        var bridge = host.__lemWsBridge;
+        if (bridge && typeof bridge.connect === 'function') return bridge;
+      }
+    } catch (error) {
+      // A cross-origin parent throws on property access. Only the attach hook
+      // can reach us then, and it has not fired yet.
+    }
+    return null;
+  }
+
+  function resolveUrl(raw) {
+    var url = new URL(String(raw), document.baseURI);
+    if (url.protocol === 'http:') url.protocol = 'ws:';
+    else if (url.protocol === 'https:') url.protocol = 'wss:';
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+      throw new SyntaxError('The URL scheme must be ws or wss');
+    }
+    return url.href;
+  }
+
+  function sizeOf(data) {
+    if (typeof data === 'string') return data.length;
+    if (data && typeof data.byteLength === 'number') return data.byteLength;
+    if (data && typeof data.size === 'number') return data.size;
+    return 0;
+  }
+
+  function originOf(href) {
+    try {
+      var url = new URL(href);
+      return url.protocol + '//' + url.host;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  class LemWebSocket extends EventTarget {
+    constructor(url, protocols) {
+      super();
+      this.CONNECTING = 0;
+      this.OPEN = 1;
+      this.CLOSING = 2;
+      this.CLOSED = 3;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+      this.binaryType = 'blob';
+      this.extensions = '';
+      this.protocol = '';
+      this.readyState = 0;
+      this.bufferedAmount = 0;
+      this.url = resolveUrl(url);
+
+      this._pending = [];
+      this._handle = null;
+
+      var self = this;
+      var bridge = findBridge();
+      if (bridge === null) {
+        setTimeout(function () {
+          self._shutdown(4002, 'Lem app bridge unavailable', false, true);
+        }, 0);
+        return;
+      }
+
+      this._handle = bridge.connect(this.url, protocols, {
+        open: function (negotiated) {
+          self._opened(negotiated);
+        },
+        message: function (data) {
+          self._received(data);
+        },
+        error: function () {
+          self._fire('error', new Event('error'));
+        },
+        close: function (code, reason, wasClean) {
+          self._shutdown(code, reason, wasClean, false);
+        },
+      });
+    }
+
+    send(data) {
+      if (this.readyState === 0) {
+        this._pending.push(data);
+        this.bufferedAmount += sizeOf(data);
+        return;
+      }
+      if (this.readyState !== 1) {
+        throw new DOMException(
+          'WebSocket is already in CLOSING or CLOSED state',
+          'InvalidStateError'
+        );
+      }
+      if (this._handle !== null) this._handle.send(data);
+    }
+
+    close(code, reason) {
+      if (this.readyState === 2 || this.readyState === 3) return;
+      this.readyState = 2;
+      if (this._handle !== null) {
+        this._handle.close(code, reason);
+        return;
+      }
+      this._shutdown(code || 1000, reason || '', true, false);
+    }
+
+    _opened(negotiated) {
+      if (this.readyState !== 0) return;
+      this.protocol = negotiated || '';
+      this.readyState = 1;
+      this._fire('open', new Event('open'));
+      var pending = this._pending;
+      this._pending = [];
+      this.bufferedAmount = 0;
+      for (var index = 0; index < pending.length; index += 1) {
+        if (this._handle !== null) this._handle.send(pending[index]);
+      }
+    }
+
+    _received(data) {
+      var payload = data;
+      if (typeof data !== 'string' && this.binaryType !== 'arraybuffer') {
+        payload = new Blob([data]);
+      }
+      this._fire(
+        'message',
+        new MessageEvent('message', { data: payload, origin: originOf(this.url) })
+      );
+    }
+
+    _shutdown(code, reason, wasClean, alsoError) {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this._pending = [];
+      this.bufferedAmount = 0;
+      if (alsoError) this._fire('error', new Event('error'));
+      this._fire(
+        'close',
+        new CloseEvent('close', {
+          code: code || 1006,
+          reason: reason || '',
+          wasClean: Boolean(wasClean),
+        })
+      );
+    }
+
+    _fire(type, event) {
+      var handler = this['on' + type];
+      if (typeof handler === 'function') handler.call(this, event);
+      this.dispatchEvent(event);
+    }
+  }
+
+  LemWebSocket.CONNECTING = NativeWebSocket ? NativeWebSocket.CONNECTING : 0;
+  LemWebSocket.OPEN = NativeWebSocket ? NativeWebSocket.OPEN : 1;
+  LemWebSocket.CLOSING = NativeWebSocket ? NativeWebSocket.CLOSING : 2;
+  LemWebSocket.CLOSED = NativeWebSocket ? NativeWebSocket.CLOSED : 3;
+
+  window.WebSocket = LemWebSocket;
+})();`
 
 /** Statuses that must not carry a body (RFC 9110). */
 const BODYLESS_STATUSES = new Set([101, 103, 204, 205, 304])
@@ -295,6 +517,346 @@ export function rewriteLocation(location, deviceId, serviceId, upstreamPath) {
   return location
 }
 
+// -- shim injection ----------------------------------------------------------
+
+const SPACE_BYTES = new Set([0x09, 0x0a, 0x0c, 0x0d, 0x20])
+
+/**
+ * @param {Uint8Array} bytes
+ * @param {number} index
+ * @returns {number} the byte at `index`, ASCII-lowercased
+ */
+function lowerAt(bytes, index) {
+  const byte = bytes[index]
+  return byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte
+}
+
+/**
+ * Case-insensitive ASCII compare at an offset.
+ *
+ * Deliberately byte-wise rather than `TextDecoder`-per-chunk: decoding each
+ * chunk independently turns a multi-byte UTF-8 sequence split across a chunk
+ * boundary into replacement characters *inside the document*.
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} index
+ * @param {string} ascii Lowercase ASCII needle
+ * @returns {boolean}
+ */
+function matchesAt(bytes, index, ascii) {
+  if (index < 0 || index + ascii.length > bytes.length) return false
+  for (let offset = 0; offset < ascii.length; offset += 1) {
+    if (lowerAt(bytes, index + offset) !== ascii.charCodeAt(offset)) return false
+  }
+  return true
+}
+
+/**
+ * @param {Uint8Array} bytes
+ * @param {string} ascii
+ * @param {number} from
+ * @returns {number} index of the first match, or -1
+ */
+function indexOfAscii(bytes, ascii, from) {
+  for (let index = from; index + ascii.length <= bytes.length; index += 1) {
+    if (matchesAt(bytes, index, ascii)) return index
+  }
+  return -1
+}
+
+/**
+ * Is `<name` starting at `index` a real start tag, rather than `<header`?
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} index Index of the `<`
+ * @param {string} name Lowercase tag name
+ * @returns {boolean}
+ */
+function isStartTag(bytes, index, name) {
+  if (!matchesAt(bytes, index + 1, name)) return false
+  const after = bytes[index + 1 + name.length]
+  return after === 0x3e || after === 0x2f || SPACE_BYTES.has(after)
+}
+
+/**
+ * Does a `<` at `index` open a markup construct at all?
+ *
+ * The HTML tokenizer's tag-open state: a `<` followed by an ASCII letter, `/`,
+ * `!` or `?` starts something; anything else (`a < b` in prose) is just text.
+ * Distinguishing them matters because the scanner skips *over* a construct once
+ * it recognises one, and skipping over ordinary text would step past markup.
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} index Index of the `<`
+ * @returns {boolean}
+ */
+function isMarkupOpen(bytes, index) {
+  const next = lowerAt(bytes, index + 1)
+  if (next === undefined) return false
+  if (next >= 0x61 && next <= 0x7a) return true
+  return next === 0x2f || next === 0x21 || next === 0x3f
+}
+
+/**
+ * End of a start tag, respecting quoted attribute values.
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} start Index of the `<`
+ * @returns {number} index just past the `>`, or -1 if it has not arrived
+ */
+function endOfStartTag(bytes, start) {
+  let quote = 0
+  for (let index = start; index < bytes.length; index += 1) {
+    const byte = bytes[index]
+    if (quote !== 0) {
+      if (byte === quote) quote = 0
+      continue
+    }
+    if (byte === 0x22 || byte === 0x27) {
+      quote = byte
+      continue
+    }
+    if (byte === 0x3e) return index + 1
+  }
+  return -1
+}
+
+/**
+ * Skip the BOM, an XML declaration, comments, the doctype and whitespace.
+ *
+ * Getting this wrong is not cosmetic: splicing a `<script>` *before* a doctype
+ * pushes the document into quirks mode, which changes how the whole app lays
+ * out. So a truncated preamble waits for more bytes rather than guessing.
+ *
+ * @param {Uint8Array} bytes
+ * @param {boolean} exhausted No more bytes are coming (or the window is full)
+ * @returns {number} offset just past the preamble, or -1 if undecidable
+ */
+function endOfPreamble(bytes, exhausted) {
+  let index = 0
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) index = 3
+
+  for (;;) {
+    while (index < bytes.length && SPACE_BYTES.has(bytes[index])) index += 1
+
+    // `<!doctype` is the longest thing that has to be recognised whole; without
+    // this the tail of a chunk that happens to end at `<` decides "no preamble"
+    // and the doctype lands after the shim.
+    if (!exhausted && index + 9 > bytes.length) return -1
+
+    if (matchesAt(bytes, index, '<?')) {
+      const end = indexOfAscii(bytes, '?>', index + 2)
+      if (end === -1) return -1
+      index = end + 2
+      continue
+    }
+    if (matchesAt(bytes, index, '<!--')) {
+      const end = indexOfAscii(bytes, '-->', index + 4)
+      if (end === -1) return -1
+      index = end + 3
+      continue
+    }
+    if (matchesAt(bytes, index, '<!')) {
+      const end = endOfStartTag(bytes, index)
+      if (end === -1) return -1
+      index = end
+      continue
+    }
+    return index
+  }
+}
+
+/**
+ * Where the shim goes in this document.
+ *
+ * `<head>`'s first child when there is a `<head>`; immediately after the
+ * preamble otherwise, which is still ahead of the first `<script>` or `<body>`
+ * (the parser fosters a pre-`<html>` script into the head it synthesises).
+ *
+ * **Two invariants, and the second was learned the hard way.**
+ *
+ * 1. *Never scan into a tag's attribute region.* An earlier tag whose attribute
+ *    value contains the bytes `<head…>` - a `data-*` holding example markup, a
+ *    JSON blob, user content - is not a `<head>`. A scanner that advances one
+ *    byte at a time past `<html …>` never leaves that tag, reads the fake match
+ *    as real, and splices the shim **inside the quotes**. The document is then
+ *    corrupt, the shim is not a script, and `window.WebSocket` stays the native
+ *    one - which is issue #6's defect #1 reappearing silently. So a recognised
+ *    markup construct is skipped whole, quote-aware, never walked into.
+ *
+ * 2. *A decidable preamble means a safe answer always exists.* Inserting at the
+ *    end of the preamble is ordering-correct unconditionally: it is after the
+ *    doctype (so the document stays out of quirks mode) and before every tag.
+ *    So anything undecidable *after* the preamble - an unterminated tag or
+ *    comment at the end of the sniff window - falls back to that rather than
+ *    guessing a position. `skip` is reserved for the one case where no position
+ *    is safe: a preamble that cannot be delimited, where the shim might land in
+ *    front of the doctype.
+ *
+ * @param {Uint8Array} bytes Everything buffered so far
+ * @param {boolean} exhausted No more bytes are coming, or the sniff window is full
+ * @returns {{ kind: 'insert', at: number } | { kind: 'wait' } | { kind: 'skip' }}
+ */
+export function findShimInsertionPoint(bytes, exhausted) {
+  const preamble = endOfPreamble(bytes, exhausted)
+  // The only unsafe case: we cannot tell where the doctype ends, so we cannot
+  // tell whether any offset is in front of it.
+  if (preamble === -1) return exhausted ? { kind: 'skip' } : { kind: 'wait' }
+
+  /** Safe fallback for anything we run out of bytes to decide (invariant 2). */
+  const undecided = exhausted
+    ? /** @type {{ kind: 'insert', at: number }} */ ({ kind: 'insert', at: preamble })
+    : /** @type {{ kind: 'wait' }} */ ({ kind: 'wait' })
+
+  let index = preamble
+  while (index < bytes.length) {
+    if (bytes[index] !== 0x3c) {
+      index += 1
+      continue
+    }
+
+    if (matchesAt(bytes, index, '<!--')) {
+      const end = indexOfAscii(bytes, '-->', index + 4)
+      if (end === -1) return undecided
+      index = end + 3
+      continue
+    }
+
+    // `<scr` at the end of a chunk must not be read as "not a script", and
+    // `<!-` must not be read as "not a comment". `<script` plus one boundary
+    // byte is the longest lookahead any decision below needs.
+    if (!exhausted && bytes.length - index < 8) return { kind: 'wait' }
+
+    if (isStartTag(bytes, index, 'head')) {
+      const end = endOfStartTag(bytes, index)
+      if (end === -1) return undecided
+      return { kind: 'insert', at: end }
+    }
+    if (isStartTag(bytes, index, 'script') || isStartTag(bytes, index, 'body')) {
+      return { kind: 'insert', at: preamble }
+    }
+
+    if (!isMarkupOpen(bytes, index)) {
+      // A bare `<` in prose. Stepping over the whole "tag" here would run to
+      // some later `>` and could step past the real `<head>`.
+      index += 1
+      continue
+    }
+
+    // Invariant 1: skip the construct whole, attribute values included.
+    const end = endOfStartTag(bytes, index)
+    if (end === -1) return undecided
+    index = end
+  }
+
+  if (!exhausted) return { kind: 'wait' }
+  return { kind: 'insert', at: preamble }
+}
+
+/**
+ * @param {Uint8Array} left
+ * @param {Uint8Array<ArrayBufferLike>} right
+ * @returns {Uint8Array<ArrayBuffer>}
+ */
+function concatBytes(left, right) {
+  // Always a fresh buffer: `right` may be a view onto a pooled or shared one
+  // the producer still owns, and this survives across chunks.
+  const out = new Uint8Array(left.byteLength + right.byteLength)
+  out.set(left, 0)
+  out.set(right, left.byteLength)
+  return out
+}
+
+/**
+ * A `TransformStream` that splices the shim into an HTML byte stream.
+ *
+ * It emits **nothing** downstream until the insertion point is settled: a shim
+ * spliced after bytes the browser has already begun parsing is not a shim, it
+ * is a race. `HTML_SNIFF_BYTES` bounds both the search and the memory this may
+ * hold before it gives up and forwards the document untouched.
+ *
+ * @param {() => void} [onSkipped] Called when no insertion point was found
+ * @returns {TransformStream<Uint8Array, Uint8Array>}
+ */
+export function createShimInjector(onSkipped) {
+  const injection = new TextEncoder().encode(
+    `<script ${SHIM_MARKER_ATTRIBUTE}="1">${WS_SHIM_SOURCE}</` + `script>`
+  )
+  let held = new Uint8Array(0)
+  let settled = false
+
+  /**
+   * @param {TransformStreamDefaultController<Uint8Array>} controller
+   * @param {boolean} exhausted
+   */
+  const decide = (controller, exhausted) => {
+    const result = findShimInsertionPoint(held, exhausted)
+    if (result.kind === 'wait') return
+    settled = true
+    if (result.kind === 'skip') {
+      if (onSkipped) onSkipped()
+      controller.enqueue(held)
+    } else {
+      controller.enqueue(held.subarray(0, result.at))
+      controller.enqueue(injection)
+      controller.enqueue(held.subarray(result.at))
+    }
+    held = new Uint8Array(0)
+  }
+
+  return new TransformStream({
+    transform: (chunk, controller) => {
+      if (settled) {
+        controller.enqueue(chunk)
+        return
+      }
+      held = concatBytes(held, chunk)
+      decide(controller, held.byteLength >= HTML_SNIFF_BYTES)
+    },
+    flush: (controller) => {
+      if (settled) return
+      decide(controller, true)
+    },
+  })
+}
+
+/**
+ * Should this response have the shim spliced into it?
+ *
+ * Navigations only, and only real HTML. A subresource fetch that happens to
+ * return HTML is not a document, and injecting into it would corrupt it.
+ *
+ * @param {boolean} isNavigation
+ * @param {Headers} headers
+ * @returns {boolean}
+ */
+export function shouldInjectShim(isNavigation, headers) {
+  if (!isNavigation) return false
+  const type = (headers.get('content-type') ?? '').trim().toLowerCase()
+  return type === 'text/html' || type.startsWith('text/html;') || type.startsWith('text/html ')
+}
+
+// -- cookies -----------------------------------------------------------------
+//
+// There is deliberately no cookie handling here.
+//
+// #72 decided that the Service Worker would re-scope each upstream `Set-Cookie`
+// to `/app/<deviceId>/<serviceId>/` on the way out. That was implemented, and
+// then found not to work: `Set-Cookie` is a *forbidden response-header name*,
+// so the `Response` this worker synthesises cannot carry it, and the algorithm
+// that would parse it is never reached by a worker-supplied response. The
+// request direction is blocked symmetrically - `Cookie` is appended after the
+// worker has already run. Spec section 5.6.2 has the mechanisms and the
+// citations.
+//
+// The rewrite was deleted rather than left in place and annotated. Code that
+// looks like working cookie handling, with green tests behind it, is worse than
+// no code at all: the tests passed only because Node's undici does not enforce
+// the response guard a browser does.
+//
+// The design that does work - the worker keeping its own jar, keyed by
+// (deviceId, serviceId) - is recorded in section 5.6.2 and belongs to #72.
+
 /**
  * Build the `Headers` for a proxied response.
  *
@@ -308,8 +870,7 @@ export function buildResponseHeaders(pairs, context) {
     const lower = name.toLowerCase()
     if (STRIPPED_RESPONSE_HEADERS.has(lower)) continue
     if (lower === 'location') {
-      // append, never set: duplicates are why the wire carries pairs at all,
-      // and Set-Cookie in particular must survive or login breaks.
+      // append, never set: duplicates are why the wire carries pairs at all.
       headers.append(
         name,
         rewriteLocation(value, context.deviceId, context.serviceId, context.upstreamPath)
@@ -808,6 +1369,9 @@ export class LemAppServiceWorker {
       body = await request.arrayBuffer()
     }
 
+    // Note for whoever builds the cookie jar of section 5.6.2: there is no
+    // `Cookie` header in here to forward. The browser appends it *after* this
+    // worker has run, so the jar has to supply one itself at this point.
     const headers = /** @type {[string, string][]} */ ([...request.headers.entries()])
     const reqId = this.nextRequestId
     this.nextRequestId = this.nextRequestId >= 0xffffffff ? 1 : this.nextRequestId + 1
@@ -821,6 +1385,9 @@ export class LemAppServiceWorker {
       headers,
       body,
       signal: request.signal,
+      // Navigations only: this is the document the app boots from, and the shim
+      // has to run before the app's own first script.
+      isNavigation: request.mode === 'navigate',
     })
   }
 
@@ -842,6 +1409,7 @@ export class LemAppServiceWorker {
    * @param {[string, string][]} exchange.headers
    * @param {ArrayBuffer | null} exchange.body
    * @param {AbortSignal} [exchange.signal]
+   * @param {boolean} [exchange.isNavigation]
    * @returns {Promise<Response>}
    */
   exchange(bridge, exchange) {
@@ -891,6 +1459,10 @@ export class LemAppServiceWorker {
             headSettled = true
             const status = typeof message.status === 'number' ? message.status : 502
             const pairs = /** @type {[string, string][]} */ (message.headers ?? [])
+            // `pairs` still carries every upstream `Set-Cookie`, because the
+            // server relays them (#72). This is where the jar of section 5.6.2
+            // would read them; `buildResponseHeaders` drops them, since a
+            // browser would not deliver them to the frame regardless.
             const responseHeaders = buildResponseHeaders(pairs, {
               deviceId: exchange.deviceId,
               serviceId: exchange.serviceId,
@@ -911,7 +1483,20 @@ export class LemAppServiceWorker {
                 finish()
               },
             })
-            resolve(new Response(stream, { status, headers: responseHeaders }))
+            const body = shouldInjectShim(exchange.isNavigation === true, responseHeaders)
+              ? stream.pipeThrough(
+                  createShimInjector(() => {
+                    // HTTP still works in this document; WebSockets in it do
+                    // not. Saying so beats a frame that half-works in silence.
+                    bridge.postMessage({
+                      type: 'LEM_SHIM_SKIPPED',
+                      reqId: exchange.reqId,
+                      path: exchange.upstreamPath,
+                    })
+                  })
+                )
+              : stream
+            resolve(new Response(body, { status, headers: responseHeaders }))
             return
           }
           case 'LEM_RESPONSE_CHUNK': {
@@ -1004,16 +1589,19 @@ function parseSessionKey(key) {
  * Attach the worker to a real `ServiceWorkerGlobalScope`.
  *
  * Exported so a test can drive the wiring with a fake scope; called below for
- * the real one.
+ * the real one. The `bindingStore` override exists for the same reason: a test
+ * has to be able to survive a worker restart over one store, and `indexedDB`
+ * is not something a fake scope can supply.
  *
  * @param {LemSwScope} scope
+ * @param {{ bindingStore?: BindingStore }} [overrides]
  * @returns {LemAppServiceWorker}
  */
-export function installServiceWorker(scope) {
+export function installServiceWorker(scope, overrides = {}) {
   const worker = new LemAppServiceWorker({
     origin: scope.location.origin,
     clients: scope.clients,
-    bindingStore: createIndexedDbBindingStore(scope.indexedDB),
+    bindingStore: overrides.bindingStore ?? createIndexedDbBindingStore(scope.indexedDB),
   })
 
   // No skipWaiting()/clients.claim(): a newly deployed worker takes over on the

@@ -396,8 +396,8 @@ have the right thing on it.
 | 3 | Open the service catalog | Services listed with real statuses | **Passes** |
 | 4 | Start a stopped service from B | It starts on A | **Passes** |
 | 5 | **Click Launch on Open WebUI** | Open WebUI's UI renders inside the dashboard | **FAILS** — `ClientViewer.tsx:281-286` renders `<iframe src="http://127.0.0.1:33801">`, so B loads **its own** loopback. Connection refused, or an unrelated local service. [#6](https://github.com/lem-app/lem/issues/6) |
-| 6 | Open WebUI's WebSocket connects | socket.io session established | **FAILS** — never reaches OPEN: `ws-proxy.ts:99` sends WS_CONNECT, nothing calls `handleConnectionOpened` (`ws-proxy.ts:444`), no ack frame type exists, and the server says so at `ws_proxy.py:146`. `send()` throws at `ws-proxy.ts:162`. [#6](https://github.com/lem-app/lem/issues/6) |
-| 7 | Send a chat message | Reply streams token by token | **FAILS** — blocked by 5 and 6; also impossible on the wire, since a response is one un-chunked frame (`http_frame.py:200-224`, `webrtc_client.py:905`) |
+| 6 | Open WebUI's WebSocket connects | socket.io session established | **Blocked** — the ack, the `ProxiedWebSocket` state machine and the injected shim all landed in Phase 5 and are covered in-suite, but socket.io runs *after* login, and login cannot work until cookie transport is redesigned ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2). Run §4.1 B/C to verify the shim half independently. [#6](https://github.com/lem-app/lem/issues/6) |
+| 7 | Send a chat message | Reply streams token by token | **Blocked by 6** — the wire can carry it (Phases 2–3 made responses chunked and incremental) and the shim is in place, but an unauthenticated session never reaches a chat. §4.1 D is the procedure once it does |
 | 8 | Load a binary asset (font, PNG, wasm) | Byte-identical | **FAILS** — bodies are UTF-8 `str` (`http_proxy.py:154`, `http_frame.py:80`, `:211`, `:189`) |
 | 9 | Block UDP on B's network and reconnect | Falls back to the relay within ~10 s | **FAILS** — auto-fallback cannot trigger: `webrtc_client.py:722` resets the attempt counter every cycle, and `relay_url` defaults to `ws://localhost:8001` (`webrtc_client.py:69`), never overridden (`manager.py:81`). [#12](https://github.com/lem-app/lem/issues/12) |
 | 10 | Force a 500 from the proxy | Error appears immediately | **FAILS** — the error frame is addressed to request id `0x01000000` because `http_proxy.py:115` reads `data[:4]` instead of `data[1:5]`, so the browser hangs the full 30 s (`proxy-fetch.ts:179-182`) |
@@ -419,6 +419,146 @@ Steps 5–8 and 10 are fixed by [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md)
 Each phase of the tunnel spec has its own testable criteria — see
 [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §9. Do not treat this end-to-end scenario as
 the only gate; it is the last one.
+
+### 4.1 Phase 5 — the two criteria no test in this repository can settle
+
+Phase 5's acceptance list contains two items that name a real product, a real browser and a real
+model:
+
+- "Open WebUI's socket.io session establishes and a chat message round-trips"
+- "A model response streams token by token into the UI — visually incremental, and asserted by
+  timestamping the first and last DOM mutation"
+
+There is **no browser automation in this repository and no Open WebUI in CI**, so no test here
+settles either one. They stay unticked until a human runs the procedure below. A third item —
+"`new WebSocket(...)` inside the iframe reaches `readyState === 1`" — is verified in-suite
+against a real second realm and the shipped shim, but only a real browser exercises the Service
+Worker's own delivery of that shim, so step C below re-checks it end to end.
+
+Two behaviours in particular are **only** exercisable here, because jsdom cannot reproduce them
+and the suite says so in the tests that touch them:
+
+- a same-origin `window.parent` that really does expose `__lemWsBridge` (jsdom's `WindowProxy`
+  does not forward properties, so the test re-points `parent`);
+- a browser honouring `Set-Cookie` on a `Response` a Service Worker synthesised. Modern Chrome,
+  Firefox and Safari do — the Fetch Standard dropped "forbidden response-header name" — but that
+  is a claim about browsers, not something this suite proves.
+
+Run the §4 setup first: machine A at home with Open WebUI and Ollama running and a small model
+pulled, machine B on a different network. Everything below happens on **B**.
+
+**A. Login — expected to FAIL, and this step is how you confirm why.**
+
+> **Do not run this step expecting a pass.** A Service Worker cannot deliver `Set-Cookie` to the
+> browser: it is a forbidden response-header name, and a worker-synthesised `Response` never
+> reaches the algorithm that would parse it. See `tunnel-proxy-spec.md` §5.6.2. The steps below
+> are written to *localise* the failure, so that when the cookie transport is redesigned there is
+> a procedure that already distinguishes "the rewrite is wrong" from "the browser dropped it".
+
+1. Launch Open WebUI from the remote dashboard and sign in with your Open WebUI account.
+2. **Expected today:** the sign-in does **not** stick — the app returns to the login form. If it
+   *does* stick, the cookie reached the jar by some route §5.6.2 says is impossible; that is worth
+   investigating and reporting, not celebrating.
+3. Open DevTools → Application → Cookies → the dashboard's origin.
+   **Expected today: the cookie is absent** — dropped by the browser, not by this proxy. To see
+   that the proxy did its part, open the Network panel entry for the login response: the
+   `Set-Cookie` the worker produced is visible there even though nothing stored it.
+   **Expected once the cookie transport works:** the session cookie is listed with
+   **`Path` = `/app/<deviceId>/webui/`**
+   (the ids from the iframe's URL), and with **no `Domain`** value of its own. `HttpOnly` and
+   `SameSite` read exactly as Open WebUI set them.
+4. In DevTools → Network, reload the frame and pick any request the app made.
+   **Expected:** it carries the cookie. Now open a *second* service (Ollama, say) and pick one of
+   its requests. **Expected:** it carries **no** Open WebUI cookie.
+5. Reload the dashboard itself and look at any dashboard-originated request (`/v1/services`).
+   **Expected:** no framed app's cookie on it.
+6. **The decisive check, and the one no test here can make: did the cookie reach the upstream?**
+   On **A**, watch the service's own access log (`docker logs -f <container>` for the Harbor
+   container) while doing something authenticated on **B**.
+   **Expected:** the request arrives carrying `Cookie: <the app's session cookie>`.
+
+   This step exists because the browser attaches `Cookie` *after* the Service Worker sees the
+   request, so what the worker forwards is whatever `event.request.headers` happens to contain.
+   Whether that includes `Cookie` is a browser behaviour this repository cannot observe — jsdom
+   has no cookie jar wired to `Request` — and the suite therefore *supplies* the header rather
+   than proving the browser did. If this step fails while step 3 shows the cookie correctly
+   stored, the defect is on the request path, not in the `Set-Cookie` rewrite, and the fix
+   belongs with whatever mechanism the worker uses to read cookies.
+7. **When the §5.6.2 jar lands, re-run steps 3–6 and add:** a `__Host-`-prefixed cookie (Open
+   WebUI does not set one; many hardened apps do) must reach the upstream under its **original**
+   name, and must not appear in DevTools → Application → Cookies at all — under a jar the browser
+   never stores these, which is the point. Note that a `__HOST-`-cased name has to work too: user
+   agents match the prefix case-insensitively, and this repository's only cookie-store oracle
+   (tough-cookie) does not, so that case can only be checked here. See spec §5.6.2.
+
+**B. The shim is in the document, and it is first.**
+
+1. With the service framed, DevTools → Elements, expand the iframe's document.
+2. **Expected:** the very first `<script>` in the document carries `data-lem-ws-shim="1"`, and it
+   sits inside `<head>` ahead of every one of Open WebUI's own scripts.
+3. In the console, switch the context selector to the iframe and evaluate `WebSocket.name`.
+   **Expected:** `"LemWebSocket"`. Evaluate it again in the top frame.
+   **Expected:** `"WebSocket"` — the dashboard's own realm is untouched.
+
+**C. socket.io establishes and a chat message round-trips.**
+
+1. Still in the iframe's console, evaluate `window.__lemWsShimInstalled`. **Expected:** `true`.
+2. DevTools → Network → WS. **Expected: the list is empty.** A real WebSocket here would be the
+   browser connecting from *B's* network, which is the defect this design removes; the traffic
+   must be riding the DataChannel instead.
+3. Send a chat message.
+   **Expected:** it is accepted and a reply begins. On A, the local server log shows
+   `WebSocket CONNECT <id>` followed by `WebSocket <id> connected successfully`.
+4. If nothing happens, the diagnostic is in the dashboard's own console: a `close` with code
+   **4002** means the shim could not reach `window.__lemWsBridge`; **4003** means the ack never
+   arrived within 10 s; a `[sw-bridge] WebSocket shim not injected into …` warning means the
+   splice was skipped for that document.
+
+**D. The reply streams token by token.**
+
+1. Ask for something long enough to take several seconds: "write 300 words about the sea".
+2. **Expected, by eye:** text appears progressively, a few tokens at a time. A single late paint
+   of the whole reply is a failure even if the content is correct.
+3. To measure it rather than trust it, paste this into the **iframe's** console before sending,
+   then send:
+
+   ```js
+   const target = document.querySelector('main') ?? document.body
+   const stamps = []
+   new MutationObserver(() => stamps.push(performance.now())).observe(target, {
+     subtree: true,
+     childList: true,
+     characterData: true,
+   })
+   window.__lemStamps = stamps
+   ```
+
+   After the reply completes, evaluate:
+
+   ```js
+   const s = window.__lemStamps
+   ;({ mutations: s.length, spanMs: s.at(-1) - s[0] })
+   ```
+
+   **Pass:** `mutations >= 20` **and** `spanMs >= 1000`. **Fail:** anything else — including the
+   middle ground (say 8 mutations over 300 ms), which is a coarsely-buffered stream, not a
+   token-by-token one, and is a regression against G4 even though it is not a single paint.
+   There is deliberately no "inconclusive" band: if the reply took several seconds to generate,
+   a working stream produces mutations across those seconds, and anything that does not is a
+   failure to investigate rather than a judgement call. If the reply genuinely finished in under
+   a second, the prompt was too short — ask for more and re-run rather than scoring it.
+
+**E. A refused upstream fails fast, not after ten seconds.**
+
+1. On A, stop Open WebUI while its frame is still open on B.
+2. In the iframe's console: `const t = performance.now(); const w = new WebSocket('/ws/socket.io/?EIO=4&transport=websocket'); w.onclose = e => console.log(e.code, performance.now() - t)`.
+3. **Expected:** a close logged in **well under 1000 ms**, with a code from §7.2 (`1011` for a
+   refused upstream). A close at ~10000 ms with code `4003` means the `WS_CONNECT_ERROR` path is
+   not working and the connect timeout is doing the job instead.
+
+**F. A large message survives fragmentation.** Send a chat message with a pasted block of at
+least 100 KB. **Expected:** Open WebUI receives it whole — the reply refers to the content, and
+A's log shows no `message exceeded MAX_WS_MESSAGE_BYTES`.
 
 ---
 
