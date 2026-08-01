@@ -38,9 +38,11 @@ import sys
 import uvicorn
 
 from app.security import (
+    REQUIRE_TOKEN_ENV_VAR,
     TOKEN_PATH,
     get_bind_host,
     get_bind_port,
+    token_required,
     verify_bind_posture,
 )
 
@@ -76,7 +78,15 @@ def bind_and_verify(config: uvicorn.Config) -> socket.socket:
     sock = config.bind_socket()
     posture = verify_bind_posture([sock])
 
-    if posture.verified and posture.loopback_only:
+    if posture.verified and posture.loopback_only and token_required():
+        # $LEM_REQUIRE_TOKEN is on. The socket really is loopback-only, but the
+        # operator has told us something sits in front of it.
+        logger.info(
+            f"✓ Lem local API {posture.describe()}; ${REQUIRE_TOKEN_ENV_VAR} is set, so every "
+            f"/v1/* request requires 'Authorization: Bearer <token>' using the token in "
+            f"{TOKEN_PATH}."
+        )
+    elif posture.verified and posture.loopback_only:
         logger.info(f"✓ Lem local API {posture.describe()}; bearer token accepted but not required")
     elif posture.verified:
         logger.warning(

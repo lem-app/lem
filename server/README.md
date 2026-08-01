@@ -50,6 +50,8 @@ The startup line reports what was **verified**, never what was assumed:
   allowlisted (`app.security.ALLOWED_ORIGINS`, plus `LEM_ALLOWED_ORIGINS`).
 - **`LEM_ALLOWED_ORIGINS`**: comma-separated extra browser origins, needed when
   a dashboard is served from anything other than localhost. `*` is refused.
+- **`LEM_REQUIRE_TOKEN`**: force the bearer requirement on even for a verified
+  loopback bind - see "Proxies in front of the bind" below.
 
 ```bash
 curl -X POST http://127.0.0.1:5142/v1/services/ollama/start \
@@ -57,51 +59,63 @@ curl -X POST http://127.0.0.1:5142/v1/services/ollama/start \
      -H "Authorization: Bearer $(cat ~/.lem/api_token)"
 ```
 
-### Using the dashboard over the LAN
+### Browser session tokens
 
-**Not supported today.** The dashboard works against a loopback-bound server;
-against any other bind it will get 401 on every request, because it has no way
-to obtain the bearer token.
+A browser cannot read `~/.lem/api_token`, and it must not be built with a copy
+of it: Vite inlines `import.meta.env.VITE_*` as plaintext string literals into
+`dist/assets/*.js`, so a build-time token is readable by anyone who can load the
+dashboard page - the same LAN population the token exists to keep out. An
+extracted token grants full Docker control from anywhere that can reach port
+5142 and bypasses the `Origin`/`X-Lem-Client` layer entirely, since a raw bearer
+holder has nothing to spoof.
 
-A browser cannot read `~/.lem/api_token`, and the obvious shortcut - baking the
-token into the dashboard build with a `VITE_*` variable - is not a fix. Vite
-inlines those as plaintext string literals into `dist/assets/*.js`, so the
-token would be readable by anyone who can load the dashboard page. That is the
-same LAN population the token exists to keep out, and a token extracted from
-the bundle grants full Docker control from anywhere that can reach port 5142,
-bypassing the `Origin`/`X-Lem-Client` layer entirely (a raw bearer holder has
-nothing to spoof). "Read a 0600 file on a machine you already have an account
-on" and "load a webpage" are very different bars.
+So the credential is delivered at runtime and downgraded on arrival:
 
-Doing this properly needs credential delivery that never puts the secret in a
-static bundle - the operator supplies the token at runtime, it is held in
-memory/session state rather than compiled in, and the dashboard prompts for it
-on 401. That is tracked on
-[#48](https://github.com/lem-app/lem/issues/48) and is not in this repo yet.
+|                           |                                                                                                                                                                                                                |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/auth/session`   | Trades the root token for a session token. **Only** `~/.lem/api_token` is accepted - a session token cannot mint another one, so the expiry is real. Returns `{"token": "...", "expires_at": "..."}` with 201. |
+| `DELETE /v1/auth/session` | Revokes the session token presented. Always 204, so it is not an oracle for guessing live sessions.                                                                                                            |
 
-Until then:
+- **Memory only.** Sessions live in a dict in this process (`app/sessions.py`).
+  Nothing is written to disk or to SQLite, so **a server restart invalidates
+  every session** and the dashboard re-prompts. That is intended: a credential
+  that does not exist in a file cannot be stolen from one.
+- **Fixed 12-hour TTL.** No sliding window, no refresh endpoint. Expired entries
+  are deleted (not merely refused) on the next mint or verification, so the
+  store cannot grow.
+- **Never logged**, at any level, in any truncated form.
 
-- **Run the dashboard on the same machine as the server**, against the default
-  loopback bind. This is the supported path and needs no token.
-- `LEM_HOST=0.0.0.0` remains useful for non-browser clients (`curl`, scripts),
-  which can send `Authorization: Bearer $(cat ~/.lem/api_token)` themselves.
-- `LEM_ALLOWED_ORIGINS` is still needed, and still correct, for any browser
-  origin other than localhost - it just is not sufficient on its own.
+The dashboard side: `web/local` prompts on 401, exchanges what the operator
+pastes, keeps only the session token (in `sessionStorage` by default,
+`localStorage` behind an explicit "remember on this device"), and retries the
+request that failed. A **Sign out** control calls `DELETE /v1/auth/session` and
+clears both storages, so the remembered-device opt-in is not one-way.
+`scripts/check-bundle-secrets.sh` builds both web apps and fails on either a
+forbidden build-variable name or a credential-shaped literal in the output.
 
-### Known limitation: proxies in front of the bind
+### Proxies in front of the bind: `LEM_REQUIRE_TOKEN`
 
 The posture check reads the address off the socket this process actually bound.
 It cannot see a second hop it is not part of. Put a reverse proxy, port
 forward, container port publish or SSH tunnel in front of a verified-loopback
 bind and the API becomes reachable off-host while the server correctly reports
-`loopback only` and does not require a token - it *is* bound to loopback; the
-exposure was added downstream.
+`loopback only` and does not require a token - it _is_ bound to loopback; the
+exposure was added downstream. `web/local`'s own `pnpm run dev:lan` is exactly
+this shape: it publishes the Vite dev server on every interface while proxying
+`/v1/*` to loopback.
 
-This is inherent to any self-`getsockname()` check, not something the server can
-detect. If you front the local API with a proxy, either bind it with
-`LEM_HOST=0.0.0.0` so the token is enforced, or make the proxy authenticate.
-`web/local`'s own `pnpm run dev:lan` is exactly this shape: it publishes the
-Vite dev server on every interface while proxying `/v1/*` to loopback.
+No self-`getsockname()` check can detect that, so the operator declares it:
+
+```bash
+LEM_REQUIRE_TOKEN=true uv run lem-serve
+```
+
+Every `/v1/*` request then needs a bearer token even though the bind is
+loopback-only, and the dashboard's credential prompt makes that usable from
+another machine. The flag can only ever _add_ the requirement - there is no
+value that switches the token off on a network-reachable bind. Accepted values
+are `1`, `true`, `yes`, `on` (case-insensitive); anything else is false, so a
+typo cannot silently claim protection that is not there.
 
 ## Tunnel peer authorization
 
@@ -165,6 +179,7 @@ uv run pytest --cov=app --cov-report=term-missing
 ## API Documentation
 
 Once the server is running, visit:
+
 - **Interactive docs**: http://localhost:5142/docs
 - **ReDoc**: http://localhost:5142/redoc
 

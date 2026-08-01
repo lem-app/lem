@@ -20,6 +20,8 @@ import { Toaster } from 'react-hot-toast'
 import { ServicesList } from './components/ServicesList'
 import { ModelPull } from './components/ModelPull'
 import { RemoteAccess } from './components/RemoteAccess'
+import { CredentialPrompt } from './components/CredentialPrompt'
+import { SessionStatus } from './components/SessionStatus'
 
 // Create a client for React Query
 const queryClient = new QueryClient({
@@ -34,11 +36,22 @@ const queryClient = new QueryClient({
 function App(): ReactElement {
   return (
     <QueryClientProvider client={queryClient}>
+      {/*
+        Mounted always, rendered only on a 401. Nothing gates the dashboard
+        behind it: on a loopback bind the API needs no credential and this
+        never appears. See api/session.ts.
+      */}
+      <CredentialPrompt />
+
       <div className="min-h-screen bg-background">
         <header className="border-b bg-card px-6 py-4">
-          <div className="text-center">
+          <div className="relative text-center">
             <h1 className="text-2xl font-bold">Lem Dashboard</h1>
             <p className="text-sm text-muted-foreground">Local AI Infrastructure Manager</p>
+            {/* Renders nothing unless a session credential is actually held. */}
+            <div className="absolute right-0 top-0">
+              <SessionStatus />
+            </div>
           </div>
         </header>
 

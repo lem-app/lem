@@ -30,7 +30,16 @@ privileged surface. Two independent defenses guard it:
    loopback only). The token lives in ``~/.lem/api_token`` with mode 0600, so
    only the local user can read it. On a verified loopback bind the token is
    accepted but not required - reaching the socket at all already requires
-   local access.
+   local access. A short-lived session token (see :mod:`app.sessions`) is
+   accepted anywhere the root token is, so a browser never has to hold the
+   permanent credential.
+
+The two defenses are not redundant. A raw bearer holder - curl, a script, a
+compromised host on the LAN - has no ``Origin`` to spoof and never trips the
+CSRF check; the token is what stops it. A browser, conversely, will happily be
+driven cross-origin by a hostile page that has no token at all; ``X-Lem-Client``
+plus the origin allowlist is what stops *that*. Each layer covers the path the
+other one cannot see.
 
 The second defense used to be derived from ``$LEM_HOST`` alone, which is a
 different value from the address uvicorn is actually told to bind. When the two
@@ -39,6 +48,12 @@ logging that it was loopback-only. The posture is now derived from
 ``socket.getsockname()`` on the real listening socket (see
 :func:`verify_bind_posture`, called by ``app.serve``), and it fails closed: if
 the bound address cannot be verified, the token is required.
+
+One shape the process genuinely cannot observe: a reverse proxy (or
+``vite --host``) in front of a *verified loopback* bind republishes the API to
+the network while ``getsockname()`` still, correctly, reports 127.0.0.1.
+``$LEM_REQUIRE_TOKEN`` is the operator's answer - see
+:func:`token_required_override`.
 """
 
 import ipaddress
@@ -54,6 +69,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.db import FILE_MODE, LEM_HOME, secure_lem_home
+from app.sessions import verify_session
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +105,13 @@ PORT_ENV_VAR = "LEM_PORT"
 # Bearer token for non-loopback binds.
 TOKEN_PATH = LEM_HOME / "api_token"
 TOKEN_BYTES = 32
+
+# Operator override: require the bearer token even on a verified loopback bind.
+REQUIRE_TOKEN_ENV_VAR = "LEM_REQUIRE_TOKEN"
+
+# Values accepted as "yes" for LEM_REQUIRE_TOKEN. Anything else is false, so a
+# typo can only ever fail towards *not* claiming protection that is not there.
+TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 _cached_token: str | None = None
 
@@ -269,14 +292,43 @@ def reset_bind_posture() -> None:
     set_bind_posture(UNVERIFIED_BIND)
 
 
+def token_required_override() -> bool:
+    """
+    Whether ``$LEM_REQUIRE_TOKEN`` asks for the token unconditionally.
+
+    The bind posture is read from the real socket, which makes it honest about
+    everything the *process* can see - and blind to everything in front of it.
+    Put nginx, Caddy, an SSH tunnel or ``vite --host`` ahead of a loopback bind
+    and the API is on the network while ``getsockname()`` still says 127.0.0.1;
+    the server would then correctly report "loopback only" and correctly require
+    no credential, and be wrong about the thing that matters.
+
+    Only the operator knows what is in front of the socket, so this is the knob
+    they use to say so. It can only ever *add* the requirement: there is
+    deliberately no value that switches the token off on a network-reachable
+    bind.
+
+    Kept as an environment read alongside ``LEM_HOST``/``LEM_PORT``/
+    ``LEM_ALLOWED_ORIGINS`` rather than a pydantic-settings object, because this
+    module is already the one place the local API's security environment is
+    resolved and a second config path is exactly the drift that put the bind
+    posture and the auth gate on different values once before.
+
+    Returns:
+        True when $LEM_REQUIRE_TOKEN is set to 1/true/yes/on (case-insensitive)
+    """
+    return os.environ.get(REQUIRE_TOKEN_ENV_VAR, "").strip().lower() in TRUTHY
+
+
 def token_required() -> bool:
     """
     Whether the bearer token is enforced right now.
 
     Returns:
-        True unless a loopback-only bind has been positively verified
+        True unless a loopback-only bind has been positively verified and the
+        operator has not overridden that with $LEM_REQUIRE_TOKEN
     """
-    return _bind_posture.require_token
+    return _bind_posture.require_token or token_required_override()
 
 
 def _sockname_host(sock: socket.socket) -> str | None:
@@ -425,6 +477,43 @@ def reset_token_cache() -> None:
     _cached_token = None
 
 
+def extract_bearer(authorization: str | None) -> str | None:
+    """
+    Pull the credential out of an ``Authorization`` header.
+
+    Args:
+        authorization: Raw header value, or None when absent
+
+    Returns:
+        The token, or None if the header is missing, empty, or not Bearer
+    """
+    if not authorization:
+        return None
+    scheme, _, presented = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return presented.strip() or None
+
+
+def tokens_match(presented: str, expected: str) -> bool:
+    """
+    Compare a presented credential against the expected one, in constant time.
+
+    Args:
+        presented: Value from the request (attacker-controlled)
+        expected: Value the server holds
+
+    Returns:
+        True when the two are equal
+    """
+    # secrets.compare_digest raises TypeError on non-ASCII str arguments, and
+    # `presented` comes straight off the wire. Nothing we mint is non-ASCII, so
+    # such a value is a non-match rather than a 500.
+    if not presented.isascii() or not expected.isascii():
+        return False
+    return secrets.compare_digest(presented, expected)
+
+
 # ============================================================================
 # Middleware
 # ============================================================================
@@ -482,6 +571,7 @@ class LocalApiSecurityMiddleware:
         allowed_origins: Sequence[str] = ALLOWED_ORIGINS,
         require_token: bool | Callable[[], bool] = token_required,
         token_provider: Callable[[], str | None] = get_api_token,
+        session_verifier: Callable[[str], bool] = verify_session,
         protected_prefix: str = "/v1/",
     ) -> None:
         """
@@ -491,13 +581,17 @@ class LocalApiSecurityMiddleware:
             require_token: Require ``Authorization: Bearer`` on protected paths.
                 Defaults to the live bind posture, which fails closed until a
                 loopback-only bind has been verified.
-            token_provider: Returns the expected token (None disables the check)
+            token_provider: Returns the expected root token (None disables the
+                check)
+            session_verifier: Returns True for a live session token minted by
+                ``POST /v1/auth/session``
             protected_prefix: Path prefix the token requirement applies to
         """
         self.app = app
         self.allowed_origins = frozenset(allowed_origins)
         self.token_required = _as_provider(require_token)
         self.token_provider = token_provider
+        self.session_verifier = session_verifier
         self.protected_prefix = protected_prefix
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -524,6 +618,13 @@ class LocalApiSecurityMiddleware:
         """
         Validate the bearer token on protected paths.
 
+        Either credential is accepted: the root token from ``~/.lem/api_token``,
+        or a live session token traded for it at ``POST /v1/auth/session``. The
+        session token is what a browser holds, so the permanent secret never has
+        to reach one. The exchange endpoint itself accepts *only* the root token
+        (see :mod:`app.api.v1.session`), which is why a session cannot renew
+        itself into a second permanent credential.
+
         Args:
             method: HTTP method
             path: Request path
@@ -547,9 +648,13 @@ class LocalApiSecurityMiddleware:
                 "The server could not load its API token.",
             )
 
-        authorization = headers.get("authorization", "")
-        scheme, _, presented = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(presented.strip(), expected):
+        presented = extract_bearer(headers.get("authorization"))
+        if presented is None or not (
+            tokens_match(presented, expected) or self.session_verifier(presented)
+        ):
+            # Method and path only - never the presented value, not even a
+            # prefix of it. A rejected request may well carry a *valid*
+            # credential for another server, and logs are not 0600.
             logger.warning(f"Rejected unauthenticated request: {method} {path}")
             return problem_response(
                 401,

@@ -36,6 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth as auth_module
 from app.api.v1.auth import router as auth_router
+from app.api.v1.session import router as session_router
 from app.catalog import get_all_services, get_service_definition
 from app.catalog.models import ServiceCategory, ServiceStatus
 from app.config.platform import ARCH, DOCKER_HOST, IS_WSL, OS_TYPE, PLATFORM
@@ -51,11 +52,14 @@ from app.drivers.runners.ollama import (
 from app.jobs import JobStatus, get_job, get_recent_jobs
 from app.jobs.queue import init_job_queue, shutdown_job_queue
 from app.security import (
+    REQUIRE_TOKEN_ENV_VAR,
     TOKEN_PATH,
     LocalApiSecurityMiddleware,
     ensure_api_token,
     get_allowed_origins,
     get_bind_posture,
+    token_required,
+    token_required_override,
 )
 from app.services import (
     get_all_services_with_status,
@@ -68,6 +72,7 @@ from app.services import (
 )
 from app.services.lifecycle import install_service_inline, register_job_handlers
 from app.services.status import probe_docker
+from app.sessions import clear_sessions
 from app.tunnel.manager import TunnelManager
 
 # Configure logging for the application
@@ -107,11 +112,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # enforcement decision that follows from it - never a claim we have not
     # checked. app.serve installs this posture before the socket accepts.
     posture = get_bind_posture()
+    # token_required(), not posture.require_token: $LEM_REQUIRE_TOKEN can turn
+    # enforcement on over a verified loopback bind, and a log line that reported
+    # the posture's opinion instead of the real decision would be exactly the
+    # kind of confident-but-wrong claim this block exists to avoid.
     enforcement = (
         "bearer token REQUIRED on /v1/*"
-        if posture.require_token
+        if token_required()
         else "bearer token accepted but not required on /v1/*"
     )
+    if token_required_override():
+        enforcement += f" (forced by ${REQUIRE_TOKEN_ENV_VAR})"
     if posture.verified and posture.loopback_only:
         logger.info(f"✓ Lem local API {posture.describe()}; {enforcement}")
     elif posture.verified:
@@ -151,6 +162,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if tunnel_manager:
         await tunnel_manager.stop()
 
+    # Shutdown: drop every browser session. They live in this process's memory
+    # and nowhere else, so a restart already invalidates them; this just makes
+    # that explicit rather than incidental.
+    clear_sessions()
+
     logger.info("✓ Server shutdown complete")
 
 
@@ -185,6 +201,7 @@ app.add_middleware(
 
 # Register API routers
 app.include_router(auth_router, prefix="/v1")
+app.include_router(session_router, prefix="/v1")
 
 
 async def _legacy_status(service_id: str) -> str:
