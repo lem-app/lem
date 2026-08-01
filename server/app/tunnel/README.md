@@ -19,9 +19,11 @@ from app.tunnel.webrtc_client import TunnelAgent
 # Create agent
 agent = TunnelAgent()
 
+
 # Set up callbacks
 def on_state_change(state):
     print(f"State: {state}")
+
 
 agent.on_state_change = on_state_change
 
@@ -29,7 +31,7 @@ agent.on_state_change = on_state_change
 await agent.connect(
     signal_url="ws://localhost:8000/signal",
     device_id="local-device-1",
-    token="<JWT_from_signaling_server>"
+    token="<JWT_from_signaling_server>",
 )
 
 # Create DataChannel
@@ -60,7 +62,7 @@ agent = TunnelAgent()
 await agent.connect(
     signal_url="ws://localhost:8000/signal",
     device_id="local-device-1",
-    token="<JWT_from_signaling_server>"
+    token="<JWT_from_signaling_server>",
 )
 # → WebRTC connection established
 # → DataChannel state: "open"

@@ -55,8 +55,19 @@ SEND_LOW_WATER = 256 * 1024  # 256 KiB buffered: resume
 SEND_DRAIN_TIMEOUT = 30.0
 
 
-class ConnectionState(str, Enum):
-    """WebRTC connection states."""
+class ConnectionState(str, Enum):  # noqa: UP042
+    """WebRTC connection states.
+
+    Deliberately NOT `StrEnum`. Members are interpolated bare (no `.value`) into
+    operator-facing log lines -- `_set_state()` logs
+    `f"State change: {old_state} → {state}"` (this file), and
+    `manager.py::on_state_change` logs `f"TunnelAgent state changed: {state}"`.
+    With `(str, Enum)` those render as `ConnectionState.CONNECTED`; under
+    `StrEnum` they would silently become `connected`. Pydantic/JSON output goes
+    through `.value` and is identical either way, so the test suite cannot catch
+    the difference -- only the logs change. Convert only alongside an
+    intentional update to those log lines.
+    """
 
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"

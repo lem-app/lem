@@ -18,12 +18,12 @@ Data models for the job queue system.
 """
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     """Status of a background job."""
 
     PENDING = "pending"  # Queued, waiting to be processed
@@ -32,7 +32,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"  # Failed with error
 
 
-class JobType(str, Enum):
+class JobType(StrEnum):
     """
     Type of background job.
 
