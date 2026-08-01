@@ -90,29 +90,46 @@ readonly INSTALL_MARKER="config/install.env"
 # and `mkdir -p` merges into whatever was already there. So a prefix that
 # already had a data/ of its own must keep what is in it.
 #
-#   file:PATH  exactly this file (or symlink), by name
-#   tree:PATH  a directory the installer replaces wholesale on every run, so
-#              everything inside came from Lem's own tarball or from Lem and
-#              Harbor at runtime; removed as a unit. assert_adoptable() refuses
-#              to adopt a pre-existing src/ or harbor/, which is what makes
-#              that claim true rather than assumed.
-#   dir:PATH   a directory Lem creates but whose contents it does not own:
-#              rmdir only, so it survives -- along with every directory above
-#              it -- if anything unrecognised is inside.
+#   file:PATH     exactly this file (or symlink), by name
+#   managed:PATH  a directory whose contents Lem SHARES with the user. Only the
+#                 paths recorded in its manifest at install time are removed,
+#                 deepest first; anything added since keeps itself and every
+#                 directory above it. The manifest is $LEM_HOME/config/<name>.manifest.
+#   tree:PATH     a directory the installer replaces wholesale on every run and
+#                 which is not a place for user content; removed as a unit.
+#   dir:PATH      a directory Lem creates but whose contents it does not own:
+#                 rmdir only, so it survives -- along with every directory
+#                 above it -- if anything unrecognised is inside.
 #
-# Order matters: files and trees are listed before the directories that hold
-# them, so each rmdir runs after its owned children are gone.
+# harbor/ is "managed", not "tree": upstream Harbor documents adding a service
+# by dropping a compose.*.yml into its checkout, and Lem's own catalog scanner
+# discovers services by globbing exactly that (server/app/catalog/scanner.py).
+# A user following those instructions puts a file in that directory, so `rm -rf`
+# on it destroys their work silently.
+#
+# src/ stays a "tree" on the evidence: after a download install it holds 317
+# paths from the tarball and 4627 regenerable build artifacts (server/.venv and
+# __pycache__). It is not a documented place for user content, the installer
+# replaces it wholesale on every run anyway, and a per-file rule there would
+# report thousands of false leftovers and never uninstall cleanly.
+# assert_adoptable() refuses to adopt a pre-existing src/, so nothing a user
+# created is in there when the installer starts.
+#
+# Order matters: entries are removed in this order, so files and trees come
+# before the directories that hold them, and a manifest is read before the
+# file: entry that deletes the manifest itself.
 readonly LEM_OWNED=(
   "file:api_token"
   "file:lem.db"
   "file:lem.db-shm"
   "file:lem.db-wal"
-  "tree:harbor"
+  "managed:harbor"
   "tree:harbor.previous"
   "tree:src"
   "tree:src.previous"
   "file:bin/lem"
   "file:bin/lem-server"
+  "file:config/harbor.manifest"
   "file:config/install.env"
   "file:config/server.env"
   "file:logs/lem.log"
@@ -150,6 +167,7 @@ UV_BIN=""
 SERVER_DIR=""
 TMP_ROOT=""
 LOCK_DIR=""
+PREFIX_WAS_LEM=0
 
 # ---------------------------------------------------------------------------
 # Output
@@ -779,6 +797,7 @@ install_harbor() {
   if [ -f "$dir/.env" ]; then
     cp "$dir/.env" "$staged/.env"
   fi
+  carry_over_harbor_extras "$dir" "$staged" "$tmp"
 
   mkdir -p "$LEM_HOME"
   rm -rf "$dir.previous"
@@ -793,7 +812,56 @@ install_harbor() {
 
   "$dir/harbor.sh" --version >/dev/null 2>&1 ||
     die "Harbor installed but 'harbor.sh --version' failed"
+
+  # Record what Lem put here, now that Harbor has written its own runtime files
+  # (.env, .history) too. --uninstall removes exactly this list, so a
+  # compose.*.yml added later is not Lem's to delete. Written last: a manifest
+  # that claimed more than actually landed would authorise deleting a file we
+  # never wrote.
+  write_harbor_manifest "$dir"
+
   success "Harbor $HARBOR_VERSION installed to $dir"
+}
+
+harbor_manifest_path() {
+  printf '%s/config/harbor.manifest\n' "$LEM_HOME"
+}
+
+write_harbor_manifest() {
+  local dir="$1" manifest
+  manifest="$(harbor_manifest_path)"
+  mkdir -p "${manifest%/*}"
+  (cd "$dir" && find . ! -name . | sort) >"$manifest"
+}
+
+# Move anything the previous install did not put there into the new tree: a
+# user's own compose.*.yml (Harbor's documented way to add a service, and what
+# Lem's catalog scanner reads) would otherwise be destroyed by the swap below,
+# on every Harbor version bump. Only runs when a manifest says what was ours;
+# without one nothing is assumed and the pre-existing `.env` copy above stands.
+carry_over_harbor_extras() {
+  local dir="$1" staged="$2" tmp="$3" manifest rel
+  manifest="$(harbor_manifest_path)"
+
+  { [ -d "$dir" ] && [ -f "$manifest" ]; } || return 0
+
+  (cd "$dir" && find . ! -name . | sort) >"$tmp/current"
+  sort "$manifest" >"$tmp/claimed"
+  comm -23 "$tmp/current" "$tmp/claimed" >"$tmp/carry"
+
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in
+      *..*) continue ;;
+    esac
+    [ -e "$dir/$rel" ] || continue
+    mkdir -p "$staged/${rel%/*}"
+    cp -a "$dir/$rel" "$staged/$rel" 2>/dev/null || true
+  done <"$tmp/carry"
+
+  if [ -s "$tmp/carry" ]; then
+    detail "Keeping $(wc -l <"$tmp/carry" | tr -d ' ') file(s) you added to $dir"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -903,7 +971,15 @@ EOF
 write_server_env() {
   local path="$LEM_HOME/config/server.env"
   if [ -f "$path" ]; then
-    detail "Keeping existing $path"
+    # Adopting a file of that exact name from a prefix Lem had never installed
+    # into is a coincidence, but it becomes Lem's configuration from here on --
+    # and --uninstall will remove it. Say so once, rather than silently.
+    if [ "$PREFIX_WAS_LEM" -eq 0 ]; then
+      warn "Adopting the existing $path as Lem's server configuration."
+      warn "It will be read as config, and removed by --uninstall."
+    else
+      detail "Keeping existing $path"
+    fi
     return 0
   fi
   write_file "$path" 600 <<EOF
@@ -1385,6 +1461,42 @@ uninstall() {
   return "$status"
 }
 
+# Remove a directory whose contents Lem shares with the user ($1), using the
+# manifest ($2) recorded when the install put it there: every path it lists,
+# deepest first, and nothing else. A file added afterwards -- a custom
+# compose.*.yml, which is how upstream Harbor documents adding a service and
+# what Lem's catalog scanner globs for -- keeps itself and every directory
+# above it, so the tree survives and gets reported like any other leftover.
+#
+# No manifest means no record of what Lem put there, so nothing can be claimed
+# and the whole directory stays. That fails safe rather than guessing.
+remove_managed_tree() {
+  local dir="$1" manifest="$2" rel
+
+  { [ -d "$dir" ] && [ ! -L "$dir" ]; } || return 0
+  [ -f "$manifest" ] || return 0
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    detail "[dry-run] remove the paths $manifest records under $dir"
+    return 0
+  fi
+
+  # Reverse sort puts "./a/b" before "./a", so children go before parents.
+  sort -r "$manifest" | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in
+      *..*) continue ;;  # a tampered manifest must not reach out of the tree
+    esac
+    if [ -d "$dir/$rel" ] && [ ! -L "$dir/$rel" ]; then
+      rmdir "$dir/$rel" 2>/dev/null || true
+    elif [ -e "$dir/$rel" ] || [ -L "$dir/$rel" ]; then
+      rm -f "$dir/$rel" 2>/dev/null || true
+    fi
+  done
+
+  rmdir "$dir" 2>/dev/null || true
+}
+
 # Everything still inside the prefix, one path per line. The trailing slash is
 # load-bearing: it makes find follow a $LEM_HOME that is itself a symlink,
 # which otherwise reported an empty list and printed "holds things Lem did not
@@ -1412,6 +1524,9 @@ remove_install_prefix() {
         if [ -e "$target" ] || [ -L "$target" ]; then
           run rm -rf "$target"
         fi
+        ;;
+      managed)
+        remove_managed_tree "$target" "$LEM_HOME/config/${target##*/}.manifest"
         ;;
       dir)
         # rmdir, never rm -rf: whatever else is in here is not ours to delete.
@@ -1539,6 +1654,11 @@ main() {
   require_cmd tar
   check_docker
   assert_adoptable
+  # Recorded before anything is written, so write_server_env() can tell a
+  # re-install from adopting a stranger's file of the same name.
+  if is_lem_install "$LEM_HOME"; then
+    PREFIX_WAS_LEM=1
+  fi
 
   run mkdir -p "$LEM_HOME/data" "$LEM_HOME/logs" "$LEM_HOME/config" "$LEM_HOME/run"
 

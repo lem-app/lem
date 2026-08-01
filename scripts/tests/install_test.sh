@@ -603,6 +603,16 @@ assert_false $? "a directory that does not exist is not a Lem install"
 make_fake_install() {
   local root="$1"
   mkdir -p "$root/bin" "$root/config" "$root/data" "$root/logs" "$root/run" "$root/harbor"
+  # A Harbor tree plus the manifest install_harbor() records for it: uninstall
+  # removes exactly what the manifest lists, so a fixture without one would be
+  # testing the "no record, keep everything" fallback instead.
+  printf '#!/bin/sh\n' >"$root/harbor/harbor.sh"
+  printf 'v0.3.20\n' >"$root/harbor/.lem-harbor-version"
+  printf 'HARBOR_X=1\n' >"$root/harbor/.env"
+  mkdir -p "$root/harbor/.scripts"
+  printf 'shipped\n' >"$root/harbor/.scripts/seed.sh"
+  printf 'services:\n' >"$root/harbor/compose.ollama.yml"
+  (cd "$root/harbor" && find . ! -name . | sort) >"$root/config/harbor.manifest"
   (
     LEM_HOME="$root"
     SERVER_DIR="$root/src/server"
@@ -788,6 +798,68 @@ out="$(run_real_uninstall "$WORK/symprefix")"; status=$?
 assert_true $status "a symlinked prefix uninstalls cleanly"
 assert_not_contains "$out" "files Lem did not create" "without claiming there are leftovers"
 assert_eq "" "$(find "$WORK/symtarget/" -mindepth 1 2>/dev/null)" "the target really is empty"
+
+# ===========================================================================
+section "uninstall keeps a custom service added to harbor/"
+# ===========================================================================
+
+# The realistic user story, not a synthetic planted file: upstream Harbor
+# documents adding a service by dropping a compose.*.yml into its checkout, and
+# Lem's own catalog scanner discovers services by globbing exactly that
+# (server/app/catalog/scanner.py). So harbor/ is a directory Lem SHARES with
+# the user, and `rm -rf` on it destroyed their work silently, exit 0.
+#
+# Real entrypoint again -- this is the path the user takes.
+custom="$WORK/harbor_custom"
+make_fake_install "$custom"
+printf 'services:\n  mine:\n    image: me/mine\n' >"$custom/harbor/compose.mine.yml"
+mkdir -p "$custom/harbor/mine"
+printf 'my override\n' >"$custom/harbor/mine/notes.txt"
+
+out="$(run_real_uninstall "$custom")"; status=$?
+assert_eq "2" "$status" "--uninstall exits 2 when a custom service is in harbor/"
+assert_file_test -f "$custom/harbor/compose.mine.yml" "the custom compose file survives"
+assert_eq "services:
+  mine:
+    image: me/mine" "$(cat "$custom/harbor/compose.mine.yml")" "byte-for-byte"
+assert_file_test -f "$custom/harbor/mine/notes.txt" "and a directory the user added"
+assert_contains "$out" "harbor/compose.mine.yml" "the survivor is reported by path"
+
+# Harbor's own shipped files still go, including the ones its runtime wrote.
+assert_not_file_test -e "$custom/harbor/harbor.sh" "Harbor's own harbor.sh is removed"
+assert_not_file_test -e "$custom/harbor/compose.ollama.yml" "a shipped compose file is removed"
+assert_not_file_test -e "$custom/harbor/.scripts" "a shipped subdirectory is removed"
+assert_not_file_test -e "$custom/harbor/.env" "Harbor's runtime .env is removed"
+assert_not_file_test -e "$custom/harbor/.lem-harbor-version" "the version stamp is removed"
+
+# No manifest means no record of what Lem put there: keep everything.
+noman="$WORK/harbor_nomanifest"
+make_fake_install "$noman"
+rm -f "$noman/config/harbor.manifest"
+out="$(run_real_uninstall "$noman")"; status=$?
+assert_eq "2" "$status" "an unrecorded harbor/ is kept, not guessed at"
+assert_file_test -f "$noman/harbor/harbor.sh" "and nothing inside it is removed"
+
+# ...and the same file survives a Harbor version bump, which swaps the tree.
+# Preserving only .env, as this did before, lost every custom service on every
+# upgrade -- the same silent loss, one step earlier.
+upgrade="$WORK/harbor_upgrade"
+make_fake_install "$upgrade"
+printf 'services:\n' >"$upgrade/harbor/compose.mine.yml"
+printf 'MY=1\n' >"$upgrade/harbor/.env"
+staged_new="$WORK/harbor_staged"
+mkdir -p "$staged_new"
+printf '#!/bin/sh\n' >"$staged_new/harbor.sh"   # the new version's tree
+(
+  LEM_HOME="$upgrade"
+  mkdir -p "$WORK/carrytmp"
+  cp "$upgrade/harbor/.env" "$staged_new/.env"  # what install_harbor does first
+  carry_over_harbor_extras "$upgrade/harbor" "$staged_new" "$WORK/carrytmp"
+) >/dev/null 2>&1
+assert_file_test -f "$staged_new/compose.mine.yml" "a custom compose file is carried into the new tree"
+assert_file_test -f "$staged_new/.env" "and Harbor's .env still is too"
+assert_not_file_test -e "$staged_new/compose.ollama.yml" "a shipped file is not carried over"
+assert_not_file_test -e "$staged_new/.scripts" "nor a shipped subdirectory"
 
 # ===========================================================================
 section "the installer refuses to adopt a src/ or harbor/ it did not create"
