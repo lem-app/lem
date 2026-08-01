@@ -88,6 +88,10 @@ def extract_service_id(headers: Iterable[tuple[str, str]]) -> str | None:
     service_id = values[0].strip()
     if not _SERVICE_ID_RE.match(service_id):
         raise UnknownServiceError(service_id)
+    # "." is in the character class, so "." and ".." match the grammar. A
+    # segment that means "somewhere else" is never a service id.
+    if service_id in {".", ".."}:
+        raise UnknownServiceError(service_id)
     return service_id
 
 

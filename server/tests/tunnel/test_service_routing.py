@@ -140,7 +140,7 @@ class TestRouterUnit:
         with pytest.raises(UnknownServiceError):
             router.route("/x", [("X-Lem-Service", "webui"), ("X-Lem-Service", "ollama")])
 
-    @pytest.mark.parametrize("value", ["", "  ", "../etc", "a/b", "x" * 65, "web ui"])
+    @pytest.mark.parametrize("value", ["", "  ", "../etc", "a/b", "x" * 65, "web ui", ".", ".."])
     def test_malformed_service_ids_are_refused(self, value: str) -> None:
         router = RequestRouter("http://localhost:5142", lambda _sid: "http://127.0.0.1:33801")
         with pytest.raises(UnknownServiceError):

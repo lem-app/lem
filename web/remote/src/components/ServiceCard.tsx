@@ -34,6 +34,15 @@ interface ServiceCardProps {
   onStop: (serviceId: string) => Promise<void>
   onRemove: (serviceId: string) => Promise<JobResponse>
   onLaunch?: (serviceId: string) => void
+  /**
+   * Why Launch is unavailable, or null when it works.
+   *
+   * Framing a service requires the same-origin Service Worker proxy. Without it
+   * there is no honest fallback: pointing the frame at the service's own
+   * `127.0.0.1` address would load *this* machine's localhost, which is the bug
+   * this whole path exists to fix.
+   */
+  launchBlockedReason?: string | null
   isActionLoading: boolean
 }
 
@@ -45,6 +54,7 @@ export function ServiceCard({
   onStop,
   onRemove,
   onLaunch,
+  launchBlockedReason = null,
   isActionLoading,
 }: ServiceCardProps): ReactElement {
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
@@ -177,7 +187,13 @@ export function ServiceCard({
         ) : isRunning ? (
           <>
             {service.has_ui && onLaunch && (
-              <Button variant="default" className="flex-1" onClick={() => onLaunch(service.id)}>
+              <Button
+                variant="default"
+                className="flex-1"
+                onClick={() => onLaunch(service.id)}
+                disabled={launchBlockedReason !== null}
+                title={launchBlockedReason ?? undefined}
+              >
                 <ExternalLink className="mr-2 h-4 w-4" />
                 Launch
               </Button>

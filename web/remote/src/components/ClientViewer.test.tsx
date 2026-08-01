@@ -14,38 +14,20 @@
 // Public License for more details.
 
 /**
- * Tests for the framed-app URL allowlist (F-SEC-3).
+ * The viewer must never hand this browser a far-machine address.
+ *
+ * The old allowlist (F-SEC-3) restricted `<iframe src>` to loopback URLs, which
+ * kept a compromised server from framing arbitrary content but still pointed the
+ * frame at *this* browser's own localhost - defect #1 of issue #6. These tests
+ * assert the stronger property that replaced it: the src is a same-origin
+ * `/app/<deviceId>/<serviceId>/` path, whatever the server reports.
  */
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { ClientViewer } from './ClientViewer'
-import { toFramableUrl } from '../lib/framable-url'
+import type { SessionRegistrar, SwStatus } from '../lib/sw-bridge'
 import type { Service } from '../api/types'
-
-describe('toFramableUrl', () => {
-  it('accepts loopback http(s) URLs', () => {
-    expect(toFramableUrl('http://localhost:3000/')).toBe('http://localhost:3000/')
-    expect(toFramableUrl('http://127.0.0.1:8080/ui')).toBe('http://127.0.0.1:8080/ui')
-  })
-
-  it('rejects javascript: and data: URLs', () => {
-    expect(toFramableUrl('javascript:alert(1)')).toBeNull()
-    expect(toFramableUrl('data:text/html,<script>alert(1)</script>')).toBeNull()
-  })
-
-  it('rejects non-loopback hosts', () => {
-    expect(toFramableUrl('https://evil.example.com/')).toBeNull()
-    expect(toFramableUrl('http://10.0.0.5:3000/')).toBeNull()
-  })
-
-  it('rejects nonsense and empty values', () => {
-    expect(toFramableUrl('not a url')).toBeNull()
-    expect(toFramableUrl(null)).toBeNull()
-    expect(toFramableUrl(undefined)).toBeNull()
-    expect(toFramableUrl('')).toBeNull()
-  })
-})
 
 function service(endpoint: string | null): Service {
   return {
@@ -73,43 +55,132 @@ function proxyFetchReturning(body: Service): (url: string) => Promise<Response> 
     )
 }
 
+function fakeBridge(): SessionRegistrar & {
+  opened: [string, string][]
+  closed: [string, string][]
+} {
+  const opened: [string, string][] = []
+  const closed: [string, string][] = []
+  return {
+    opened,
+    closed,
+    openSession: (deviceId, serviceId) => opened.push([deviceId, serviceId]),
+    closeSession: (deviceId, serviceId) => closed.push([deviceId, serviceId]),
+  }
+}
+
+const READY: SwStatus = { state: 'ready' }
+
+function renderViewer(
+  endpoint: string | null,
+  bridge: SessionRegistrar | null,
+  swStatus: SwStatus = READY
+) {
+  return render(
+    <ClientViewer
+      serviceId="webui"
+      deviceId="dev-7f3a"
+      connectionState="connected"
+      dataChannelState="open"
+      onBack={() => undefined}
+      proxyFetch={proxyFetchReturning(service(endpoint))}
+      swStatus={swStatus}
+      bridge={bridge}
+    />
+  )
+}
+
+async function findFrame(): Promise<HTMLIFrameElement> {
+  return await waitFor(() => {
+    const element = document.querySelector('iframe')
+    expect(element).not.toBeNull()
+    return element as HTMLIFrameElement
+  })
+}
+
 describe('ClientViewer iframe', () => {
-  it('embeds a loopback service with a tight sandbox', async () => {
+  it('frames the same-origin app path, not the service endpoint', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const frame = await findFrame()
+
+    expect(frame.getAttribute('src')).toBe('/app/dev-7f3a/webui/')
+    // The resolved URL stays on the dashboard's own origin, which is what lets
+    // the Service Worker control the document at all.
+    expect(new URL(frame.src, window.location.href).origin).toBe(window.location.origin)
+  })
+
+  it('ignores a hostile endpoint entirely rather than validating it', async () => {
+    renderViewer('https://evil.example.com/', fakeBridge())
+
+    const frame = await findFrame()
+
+    expect(frame.getAttribute('src')).toBe('/app/dev-7f3a/webui/')
+    expect(document.body.innerHTML).not.toContain('evil.example.com')
+  })
+
+  it('keeps the tight sandbox', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const frame = await findFrame()
+
+    expect(frame.getAttribute('sandbox')).toBe('allow-scripts allow-same-origin allow-forms')
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-popups')
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-top-navigation')
+  })
+
+  it('does not suppress the referrer, which resolution step 2 reads', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const frame = await findFrame()
+
+    // The frame is same-origin now, so the default policy sends the full path
+    // and the worker can attribute a subresource from the referrer alone.
+    expect(frame.getAttribute('referrerpolicy')).toBeNull()
+  })
+
+  it('registers the session before the frame exists, and closes it on unmount', async () => {
+    const bridge = fakeBridge()
+    const view = renderViewer('http://localhost:3000/', bridge)
+
+    await findFrame()
+    expect(bridge.opened).toEqual([['dev-7f3a', 'webui']])
+    expect(bridge.closed).toEqual([])
+
+    view.unmount()
+    expect(bridge.closed).toEqual([['dev-7f3a', 'webui']])
+  })
+
+  it('renders no iframe at all when the proxy is unavailable', async () => {
+    renderViewer('http://localhost:3000/', null, {
+      state: 'unavailable',
+      reason: 'insecure-context',
+    })
+
+    expect(await screen.findByText(/Cannot open Open WebUI here/)).toBeInTheDocument()
+    // Never a fallback to the service's own address: that is the defect.
+    expect(document.querySelector('iframe')).toBeNull()
+  })
+
+  it('refuses to build a path from an id that would not survive the URL', async () => {
+    const bridge = fakeBridge()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     render(
       <ClientViewer
-        serviceId="webui"
+        serviceId="../../etc"
+        deviceId="dev-7f3a"
         connectionState="connected"
         dataChannelState="open"
         onBack={() => undefined}
         proxyFetch={proxyFetchReturning(service('http://localhost:3000/'))}
+        swStatus={READY}
+        bridge={bridge}
       />
     )
 
-    const frame = await waitFor(() => {
-      const el = document.querySelector('iframe')
-      expect(el).not.toBeNull()
-      return el
-    })
-
-    expect(frame?.getAttribute('sandbox')).toBe('allow-scripts allow-same-origin allow-forms')
-    // allow-popups and allow-top-navigation must stay off.
-    expect(frame?.getAttribute('sandbox')).not.toContain('allow-popups')
-    expect(frame?.getAttribute('sandbox')).not.toContain('allow-top-navigation')
-    expect(frame?.getAttribute('referrerpolicy')).toBe('no-referrer')
-  })
-
-  it('refuses to embed a server-supplied non-loopback URL', async () => {
-    render(
-      <ClientViewer
-        serviceId="webui"
-        connectionState="connected"
-        dataChannelState="open"
-        onBack={() => undefined}
-        proxyFetch={proxyFetchReturning(service('https://evil.example.com/'))}
-      />
-    )
-
-    expect(await screen.findByText(/Refusing to embed/)).toBeInTheDocument()
+    expect(await screen.findByText(/cannot appear in a service URL/)).toBeInTheDocument()
     expect(document.querySelector('iframe')).toBeNull()
+    expect(bridge.opened).toEqual([])
+    consoleError.mockRestore()
   })
 })
