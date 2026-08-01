@@ -13,9 +13,30 @@
 // or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 // Public License for more details.
 
-import { clsx, type ClassValue } from "clsx"
-import { twMerge } from "tailwind-merge"
+import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
+}
+
+/** Schemes an `<a href>` built from server data may use. */
+const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:'])
+
+/**
+ * Validate a URL that came from the local server before putting it in an
+ * `href`. Service endpoints are server-supplied strings; rendering one
+ * unchecked makes `javascript:` (and `data:`) a one-click XSS.
+ *
+ * @returns the normalised URL, or `null` when it must not be linked.
+ */
+export function safeExternalHref(raw: string | null | undefined): string | null {
+  if (!raw) return null
+
+  try {
+    const parsed = new URL(raw)
+    return SAFE_LINK_PROTOCOLS.has(parsed.protocol) ? parsed.toString() : null
+  } catch {
+    return null
+  }
 }

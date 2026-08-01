@@ -55,7 +55,7 @@ export function DeviceSelector({ onSelectDevice, token }: DeviceSelectorProps): 
       }
     }
 
-    fetchDevices()
+    void fetchDevices()
   }, [token])
 
   const handleManualSubmit = (e: React.FormEvent) => {
@@ -122,11 +122,7 @@ export function DeviceSelector({ onSelectDevice, token }: DeviceSelectorProps): 
               </div>
               <div className="flex gap-2">
                 <Button type="submit">Connect</Button>
-                <Button
-                  type="button"
-                  onClick={() => setManualEntry(false)}
-                  variant="secondary"
-                >
+                <Button type="button" onClick={() => setManualEntry(false)} variant="secondary">
                   Back to List
                 </Button>
               </div>

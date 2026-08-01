@@ -24,6 +24,9 @@ import type { WebRTCConnectionManager } from './webrtc'
 import type { RelayClient } from './relay-client'
 import { serializeRequest, deserializeResponse, type HTTPResponseFrame } from './http-frame'
 
+/** How long a tunneled request may stay outstanding before it is failed. */
+const REQUEST_TIMEOUT_MS = 30000
+
 /**
  * Pending request awaiting response.
  */
@@ -139,22 +142,28 @@ export class HTTPProxy {
       }
     }
 
-    // Get body
+    // Get body.
+    //
+    // The wire format carries a UTF-8 string, so only text-shaped bodies round
+    // trip. Anything else (Blob, ArrayBuffer, streams) is rejected loudly rather
+    // than silently sent as "[object Object]"; binary bodies belong to the
+    // tunnel-protocol track.
     let body = ''
-    if (init?.body) {
+    if (init?.body !== undefined && init.body !== null) {
       if (typeof init.body === 'string') {
         body = init.body
+      } else if (init.body instanceof URLSearchParams) {
+        body = init.body.toString()
       } else if (init.body instanceof FormData) {
         // Convert FormData to JSON (simplified)
         const formObj: Record<string, string> = {}
         init.body.forEach((value, key) => {
-          formObj[key] = String(value)
+          formObj[key] = typeof value === 'string' ? value : value.name
         })
         body = JSON.stringify(formObj)
         headers['Content-Type'] = 'application/json'
       } else {
-        // For other types, try to convert to string
-        body = String(init.body)
+        throw new TypeError('proxyFetch only supports string, URLSearchParams and FormData bodies')
       }
     }
 
@@ -172,46 +181,57 @@ export class HTTPProxy {
 
     // Send over DataChannel
     return new Promise<Response>((resolve, reject) => {
-      // Store pending request
-      this.pendingRequests.set(requestId, { resolve, reject })
+      let timeout: number | null = null
 
-      // Set timeout (30 seconds)
-      const timeout = setTimeout(() => {
+      // Single settle path. The previous version deleted the entry in its catch
+      // block and then *fell through* to re-insert it, so every send failure
+      // leaked a permanently-pending entry into the map.
+      const settle = () => {
+        if (timeout !== null) {
+          clearTimeout(timeout)
+          timeout = null
+        }
         this.pendingRequests.delete(requestId)
-        reject(new Error('Request timeout'))
-      }, 30000)
+      }
+
+      const pending: PendingRequest = {
+        resolve: (response: Response) => {
+          settle()
+          resolve(response)
+        },
+        reject: (error: Error) => {
+          settle()
+          reject(error)
+        },
+      }
+
+      this.pendingRequests.set(requestId, pending)
+
+      timeout = window.setTimeout(() => {
+        timeout = null
+        pending.reject(new Error(`Request timeout after ${REQUEST_TIMEOUT_MS}ms`))
+      }, REQUEST_TIMEOUT_MS)
 
       try {
-        // Send binary frame
         if (!this.transport.isOpen()) {
-          clearTimeout(timeout)
-          this.pendingRequests.delete(requestId)
-          reject(new Error('Transport not open'))
-          return
+          throw new Error('Transport not open')
         }
 
         // Send ArrayBuffer over transport (DataChannel or WebSocket)
         this.transport.sendData(frame)
         console.log(`[ProxyFetch] Sent request ${requestId}: ${method} ${path}`)
       } catch (error) {
-        clearTimeout(timeout)
-        this.pendingRequests.delete(requestId)
-        reject(error instanceof Error ? error : new Error(String(error)))
+        pending.reject(error instanceof Error ? error : new Error(String(error)))
       }
-
-      // Clean up timeout when response arrives
-      const originalResolve = resolve
-      this.pendingRequests.set(requestId, {
-        resolve: (response: Response) => {
-          clearTimeout(timeout)
-          originalResolve(response)
-        },
-        reject: (error: Error) => {
-          clearTimeout(timeout)
-          reject(error)
-        },
-      })
     })
+  }
+
+  /**
+   * Number of requests still awaiting a response. Exposed for tests and
+   * diagnostics - a monotonically growing value means responses are being lost.
+   */
+  get pendingCount(): number {
+    return this.pendingRequests.size
   }
 
   /**
@@ -237,6 +257,20 @@ export class HTTPProxy {
 
       // Create Response object
       const response = this.createResponse(frame)
+
+      // NOTE on 401s: a 401 arriving here came from the *local* Lem server at
+      // the far end of the tunnel, which authenticates separately from the
+      // cloud session this browser holds a JWT for. Dropping the cloud session
+      // on it would log the user out for an unrelated failure, so the status is
+      // handed to the caller untouched. Cloud-session 401s are intercepted in
+      // `api/auth.ts`, and relay/signaling token rejection surfaces through
+      // `RelayAuthError`.
+      if (frame.statusCode === 401 || frame.statusCode === 403) {
+        console.warn(
+          `[ProxyFetch] Local server rejected request ${frame.requestId} with ${frame.statusCode}`
+        )
+      }
+
       pending.resolve(response)
     } catch (error) {
       console.error('[ProxyFetch] Error handling response:', error)
@@ -261,44 +295,14 @@ export class HTTPProxy {
   }
 
   /**
-   * Clear all pending requests.
+   * Fail every outstanding request. Called when the transport goes away so the
+   * map cannot accumulate resolvers nobody will ever call.
    */
   clearPending(): void {
-    this.pendingRequests.forEach((pending) => {
-      pending.reject(new Error('Connection closed'))
-    })
+    const pending = [...this.pendingRequests.values()]
     this.pendingRequests.clear()
-  }
-}
-
-/**
- * Create proxyFetch function bound to WebRTC connection.
- */
-export function createProxyFetch(webrtc: WebRTCConnectionManager): {
-  fetch: (url: string, init?: RequestInit) => Promise<Response>
-  proxy: HTTPProxy
-} {
-  const transport = new WebRTCTransport(webrtc)
-  const proxy = new HTTPProxy(transport)
-
-  return {
-    fetch: (url: string, init?: RequestInit) => proxy.fetch(url, init),
-    proxy,
-  }
-}
-
-/**
- * Create proxyFetch function bound to Relay connection.
- */
-export function createRelayProxyFetch(relay: RelayClient): {
-  fetch: (url: string, init?: RequestInit) => Promise<Response>
-  proxy: HTTPProxy
-} {
-  const transport = new RelayTransport(relay)
-  const proxy = new HTTPProxy(transport)
-
-  return {
-    fetch: (url: string, init?: RequestInit) => proxy.fetch(url, init),
-    proxy,
+    pending.forEach((request) => {
+      request.reject(new Error('Connection closed'))
+    })
   }
 }

@@ -14,10 +14,10 @@
 // Public License for more details.
 
 // Hook for model operations
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getRunnerModels, pullModel, type ApiError } from '../api/client';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { getRunnerModels, pullModel } from '../api/client'
 
-const POLL_INTERVAL = 5000; // 5 seconds (api.md §0.1.1)
+const POLL_INTERVAL = 5000 // 5 seconds (api.md §0.1.1)
 
 export function useRunnerModels(runnerId: string) {
   return useQuery({
@@ -26,28 +26,20 @@ export function useRunnerModels(runnerId: string) {
     refetchInterval: POLL_INTERVAL,
     refetchIntervalInBackground: true,
     enabled: !!runnerId, // Only fetch if runnerId is provided
-  });
+  })
 }
 
 export function usePullModel() {
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: ({
-      runnerId,
-      modelRef,
-    }: {
-      runnerId: string;
-      modelRef: string;
-    }) => pullModel(runnerId, { model_ref: modelRef }),
+    mutationFn: ({ runnerId, modelRef }: { runnerId: string; modelRef: string }) =>
+      pullModel(runnerId, { model_ref: modelRef }),
     onSuccess: (_, variables) => {
       // Invalidate models query to show pulling status
       void queryClient.invalidateQueries({
         queryKey: ['runners', variables.runnerId, 'models'],
-      });
+      })
     },
-    onError: (error: ApiError) => {
-      throw error;
-    },
-  });
+  })
 }

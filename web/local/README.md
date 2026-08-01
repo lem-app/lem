@@ -1,73 +1,59 @@
-# React + TypeScript + Vite
+# Lem Local Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The dashboard served on the machine running Lem. It talks to the local Lem API
+(`http://127.0.0.1:5142` by default) to install, start and stop Harbor services,
+pull models, and manage remote access.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+```bash
+# Install dependencies
+pnpm install
 
-## React Compiler
+# Run dev server (http://127.0.0.1:5174)
+pnpm dev
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+# Same, but reachable from the LAN - see the warning below
+pnpm dev:lan
 
-## Expanding the ESLint configuration
+# Build for production
+pnpm build
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+# Run tests (single pass) / watch mode / with coverage
+pnpm test
+pnpm test:watch
+pnpm test:coverage
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+# Type check (tsc -b: the solution-style tsconfig means plain `tsc --noEmit`
+# checks nothing at all)
+pnpm type-check
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# Lint / format
+pnpm lint
+pnpm format
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### A note on `dev:lan`
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+The dev server proxies `/v1/*` straight to the local Lem API, which can start
+and stop Docker containers and has no authentication of its own. `pnpm dev`
+therefore binds to loopback only. `pnpm dev:lan` binds every interface - use it
+when you deliberately want to reach the dashboard from another device on a
+network you trust, and not otherwise.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Configuration
+
+| Variable          | Default                 | Purpose                                |
+| ----------------- | ----------------------- | -------------------------------------- |
+| `VITE_API_URL`    | `""` (relative URLs)    | Backend base URL for production builds |
+| `VITE_API_TARGET` | `http://127.0.0.1:5142` | Dev-server proxy target for `/v1/*`    |
+
+## Layout
+
+```
+src/
+├── api/          # Typed client for the local Lem API
+├── components/   # Dashboard UI (shadcn/ui + Tailwind)
+├── hooks/        # React Query hooks
+└── lib/          # Shared helpers
 ```

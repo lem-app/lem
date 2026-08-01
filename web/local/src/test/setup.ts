@@ -13,20 +13,18 @@
 // or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 // Public License for more details.
 
-// Hook for polling tunnel status
-import { useQuery } from '@tanstack/react-query';
-import { getTunnelStatus } from '../api/client';
+/**
+ * Vitest DOM harness.
+ *
+ * jsdom was already a dependency but nothing wired it up, so component tests
+ * were impossible. This adds jest-dom matchers and unmounts React trees between
+ * tests so one test's timers and effects cannot bleed into the next.
+ */
 
-const POLL_INTERVAL = 5000; // 5 seconds (api.md §0.1.1)
+import '@testing-library/jest-dom/vitest'
+import { cleanup } from '@testing-library/react'
+import { afterEach } from 'vitest'
 
-export function useTunnelStatus() {
-  return useQuery({
-    queryKey: ['tunnel', 'status'],
-    queryFn: getTunnelStatus,
-    refetchInterval: POLL_INTERVAL,
-    refetchIntervalInBackground: true,
-    // Tunnel status might not be implemented yet (returns 501)
-    // Don't throw on error, just return undefined
-    retry: false,
-  });
-}
+afterEach(() => {
+  cleanup()
+})

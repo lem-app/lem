@@ -30,8 +30,10 @@ type ConnectionStatusProps = {
   connectionState: ConnectionState
   dataChannelState: DataChannelState
   connectionMode: ConnectionMode
+  /** Signaling endpoint, shown in Diagnostics. */
+  signalUrl: string
   error: Error | null
-  onConnect: () => void
+  onConnect: () => Promise<void>
   onDisconnect: () => void
 }
 
@@ -39,10 +41,16 @@ export function ConnectionStatus({
   connectionState,
   dataChannelState,
   connectionMode,
+  signalUrl,
   error,
   onConnect,
   onDisconnect,
 }: ConnectionStatusProps): ReactElement {
+  // onConnect is async; handing it straight to onClick floats its rejection.
+  const handleConnect = (): void => {
+    void onConnect()
+  }
+
   const getConnectionStateVariant = (
     state: ConnectionState
   ): 'default' | 'secondary' | 'destructive' | 'outline' => {
@@ -102,7 +110,7 @@ export function ConnectionStatus({
             <CardTitle>Connection Status</CardTitle>
             <div>
               {connectionState === 'disconnected' || connectionState === 'failed' ? (
-                <Button onClick={onConnect} size="sm">
+                <Button onClick={handleConnect} size="sm">
                   Connect
                 </Button>
               ) : (
@@ -157,11 +165,13 @@ export function ConnectionStatus({
             <h3 className="text-sm font-semibold">Diagnostics</h3>
             <ul className="space-y-2 text-sm text-muted-foreground">
               <li>
-                <strong className="text-foreground">Signaling Server:</strong> ws://localhost:8000/signal
+                <strong className="text-foreground">Signaling Server:</strong> {signalUrl}
               </li>
               <li>
                 <strong className="text-foreground">Connection Type:</strong>{' '}
-                {connectionState === 'connected' ? getConnectionModeLabel(connectionMode) : 'Not connected'}
+                {connectionState === 'connected'
+                  ? getConnectionModeLabel(connectionMode)
+                  : 'Not connected'}
               </li>
               <li>
                 <strong className="text-foreground">Protocol:</strong>{' '}

@@ -1,7 +1,22 @@
-import * as React from "react"
-import * as ProgressPrimitive from "@radix-ui/react-progress"
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2025 Lem
+//
+// This file is part of Lem.
+//
+// Lem is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Lem is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+// or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
+// Public License for more details.
 
-import { cn } from "@/lib/utils"
+import * as React from 'react'
+import * as ProgressPrimitive from '@radix-ui/react-progress'
+
+import { cn } from '@/lib/utils'
 
 const Progress = React.forwardRef<
   React.ElementRef<typeof ProgressPrimitive.Root>,
@@ -9,10 +24,7 @@ const Progress = React.forwardRef<
 >(({ className, value, ...props }, ref) => (
   <ProgressPrimitive.Root
     ref={ref}
-    className={cn(
-      "relative h-2 w-full overflow-hidden rounded-full bg-primary/20",
-      className
-    )}
+    className={cn('relative h-2 w-full overflow-hidden rounded-full bg-primary/20', className)}
     {...props}
   >
     <ProgressPrimitive.Indicator

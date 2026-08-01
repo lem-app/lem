@@ -13,8 +13,8 @@
 // or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 // Public License for more details.
 
-import { clsx, type ClassValue } from "clsx"
-import { twMerge } from "tailwind-merge"
+import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))

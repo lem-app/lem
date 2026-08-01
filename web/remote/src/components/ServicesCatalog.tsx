@@ -42,7 +42,12 @@ export function ServicesCatalog({
   const [searchQuery, setSearchQuery] = useState('')
 
   const { services, isLoading, error, refetch } = useServices({ proxyFetch })
-  const actions = useServiceActions({ proxyFetch, onSuccess: refetch })
+  const actions = useServiceActions({
+    proxyFetch,
+    onSuccess: () => {
+      void refetch()
+    },
+  })
 
   if (isLoading && services.length === 0) {
     return (
@@ -59,7 +64,10 @@ export function ServicesCatalog({
     )
   }
 
-  if (error) {
+  // Only replace the whole catalog when there is nothing to show. A transient
+  // poll failure (the list refreshes every 5s) used to blow away a fully
+  // populated grid; now it degrades to a banner over the last good data.
+  if (error && services.length === 0) {
     return (
       <Alert variant="destructive">
         <AlertCircle className="h-4 w-4" />
@@ -102,6 +110,22 @@ export function ServicesCatalog({
 
   return (
     <div className="space-y-6 p-4">
+      {error && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>
+            Could not refresh services: {error.message}. Showing the last known state.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {actions.error && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{actions.error.message}</AlertDescription>
+        </Alert>
+      )}
+
       {/* Header with filters */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-2xl font-semibold">
@@ -179,7 +203,7 @@ export function ServicesCatalog({
             }}
             onRemove={actions.removeService}
             onLaunch={service.has_ui ? onLaunchService : undefined}
-            isActionLoading={actions.isLoading}
+            isActionLoading={actions.isServicePending(service.id)}
           />
         ))}
       </div>

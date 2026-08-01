@@ -60,38 +60,36 @@ export function ServiceCard({
   const hasActiveJob = job && (job.status === 'pending' || job.status === 'running')
   const isDisabled = isActionLoading || !!hasActiveJob
 
-  const handleInstall = async () => {
-    try {
-      const result = await onInstall(service.id)
-      setActiveJobId(result.job_id)
-    } catch (err) {
-      console.error('Install failed:', err)
-    }
+  const handleInstall = (): void => {
+    onInstall(service.id)
+      .then((result) => {
+        setActiveJobId(result.job_id)
+      })
+      .catch((err: unknown) => {
+        console.error('Install failed:', err)
+      })
   }
 
-  const handleStart = async () => {
-    try {
-      await onStart(service.id)
-    } catch (err) {
+  const handleStart = (): void => {
+    onStart(service.id).catch((err: unknown) => {
       console.error('Start failed:', err)
-    }
+    })
   }
 
-  const handleStop = async () => {
-    try {
-      await onStop(service.id)
-    } catch (err) {
+  const handleStop = (): void => {
+    onStop(service.id).catch((err: unknown) => {
       console.error('Stop failed:', err)
-    }
+    })
   }
 
-  const handleRemove = async () => {
-    try {
-      const result = await onRemove(service.id)
-      setActiveJobId(result.job_id)
-    } catch (err) {
-      console.error('Remove failed:', err)
-    }
+  const handleRemove = (): void => {
+    onRemove(service.id)
+      .then((result) => {
+        setActiveJobId(result.job_id)
+      })
+      .catch((err: unknown) => {
+        console.error('Remove failed:', err)
+      })
   }
 
   const getStatusVariant = (

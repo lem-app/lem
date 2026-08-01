@@ -17,94 +17,94 @@
  * RemoteAccess component - manages remote access authentication and tunnel status.
  */
 
-import type { ReactElement } from 'react';
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import toast from 'react-hot-toast';
-import { getAuthStatus, getTunnelStatus, login, logout, register } from '../api/client';
-import type { LoginRequest, RegisterRequest } from '../api/types';
-import { cn } from '@/lib/utils';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Badge } from '@/components/ui/badge';
+import type { ReactElement } from 'react'
+import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import toast from 'react-hot-toast'
+import { getAuthStatus, getTunnelStatus, login, logout, register } from '../api/client'
+import type { LoginRequest, RegisterRequest } from '../api/types'
+import { cn } from '@/lib/utils'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Badge } from '@/components/ui/badge'
 
-type AuthMode = 'login' | 'signup';
+type AuthMode = 'login' | 'signup'
 
 export function RemoteAccess(): ReactElement {
-  const queryClient = useQueryClient();
-  const [showAuth, setShowAuth] = useState(false);
-  const [authMode, setAuthMode] = useState<AuthMode>('login');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const queryClient = useQueryClient()
+  const [showAuth, setShowAuth] = useState(false)
+  const [authMode, setAuthMode] = useState<AuthMode>('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
   const [signalingUrl, setSignalingUrl] = useState(
     import.meta.env.VITE_DEFAULT_SIGNALING_URL || 'http://localhost:8000'
-  );
+  )
 
   const { data: authStatus, isLoading: authLoading } = useQuery({
     queryKey: ['auth', 'status'],
     queryFn: getAuthStatus,
     refetchInterval: 5000,
-  });
+  })
 
   const { data: tunnelStatus } = useQuery({
     queryKey: ['tunnel', 'status'],
     queryFn: getTunnelStatus,
     refetchInterval: 5000,
     enabled: authStatus?.authenticated === true,
-  });
+  })
 
   const registerMutation = useMutation({
     mutationFn: (request: RegisterRequest) => register(request),
     onSuccess: (data) => {
-      toast.success(`Account created! Device: ${data.device_id}`);
-      queryClient.invalidateQueries({ queryKey: ['auth'] });
-      queryClient.invalidateQueries({ queryKey: ['tunnel'] });
-      setShowAuth(false);
-      setEmail('');
-      setPassword('');
+      toast.success(`Account created! Device: ${data.device_id}`)
+      void queryClient.invalidateQueries({ queryKey: ['auth'] })
+      void queryClient.invalidateQueries({ queryKey: ['tunnel'] })
+      setShowAuth(false)
+      setEmail('')
+      setPassword('')
     },
     onError: (error: Error) => {
-      toast.error(`Registration failed: ${error.message}`);
+      toast.error(`Registration failed: ${error.message}`)
     },
-  });
+  })
 
   const loginMutation = useMutation({
     mutationFn: (request: LoginRequest) => login(request),
     onSuccess: (data) => {
-      toast.success(`Logged in! Device: ${data.device_id}`);
-      queryClient.invalidateQueries({ queryKey: ['auth'] });
-      queryClient.invalidateQueries({ queryKey: ['tunnel'] });
-      setShowAuth(false);
-      setEmail('');
-      setPassword('');
+      toast.success(`Logged in! Device: ${data.device_id}`)
+      void queryClient.invalidateQueries({ queryKey: ['auth'] })
+      void queryClient.invalidateQueries({ queryKey: ['tunnel'] })
+      setShowAuth(false)
+      setEmail('')
+      setPassword('')
     },
     onError: (error: Error) => {
-      toast.error(`Login failed: ${error.message}`);
+      toast.error(`Login failed: ${error.message}`)
     },
-  });
+  })
 
   const logoutMutation = useMutation({
     mutationFn: logout,
     onSuccess: () => {
-      toast.success('Logged out');
-      queryClient.invalidateQueries({ queryKey: ['auth'] });
-      queryClient.invalidateQueries({ queryKey: ['tunnel'] });
+      toast.success('Logged out')
+      void queryClient.invalidateQueries({ queryKey: ['auth'] })
+      void queryClient.invalidateQueries({ queryKey: ['tunnel'] })
     },
     onError: (error: Error) => {
-      toast.error(`Logout failed: ${error.message}`);
+      toast.error(`Logout failed: ${error.message}`)
     },
-  });
+  })
 
   const handleSubmit = (e: React.FormEvent): void => {
-    e.preventDefault();
+    e.preventDefault()
     if (authMode === 'signup') {
-      registerMutation.mutate({ email, password, signaling_url: signalingUrl });
+      registerMutation.mutate({ email, password, signaling_url: signalingUrl })
     } else {
-      loginMutation.mutate({ email, password, signaling_url: signalingUrl });
+      loginMutation.mutate({ email, password, signaling_url: signalingUrl })
     }
-  };
+  }
 
   if (authLoading) {
     return (
@@ -116,11 +116,11 @@ export function RemoteAccess(): ReactElement {
           <p className="text-muted-foreground">Loading...</p>
         </CardContent>
       </Card>
-    );
+    )
   }
 
-  const isAuthenticated = authStatus?.authenticated === true;
-  const connectionStatus = tunnelStatus?.mode || authStatus?.tunnel_status || 'offline';
+  const isAuthenticated = authStatus?.authenticated === true
+  const connectionStatus = tunnelStatus?.mode || authStatus?.tunnel_status || 'offline'
 
   return (
     <Card>
@@ -128,7 +128,6 @@ export function RemoteAccess(): ReactElement {
         <CardTitle>Remote Access</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
-
         {!isAuthenticated ? (
           <div className="space-y-4">
             <div className="flex items-center gap-3">
@@ -140,8 +139,8 @@ export function RemoteAccess(): ReactElement {
               <div className="flex gap-3">
                 <Button
                   onClick={() => {
-                    setAuthMode('login');
-                    setShowAuth(true);
+                    setAuthMode('login')
+                    setShowAuth(true)
                   }}
                 >
                   Login
@@ -149,8 +148,8 @@ export function RemoteAccess(): ReactElement {
                 <Button
                   variant="outline"
                   onClick={() => {
-                    setAuthMode('signup');
-                    setShowAuth(true);
+                    setAuthMode('signup')
+                    setShowAuth(true)
                   }}
                 >
                   Sign Up
@@ -163,10 +162,10 @@ export function RemoteAccess(): ReactElement {
                     type="button"
                     onClick={() => setAuthMode('login')}
                     className={cn(
-                      "flex-1 py-1.5 px-3 text-sm font-medium rounded transition-colors",
+                      'flex-1 py-1.5 px-3 text-sm font-medium rounded transition-colors',
                       authMode === 'login'
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground"
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
                     )}
                   >
                     Login
@@ -175,10 +174,10 @@ export function RemoteAccess(): ReactElement {
                     type="button"
                     onClick={() => setAuthMode('signup')}
                     className={cn(
-                      "flex-1 py-1.5 px-3 text-sm font-medium rounded transition-colors",
+                      'flex-1 py-1.5 px-3 text-sm font-medium rounded transition-colors',
                       authMode === 'signup'
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground"
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
                     )}
                   >
                     Sign Up
@@ -227,17 +226,20 @@ export function RemoteAccess(): ReactElement {
                     disabled={loginMutation.isPending || registerMutation.isPending}
                   >
                     {authMode === 'signup'
-                      ? (registerMutation.isPending ? 'Creating account...' : 'Sign Up')
-                      : (loginMutation.isPending ? 'Logging in...' : 'Login')
-                    }
+                      ? registerMutation.isPending
+                        ? 'Creating account...'
+                        : 'Sign Up'
+                      : loginMutation.isPending
+                        ? 'Logging in...'
+                        : 'Login'}
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
                     onClick={() => {
-                      setShowAuth(false);
-                      setEmail('');
-                      setPassword('');
+                      setShowAuth(false)
+                      setEmail('')
+                      setPassword('')
                     }}
                   >
                     Cancel
@@ -250,13 +252,15 @@ export function RemoteAccess(): ReactElement {
           <div className="space-y-6">
             <div className="space-y-4">
               <div className="flex items-center gap-3">
-                <div className={cn(
-                  "h-3 w-3 rounded-full",
-                  connectionStatus === 'connected' && "bg-green-500",
-                  connectionStatus === 'connecting' && "bg-primary animate-pulse",
-                  connectionStatus === 'offline' && "bg-muted-foreground",
-                  connectionStatus === 'failed' && "bg-destructive"
-                )} />
+                <div
+                  className={cn(
+                    'h-3 w-3 rounded-full',
+                    connectionStatus === 'connected' && 'bg-green-500',
+                    connectionStatus === 'connecting' && 'bg-primary animate-pulse',
+                    connectionStatus === 'offline' && 'bg-muted-foreground',
+                    connectionStatus === 'failed' && 'bg-destructive'
+                  )}
+                />
                 <span className="text-sm">
                   {connectionStatus === 'connected' && 'Connected'}
                   {connectionStatus === 'connecting' && 'Connecting...'}
@@ -296,5 +300,5 @@ export function RemoteAccess(): ReactElement {
         )}
       </CardContent>
     </Card>
-  );
+  )
 }

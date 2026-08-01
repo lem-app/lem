@@ -18,9 +18,58 @@
  *
  * Provides automatic fallback when WebRTC P2P/TURN connections fail.
  * Uses the same HTTP framing protocol as the DataChannel implementation.
+ *
+ * ## Authentication handshake
+ *
+ * `cloud/relay/app/api/relay.py` accepts the socket, then waits for a first
+ * text message `{"type": "auth", "token": "..."}`. On success it sends
+ * **nothing** and simply starts forwarding; on failure it sends
+ * `{"type": "error", "message": "..."}` and closes with 1008
+ * (`WS_1008_POLICY_VIOLATION`).
+ *
+ * There is therefore no positive acknowledgement to wait for today. Reporting
+ * `connected` straight out of `onopen` (what this client used to do) painted
+ * the UI green for an expired JWT and then looped reconnecting forever with no
+ * visible error. Until the relay grows an explicit ack, this client:
+ *
+ * 1. stays in `connecting` after sending auth,
+ * 2. treats an explicit `{"type": "error"}` control frame or a 1008 close as a
+ *    **permanent** auth failure - surfaced to the caller, reconnection stopped,
+ * 3. treats an explicit `{"type": "connected"}` / `{"type": "auth-ok"}` control
+ *    frame, or the first binary frame, as proof the tunnel is live (so we adopt
+ *    a real ack automatically once the server sends one),
+ * 4. otherwise reports `connected` after {@link AUTH_GRACE_MS} of silence,
+ *    which is the honest best available signal.
+ *
+ * Reconnection is also bounded: an endless invisible retry loop is worse than a
+ * visible error.
  */
 
 import type { ConnectionState } from '../api/types'
+
+/**
+ * Raised when the relay rejects our credentials. Reconnecting will not help.
+ */
+export class RelayAuthError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RelayAuthError'
+  }
+}
+
+/**
+ * How long to wait after sending auth before assuming the relay accepted it.
+ * The relay's own auth read has a 10s timeout, but rejection is immediate, so a
+ * short window is enough to catch it.
+ */
+const AUTH_GRACE_MS = 750
+
+const INITIAL_RECONNECT_DELAY_MS = 2000
+const MAX_RECONNECT_DELAY_MS = 60000
+const MAX_RECONNECT_ATTEMPTS = 5
+
+/** WebSocket close code the relay uses to reject bad credentials. */
+const WS_POLICY_VIOLATION = 1008
 
 /**
  * Relay client configuration.
@@ -32,6 +81,11 @@ export interface RelayClientConfig {
   onStateChange?: (state: ConnectionState) => void
   onMessage?: (message: ArrayBuffer) => void
   onError?: (error: Error) => void
+}
+
+interface RelayControlMessage {
+  type?: unknown
+  message?: unknown
 }
 
 /**
@@ -55,8 +109,9 @@ export class RelayClient {
 
   // Reconnection
   private shouldReconnect = true
-  private reconnectDelay = 2000
-  private maxReconnectDelay = 60000
+  private reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+  private reconnectTimer: number | null = null
+  private reconnectAttempts = 0
 
   constructor(config: RelayClientConfig) {
     this.relayUrl = config.relayUrl
@@ -71,6 +126,8 @@ export class RelayClient {
    * Connect to relay server via WebSocket.
    */
   async connect(): Promise<void> {
+    this.shouldReconnect = true
+    this.cancelReconnect()
     this.setState('connecting')
 
     try {
@@ -88,11 +145,10 @@ export class RelayClient {
    */
   disconnect(): void {
     this.shouldReconnect = false
-
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
-    }
+    this.cancelReconnect()
+    this.closeSocket()
+    this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+    this.reconnectAttempts = 0
 
     this.setState('disconnected')
     console.log('[RelayClient] Disconnected')
@@ -147,46 +203,140 @@ export class RelayClient {
   /**
    * Connect to relay server.
    */
-  private async connectRelay(): Promise<void> {
+  private connectRelay(): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Connect without token in URL (more secure)
       const wsUrl = `${this.relayUrl}/relay/${this.sessionId}`
 
       console.log(`[RelayClient] Connecting to relay server: ${wsUrl}`)
 
-      this.ws = new WebSocket(wsUrl)
-      this.ws.binaryType = 'arraybuffer'
+      this.closeSocket()
 
-      this.ws.onopen = () => {
-        console.log('[RelayClient] Connected, sending auth message')
-        // Send auth message instead of passing token in URL
-        if (this.ws) {
-          this.ws.send(JSON.stringify({ type: 'auth', token: this.token }))
+      const ws = new WebSocket(wsUrl)
+      ws.binaryType = 'arraybuffer'
+      this.ws = ws
+
+      let settled = false
+      let graceTimer: number | null = null
+
+      const clearGrace = () => {
+        if (graceTimer !== null) {
+          clearTimeout(graceTimer)
+          graceTimer = null
         }
+      }
+
+      /** The relay accepted us (explicitly, or by staying silent). */
+      const markConnected = () => {
+        clearGrace()
+        if (settled || this.ws !== ws) return
+        settled = true
+        this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+        this.reconnectAttempts = 0
         this.setState('connected')
         resolve()
       }
 
-      this.ws.onerror = (event) => {
-        console.error('[RelayClient] WebSocket error:', event)
-        reject(new Error('WebSocket connection failed'))
-      }
-
-      this.ws.onclose = () => {
-        console.log('[RelayClient] WebSocket closed')
-        this.setState('closed')
-        this.handleReconnect()
-      }
-
-      this.ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          console.log(`[RelayClient] Binary message received: ${event.data.byteLength} bytes`)
-          this.onMessage?.(event.data)
-        } else {
-          console.warn('[RelayClient] Received non-binary message:', event.data)
+      /** The relay rejected us, or the socket died. */
+      const markFailed = (error: Error, permanent: boolean) => {
+        clearGrace()
+        if (permanent) {
+          this.shouldReconnect = false
+          this.cancelReconnect()
         }
+        if (settled) {
+          // Already resolved: report out-of-band so the UI stops showing green.
+          this.setState('failed')
+          this.onError?.(error)
+          return
+        }
+        settled = true
+        reject(error)
+      }
+
+      ws.onopen = () => {
+        console.log('[RelayClient] Socket open, sending auth message')
+        ws.send(JSON.stringify({ type: 'auth', token: this.token }))
+        graceTimer = window.setTimeout(markConnected, AUTH_GRACE_MS)
+      }
+
+      ws.onerror = (event) => {
+        console.error('[RelayClient] WebSocket error:', event)
+        markFailed(new Error('Relay WebSocket connection failed'), false)
+      }
+
+      ws.onclose = (event) => {
+        clearGrace()
+        console.log(`[RelayClient] WebSocket closed (code ${event.code})`)
+
+        if (this.ws !== ws) return
+        this.ws = null
+
+        const authFailure = event.code === WS_POLICY_VIOLATION
+        const error = authFailure
+          ? new RelayAuthError(
+              event.reason ||
+                'Relay rejected the session token (it may have expired). Sign in again.'
+            )
+          : new Error(`Relay connection closed (code ${event.code})`)
+
+        markFailed(error, authFailure)
+        this.setState(authFailure ? 'failed' : 'closed')
+        this.scheduleReconnect()
+      }
+
+      ws.onmessage = (event) => {
+        const data: unknown = event.data
+
+        if (data instanceof ArrayBuffer) {
+          // A frame came back, so the session is genuinely live.
+          markConnected()
+          console.log(`[RelayClient] Binary message received: ${data.byteLength} bytes`)
+          this.onMessage?.(data)
+          return
+        }
+
+        if (typeof data === 'string') {
+          this.handleControlMessage(data, markConnected, markFailed)
+          return
+        }
+
+        console.warn('[RelayClient] Received unsupported message type')
       }
     })
+  }
+
+  /**
+   * Handle a JSON control frame from the relay (auth errors, and any explicit
+   * acknowledgement a future relay version adds).
+   */
+  private handleControlMessage(
+    raw: string,
+    markConnected: () => void,
+    markFailed: (error: Error, permanent: boolean) => void
+  ): void {
+    let parsed: RelayControlMessage
+    try {
+      parsed = JSON.parse(raw) as RelayControlMessage
+    } catch {
+      console.warn('[RelayClient] Ignoring non-JSON text frame')
+      return
+    }
+
+    const type = typeof parsed.type === 'string' ? parsed.type : ''
+    const message = typeof parsed.message === 'string' ? parsed.message : ''
+
+    if (type === 'error') {
+      markFailed(new RelayAuthError(message || 'Relay rejected the connection'), true)
+      return
+    }
+
+    if (type === 'connected' || type === 'auth-ok') {
+      console.log('[RelayClient] Relay acknowledged auth')
+      markConnected()
+      return
+    }
+
+    console.warn('[RelayClient] Unknown control message type:', type)
   }
 
   /**
@@ -202,27 +352,70 @@ export class RelayClient {
   }
 
   /**
-   * Handle reconnection with exponential backoff.
+   * Handle reconnection with exponential backoff and a hard attempt cap.
    */
-  private handleReconnect(): void {
-    if (!this.shouldReconnect) {
+  private scheduleReconnect(): void {
+    if (!this.shouldReconnect || this.reconnectTimer !== null) {
       return
     }
 
-    console.log(`[RelayClient] Attempting reconnect in ${this.reconnectDelay}ms...`)
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.shouldReconnect = false
+      const error = new Error(
+        `Relay connection lost after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts`
+      )
+      console.error(`[RelayClient] ${error.message}`)
+      this.setState('failed')
+      this.onError?.(error)
+      return
+    }
 
-    setTimeout(async () => {
-      try {
-        await this.connect()
+    this.reconnectAttempts += 1
+    const delay = this.reconnectDelay
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY_MS)
 
-        // Reset delay on successful reconnect
-        this.reconnectDelay = 2000
-      } catch (error) {
-        console.error('[RelayClient] Reconnect failed:', error)
+    console.log(
+      `[RelayClient] Attempting reconnect ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`
+    )
+
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
+
+      // Re-check at fire time: disconnect() between scheduling and firing must win.
+      if (!this.shouldReconnect) {
+        console.log('[RelayClient] Reconnect cancelled')
+        return
       }
-    }, this.reconnectDelay)
 
-    // Exponential backoff
-    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay)
+      this.connect().catch((error: unknown) => {
+        console.error('[RelayClient] Reconnect failed:', error)
+      })
+    }, delay)
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  /**
+   * Close the socket and detach handlers so a stale socket can never drive
+   * state changes or reconnection.
+   */
+  private closeSocket(): void {
+    const ws = this.ws
+    if (!ws) return
+
+    this.ws = null
+    ws.onopen = null
+    ws.onmessage = null
+    ws.onerror = null
+    ws.onclose = null
+
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close()
+    }
   }
 }

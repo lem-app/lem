@@ -158,7 +158,11 @@ async function getRunner(id) {
 
 **Config**: `tsconfig.json` → `"strict": true`
 
-**Check**: `pnpm tsc --noEmit`
+**Check**: `pnpm exec tsc -b --noEmit`
+
+> ⚠️ Both web apps use a **solution-style** `tsconfig.json` (`"files": []` plus
+> `references`). Plain `tsc --noEmit` type-checks **zero files** there and always
+> exits 0. Always use `tsc -b` (or `pnpm run type-check`).
 
 ---
 
@@ -363,9 +367,11 @@ uv run ruff check server/        # Lint
 # TypeScript (web/local/ or web/remote/)
 pnpm install                     # Install deps
 pnpm add react                   # Add dependency
-pnpm run dev                     # Dev server (local: 5174, remote: 5173)
-pnpm test                        # Run tests (vitest, remote only)
-pnpm tsc --noEmit                # Type check
+pnpm run dev                     # Dev server, loopback (local: 5174, remote: 5173)
+pnpm run dev:lan                 # Dev server bound to the LAN (opt-in)
+pnpm test                        # Run tests once (vitest run)
+pnpm run test:watch              # Run tests in watch mode
+pnpm exec tsc -b --noEmit        # Type check (NOT `tsc --noEmit` - see above)
 pnpm prettier --write .          # Format
 pnpm eslint .                    # Lint
 ```

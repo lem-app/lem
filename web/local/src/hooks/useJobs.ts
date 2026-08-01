@@ -14,48 +14,46 @@
 // Public License for more details.
 
 // Hook for job tracking
-import { useQuery } from "@tanstack/react-query";
-import { getJobs, getJob } from "../api/client";
+import { useQuery } from '@tanstack/react-query'
+import { getJobs, getJob } from '../api/client'
 
 // Poll faster during active jobs
-const FAST_POLL_INTERVAL = 1000; // 1 second
-const SLOW_POLL_INTERVAL = 10000; // 10 seconds
+const FAST_POLL_INTERVAL = 1000 // 1 second
+const SLOW_POLL_INTERVAL = 10000 // 10 seconds
 
 export function useJobs(serviceId?: string) {
   return useQuery({
-    queryKey: ["jobs", serviceId],
+    queryKey: ['jobs', serviceId],
     queryFn: () => getJobs(serviceId),
     refetchInterval: SLOW_POLL_INTERVAL,
     refetchIntervalInBackground: false,
-  });
+  })
 }
 
 export function useJob(jobId: string | null) {
   return useQuery({
-    queryKey: ["job", jobId],
-    queryFn: () => (jobId ? getJob(jobId) : Promise.reject("No job ID")),
+    queryKey: ['job', jobId],
+    queryFn: () => (jobId ? getJob(jobId) : Promise.reject(new Error('No job ID'))),
     enabled: !!jobId,
     refetchInterval: (query) => {
       // Poll faster while job is running
-      const job = query.state.data;
-      if (job && (job.status === "pending" || job.status === "running")) {
-        return FAST_POLL_INTERVAL;
+      const job = query.state.data
+      if (job && (job.status === 'pending' || job.status === 'running')) {
+        return FAST_POLL_INTERVAL
       }
-      return false; // Stop polling when job is complete
+      return false // Stop polling when job is complete
     },
-  });
+  })
 }
 
 export function useActiveJobs() {
-  const { data: jobs } = useJobs();
+  const { data: jobs } = useJobs()
 
   // Filter to only active (pending/running) jobs
-  const activeJobs = jobs?.filter(
-    (job) => job.status === "pending" || job.status === "running",
-  );
+  const activeJobs = jobs?.filter((job) => job.status === 'pending' || job.status === 'running')
 
   return {
     activeJobs: activeJobs ?? [],
     hasActiveJobs: (activeJobs?.length ?? 0) > 0,
-  };
+  }
 }

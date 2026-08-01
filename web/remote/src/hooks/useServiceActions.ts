@@ -15,132 +15,101 @@
 
 /**
  * Hook for service operations (install/start/stop/remove) via proxyFetch.
+ *
+ * Pending state is tracked *per service*. A single shared `isLoading` disabled
+ * every card in the catalog while one service was starting, which the local
+ * dashboard already avoided.
  */
 
 import { useState, useCallback } from 'react'
 import type { JobResponse, StatusResponse } from '../api/types'
-
-const LOCAL_API = 'http://localhost:5142'
+import { localApiUrl } from '../lib/env'
 
 interface UseServiceActionsOptions {
   proxyFetch: (url: string, init?: RequestInit) => Promise<Response>
   onSuccess?: () => void
 }
 
-interface ServiceActionState {
-  isLoading: boolean
-  error: Error | null
+interface ErrorBody {
+  detail?: unknown
+}
+
+async function readErrorDetail(response: Response, fallback: string): Promise<string> {
+  try {
+    const body = (await response.json()) as ErrorBody
+    return typeof body.detail === 'string' && body.detail.length > 0 ? body.detail : fallback
+  } catch {
+    return fallback
+  }
 }
 
 export function useServiceActions(options: UseServiceActionsOptions) {
   const { proxyFetch, onSuccess } = options
-  const [state, setState] = useState<ServiceActionState>({
-    isLoading: false,
-    error: null,
-  })
+  const [pendingServices, setPendingServices] = useState<ReadonlySet<string>>(new Set())
+  const [error, setError] = useState<Error | null>(null)
 
-  const installService = useCallback(
-    async (serviceId: string): Promise<JobResponse> => {
-      setState({ isLoading: true, error: null })
+  const run = useCallback(
+    async <T>(serviceId: string, action: string, label: string): Promise<T> => {
+      setPendingServices((prev) => new Set(prev).add(serviceId))
+      setError(null)
+
       try {
-        const response = await proxyFetch(`${LOCAL_API}/v1/services/${serviceId}/install`, {
+        const response = await proxyFetch(localApiUrl(`/v1/services/${serviceId}/${action}`), {
           method: 'POST',
         })
+
         if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          throw new Error(errorData.detail || `Install failed: ${response.status}`)
+          throw new Error(
+            await readErrorDetail(response, `${label} failed: ${response.status.toString()}`)
+          )
         }
-        const result = (await response.json()) as JobResponse
+
+        const result = (await response.json()) as T
         onSuccess?.()
         return result
       } catch (err) {
-        const error = err instanceof Error ? err : new Error('Unknown error')
-        setState({ isLoading: false, error })
-        throw error
+        const actionError = err instanceof Error ? err : new Error(`${label} failed`)
+        setError(actionError)
+        throw actionError
       } finally {
-        setState((s) => ({ ...s, isLoading: false }))
+        setPendingServices((prev) => {
+          const next = new Set(prev)
+          next.delete(serviceId)
+          return next
+        })
       }
     },
     [proxyFetch, onSuccess]
+  )
+
+  const installService = useCallback(
+    (serviceId: string) => run<JobResponse>(serviceId, 'install', 'Install'),
+    [run]
   )
 
   const startService = useCallback(
-    async (serviceId: string): Promise<StatusResponse> => {
-      setState({ isLoading: true, error: null })
-      try {
-        const response = await proxyFetch(`${LOCAL_API}/v1/services/${serviceId}/start`, {
-          method: 'POST',
-        })
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          throw new Error(errorData.detail || `Start failed: ${response.status}`)
-        }
-        const result = (await response.json()) as StatusResponse
-        onSuccess?.()
-        return result
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error('Unknown error')
-        setState({ isLoading: false, error })
-        throw error
-      } finally {
-        setState((s) => ({ ...s, isLoading: false }))
-      }
-    },
-    [proxyFetch, onSuccess]
+    (serviceId: string) => run<StatusResponse>(serviceId, 'start', 'Start'),
+    [run]
   )
 
   const stopService = useCallback(
-    async (serviceId: string): Promise<StatusResponse> => {
-      setState({ isLoading: true, error: null })
-      try {
-        const response = await proxyFetch(`${LOCAL_API}/v1/services/${serviceId}/stop`, {
-          method: 'POST',
-        })
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          throw new Error(errorData.detail || `Stop failed: ${response.status}`)
-        }
-        const result = (await response.json()) as StatusResponse
-        onSuccess?.()
-        return result
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error('Unknown error')
-        setState({ isLoading: false, error })
-        throw error
-      } finally {
-        setState((s) => ({ ...s, isLoading: false }))
-      }
-    },
-    [proxyFetch, onSuccess]
+    (serviceId: string) => run<StatusResponse>(serviceId, 'stop', 'Stop'),
+    [run]
   )
 
   const removeService = useCallback(
-    async (serviceId: string): Promise<JobResponse> => {
-      setState({ isLoading: true, error: null })
-      try {
-        const response = await proxyFetch(`${LOCAL_API}/v1/services/${serviceId}/remove`, {
-          method: 'POST',
-        })
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          throw new Error(errorData.detail || `Remove failed: ${response.status}`)
-        }
-        const result = (await response.json()) as JobResponse
-        onSuccess?.()
-        return result
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error('Unknown error')
-        setState({ isLoading: false, error })
-        throw error
-      } finally {
-        setState((s) => ({ ...s, isLoading: false }))
-      }
-    },
-    [proxyFetch, onSuccess]
+    (serviceId: string) => run<JobResponse>(serviceId, 'remove', 'Remove'),
+    [run]
+  )
+
+  const isServicePending = useCallback(
+    (serviceId: string) => pendingServices.has(serviceId),
+    [pendingServices]
   )
 
   return {
-    ...state,
+    error,
+    isServicePending,
     installService,
     startService,
     stopService,

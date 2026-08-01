@@ -32,7 +32,7 @@ interface UseWebRTCOptions {
   deviceId: string
   targetDeviceId: string
   autoConnect?: boolean
-  relayUrl?: string
+  relayUrl: string
   iceServers?: RTCIceServer[]
 }
 
@@ -40,6 +40,17 @@ interface UseWebRTCOptions {
  * Connection mode: WebRTC P2P or Relay fallback.
  */
 export type ConnectionMode = 'webrtc' | 'relay'
+
+/**
+ * How many WebRTC failures to tolerate before switching to the relay.
+ *
+ * One. The manager's own 10s connection timeout is already the "give WebRTC a
+ * fair chance" budget, and it retries with backoff on its own; waiting for a
+ * second reported failure pushed relay fallback past a minute.
+ */
+const WEBRTC_FAILURE_THRESHOLD = 1
+
+const DATA_CHANNEL_POLL_MS = 500
 
 /**
  * Generate a session ID for relay connection.
@@ -64,27 +75,55 @@ export function useWebRTC(options: UseWebRTCOptions) {
   const httpProxyRef = useRef<HTTPProxy | null>(null)
   const wsProxyManagerRef = useRef<WSProxyManager | null>(null)
   const pollingIntervalRef = useRef<number | null>(null)
-  const interceptSetupRef = useRef<boolean>(false)
   const webrtcFailureCountRef = useRef<number>(0)
   const isRelayFallbackRef = useRef<boolean>(false)
   const fallbackToRelayRef = useRef<(() => Promise<void>) | null>(null)
 
-  // Setup WebSocket interception ONCE on mount (not tied to WebRTC manager lifecycle)
-  // This prevents React Strict Mode from tearing down and re-setting up interception
-  useEffect(() => {
-    if (interceptSetupRef.current) {
-      return // Already set up
+  /**
+   * Tear every transport down and put the hook back in its initial shape.
+   *
+   * `disconnect()` used to close only the WebRTC manager. On the relay path the
+   * relay socket stayed open, `RelayClient` kept reconnecting it, and frames
+   * carried on flowing after the UI said "disconnected". The transport-mode
+   * bookkeeping was never reset either, so the next connection was mislabelled
+   * and the 500ms poller read the wrong transport.
+   */
+  const teardown = useCallback(() => {
+    if (relayClientRef.current) {
+      relayClientRef.current.disconnect()
+      relayClientRef.current = null
     }
 
-    console.log('[useWebRTC] Setting up WebSocket interception (one-time)')
-    interceptSetupRef.current = true
+    managerRef.current?.disconnect()
 
+    // Fail anything still waiting on the tunnel rather than leaking resolvers.
+    httpProxyRef.current?.clearPending()
+
+    wsProxyManagerRef.current?.closeAll()
+
+    // Point the proxies back at the WebRTC transport for the next attempt.
+    if (managerRef.current) {
+      const webrtcTransport = new WebRTCTransport(managerRef.current)
+      httpProxyRef.current?.setTransport(webrtcTransport)
+      wsProxyManagerRef.current?.updateTransport(webrtcTransport)
+    }
+
+    connectionModeRef.current = 'webrtc'
+    isRelayFallbackRef.current = false
+    webrtcFailureCountRef.current = 0
+    setConnectionMode('webrtc')
+    setDataChannelState('none')
+  }, [])
+
+  // Tear WebSocket interception down when the component unmounts. Setup happens
+  // alongside the proxy manager below (this effect used to claim it set up
+  // interception but never called setupWebSocketIntercept).
+  useEffect(() => {
     return () => {
       console.log('[useWebRTC] Tearing down WebSocket interception (component unmount)')
       teardownWebSocketIntercept()
-      interceptSetupRef.current = false
     }
-  }, []) // Empty deps - run once on mount
+  }, [])
 
   // Initialize WebRTC manager
   useEffect(() => {
@@ -98,82 +137,74 @@ export function useWebRTC(options: UseWebRTCOptions) {
       deviceId: options.deviceId,
       targetDeviceId: options.targetDeviceId,
       iceServers: options.iceServers,
-      onStateChange: (state) => {
-        setConnectionState(state)
+      onStateChange: setConnectionState,
+      onConnectionFailed: () => {
+        // Every failure is reported here, undeduplicated - unlike onStateChange,
+        // which suppresses failed→failed and so never reached the threshold.
+        if (isRelayFallbackRef.current) return
 
-        // Handle WebRTC failure - fall back to relay after 2 attempts (faster fallback)
-        if (state === 'failed' && !isRelayFallbackRef.current) {
-          webrtcFailureCountRef.current++
-          console.log(`[useWebRTC] WebRTC failure count: ${webrtcFailureCountRef.current}`)
+        webrtcFailureCountRef.current += 1
+        console.log(`[useWebRTC] WebRTC failure count: ${webrtcFailureCountRef.current}`)
 
-          if (webrtcFailureCountRef.current >= 2) {
-            console.log('[useWebRTC] WebRTC failed 2 times, falling back to relay')
-            isRelayFallbackRef.current = true
+        if (webrtcFailureCountRef.current < WEBRTC_FAILURE_THRESHOLD) return
 
-            // Stop WebRTC reconnection but keep signaling WebSocket open
-            // We need it to send connect-request messages
-            if (managerRef.current) {
-              managerRef.current.stopReconnection()
-            }
+        console.log('[useWebRTC] Falling back to relay')
+        isRelayFallbackRef.current = true
 
-            fallbackToRelay()
-          }
-        }
+        // Stop WebRTC reconnection but keep the signaling WebSocket open -
+        // we still need it to send connect-request messages.
+        managerRef.current?.stopReconnection()
+
+        void fallbackToRelayRef.current?.()
       },
       onDataChannelMessage: (message) => {
         // Handle binary messages - route by frame type
         if (message instanceof ArrayBuffer) {
-          // Read frame type (first byte)
-          const view = new DataView(message)
-          const frameType = view.getUint8(0)
-
-          if (frameType === FrameType.HTTP_RESPONSE) {
-            // HTTP response - route to HTTP proxy
-            httpProxyRef.current?.handleResponse(message)
-          } else if (frameType === FrameType.WS_DATA) {
-            // WebSocket data - route to WS proxy manager
-            wsProxyManagerRef.current?.handleDataFrame(message)
-          } else if (frameType === FrameType.WS_CLOSE) {
-            // WebSocket close - route to WS proxy manager
-            wsProxyManagerRef.current?.handleCloseFrame(message)
-          } else {
-            console.warn(`[useWebRTC] Unknown frame type: 0x${frameType.toString(16)}`)
-          }
+          routeBinaryFrame(message)
         } else {
           // Text messages go to messages state
           setMessages((prev) => [...prev, message])
         }
       },
-      onError: (err) => {
-        setError(err)
-      },
+      onError: setError,
     })
 
     managerRef.current = manager
 
-    // Create HTTP proxy instance with WebRTC transport
+    // Create HTTP proxy and WebSocket proxy manager over the WebRTC transport
     const webrtcTransport = new WebRTCTransport(manager)
-    httpProxyRef.current = new HTTPProxy(webrtcTransport)
+    const httpProxy = new HTTPProxy(webrtcTransport)
+    const wsProxyManager = new WSProxyManager(webrtcTransport)
+    httpProxyRef.current = httpProxy
+    wsProxyManagerRef.current = wsProxyManager
 
-    // Create WebSocket proxy manager
-    wsProxyManagerRef.current = new WSProxyManager(manager)
+    function routeBinaryFrame(message: ArrayBuffer): void {
+      const frameType = new DataView(message).getUint8(0)
 
-    // Update WebSocket interception with new proxy manager
-    // (interception is already set up, just update the manager reference)
-    setupWebSocketIntercept(wsProxyManagerRef.current)
+      if (frameType === FrameType.HTTP_RESPONSE) {
+        httpProxy.handleResponse(message)
+      } else if (frameType === FrameType.WS_DATA) {
+        wsProxyManager.handleDataFrame(message)
+      } else if (frameType === FrameType.WS_CLOSE) {
+        wsProxyManager.handleCloseFrame(message)
+      } else {
+        console.warn(`[useWebRTC] Unknown frame type: 0x${frameType.toString(16)}`)
+      }
+    }
+
+    // Install (or re-point) WebSocket interception for this proxy manager
+    setupWebSocketIntercept(wsProxyManager)
 
     // Poll for DataChannel state changes
     pollingIntervalRef.current = window.setInterval(() => {
-      // Check relay client state if in relay mode, otherwise check WebRTC
-      // Use ref to avoid closure issues
+      // Check relay client state if in relay mode, otherwise check WebRTC.
+      // Uses refs to avoid closure issues.
       if (relayClientRef.current && connectionModeRef.current === 'relay') {
-        const state = relayClientRef.current.getDataChannelState()
-        setDataChannelState(state)
+        setDataChannelState(relayClientRef.current.getDataChannelState())
       } else if (managerRef.current) {
-        const state = managerRef.current.getDataChannelState()
-        setDataChannelState(state)
+        setDataChannelState(managerRef.current.getDataChannelState())
       }
-    }, 500)
+    }, DATA_CHANNEL_POLL_MS)
 
     // Fallback to relay function
     const fallbackToRelay = async () => {
@@ -181,15 +212,14 @@ export function useWebRTC(options: UseWebRTCOptions) {
       setConnectionMode('relay')
       connectionModeRef.current = 'relay'
 
-      const relayUrl = options.relayUrl || 'ws://localhost:8001'
       const sessionId = generateSessionId(options.deviceId, options.targetDeviceId)
 
       try {
         // Send connect-request with relay preference
         console.log('[useWebRTC] Sending connect-request for relay mode')
-        const ack = await managerRef.current?.sendConnectRequest('relay', sessionId)
+        const ack = await manager.sendConnectRequest('relay', sessionId)
 
-        if (!ack || ack.status === 'failed') {
+        if (ack.status === 'failed') {
           throw new Error('Server rejected relay connection request')
         }
 
@@ -197,32 +227,12 @@ export function useWebRTC(options: UseWebRTCOptions) {
 
         // Server has confirmed relay mode, now connect to relay
         const relayClient = new RelayClient({
-          relayUrl,
+          relayUrl: options.relayUrl,
           sessionId,
           token: options.token,
-          onStateChange: (state) => {
-            setConnectionState(state)
-          },
-          onMessage: (message) => {
-            // Handle binary messages - route by frame type (same as WebRTC)
-            if (message instanceof ArrayBuffer) {
-              const view = new DataView(message)
-              const frameType = view.getUint8(0)
-
-              if (frameType === FrameType.HTTP_RESPONSE) {
-                httpProxyRef.current?.handleResponse(message)
-              } else if (frameType === FrameType.WS_DATA) {
-                wsProxyManagerRef.current?.handleDataFrame(message)
-              } else if (frameType === FrameType.WS_CLOSE) {
-                wsProxyManagerRef.current?.handleCloseFrame(message)
-              } else {
-                console.warn(`[useWebRTC] Unknown frame type: 0x${frameType.toString(16)}`)
-              }
-            }
-          },
-          onError: (err) => {
-            setError(err)
-          },
+          onStateChange: setConnectionState,
+          onMessage: routeBinaryFrame,
+          onError: setError,
         })
 
         relayClientRef.current = relayClient
@@ -231,17 +241,10 @@ export function useWebRTC(options: UseWebRTCOptions) {
         await relayClient.connect()
         console.log('[useWebRTC] Successfully connected via relay')
 
-        // Now that relay is connected, switch HTTP proxy to use relay transport
-        if (httpProxyRef.current) {
-          const relayTransport = new RelayTransport(relayClient)
-          httpProxyRef.current.setTransport(relayTransport)
-        }
-
-        // Update WebSocket proxy manager to use relay client
-        // Do this AFTER connecting so WebSocket connections work immediately
-        if (wsProxyManagerRef.current) {
-          wsProxyManagerRef.current.updateConnectionManager(relayClient)
-        }
+        // Now that relay is connected, switch both proxies to the relay transport
+        const relayTransport = new RelayTransport(relayClient)
+        httpProxy.setTransport(relayTransport)
+        wsProxyManager.updateTransport(relayTransport)
 
         // Clear any previous WebRTC errors since relay connected successfully
         setError(null)
@@ -251,66 +254,68 @@ export function useWebRTC(options: UseWebRTCOptions) {
       }
     }
 
-    // Store fallback function in ref so it's accessible from connect callback
+    // Store fallback function in ref so it's accessible from the failure callback
     fallbackToRelayRef.current = fallbackToRelay
 
     return () => {
       if (pollingIntervalRef.current !== null) {
         clearInterval(pollingIntervalRef.current)
+        pollingIntervalRef.current = null
       }
-      // Clean up WebSocket connections (but NOT interception - that stays active)
-      if (wsProxyManagerRef.current) {
-        wsProxyManagerRef.current.closeAll()
-      }
-      if (managerRef.current) {
-        managerRef.current.disconnect()
-      }
-      if (relayClientRef.current) {
-        relayClientRef.current.disconnect()
-      }
+      fallbackToRelayRef.current = null
+      // Clean up connections (but NOT interception - that stays active)
+      teardown()
     }
-  }, [options.signalUrl, options.token, options.deviceId, options.targetDeviceId, options.relayUrl, options.iceServers])
+  }, [
+    options.signalUrl,
+    options.token,
+    options.deviceId,
+    options.targetDeviceId,
+    options.relayUrl,
+    options.iceServers,
+    teardown,
+  ])
 
-  // Auto-connect if enabled
-  useEffect(() => {
-    if (options.autoConnect && managerRef.current && connectionState === 'disconnected') {
-      managerRef.current.connect().catch((err) => {
-        console.error('[useWebRTC] Auto-connect failed:', err)
-      })
-    }
-  }, [options.autoConnect, connectionState])
-
-  const connect = useCallback(async () => {
-    if (!managerRef.current) {
-      throw new Error('WebRTC manager not initialized')
-    }
-    setError(null)
-
-    // Check if WebRTC is available upfront
-    if (typeof RTCPeerConnection === 'undefined') {
-      console.log('[useWebRTC] RTCPeerConnection not available, using relay mode directly')
-      isRelayFallbackRef.current = true
-      setConnectionMode('relay')
-      connectionModeRef.current = 'relay'
-
-      // Connect to signaling first (needed for connect-request)
-      await managerRef.current.connectSignalingOnly()
-
-      // Then fall back to relay
-      if (fallbackToRelayRef.current) {
-        await fallbackToRelayRef.current()
-      }
+  const connect = useCallback(async (): Promise<void> => {
+    const manager = managerRef.current
+    if (!manager) {
+      setError(new Error('WebRTC manager not initialized'))
       return
     }
 
-    await managerRef.current.connect()
+    setError(null)
+    webrtcFailureCountRef.current = 0
+
+    try {
+      // Check if WebRTC is available upfront
+      if (typeof RTCPeerConnection === 'undefined') {
+        console.log('[useWebRTC] RTCPeerConnection not available, using relay mode directly')
+        isRelayFallbackRef.current = true
+        setConnectionMode('relay')
+        connectionModeRef.current = 'relay'
+
+        // Connect to signaling first (needed for connect-request)
+        await manager.connectSignalingOnly()
+
+        // Then fall back to relay
+        await fallbackToRelayRef.current?.()
+        return
+      }
+
+      await manager.connect()
+    } catch (err) {
+      // Never reject: the failure is already surfaced through `error`, and a
+      // rejected promise from an onClick handler is an unhandled rejection.
+      console.error('[useWebRTC] Connect failed:', err)
+      setError(err instanceof Error ? err : new Error(String(err)))
+    }
   }, [])
 
   const disconnect = useCallback(() => {
-    if (managerRef.current) {
-      managerRef.current.disconnect()
-    }
-  }, [])
+    teardown()
+    setConnectionState('disconnected')
+    setError(null)
+  }, [teardown])
 
   const sendData = useCallback((data: string) => {
     if (!managerRef.current) {
@@ -319,15 +324,19 @@ export function useWebRTC(options: UseWebRTCOptions) {
     managerRef.current.sendData(data)
   }, [])
 
-  const proxyFetch = useCallback(
-    async (url: string, init?: RequestInit): Promise<Response> => {
-      if (!httpProxyRef.current) {
-        throw new Error('HTTP proxy not initialized')
-      }
-      return httpProxyRef.current.fetch(url, init)
-    },
-    []
-  )
+  const proxyFetch = useCallback(async (url: string, init?: RequestInit): Promise<Response> => {
+    if (!httpProxyRef.current) {
+      throw new Error('HTTP proxy not initialized')
+    }
+    return httpProxyRef.current.fetch(url, init)
+  }, [])
+
+  // Auto-connect if enabled
+  useEffect(() => {
+    if (options.autoConnect && managerRef.current && connectionState === 'disconnected') {
+      void connect()
+    }
+  }, [options.autoConnect, connectionState, connect])
 
   return {
     connectionState,

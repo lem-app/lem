@@ -19,8 +19,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { Service } from '../api/types'
+import { localApiUrl } from '../lib/env'
 
-const LOCAL_API = 'http://localhost:5142'
 const POLL_INTERVAL = 5000 // 5 seconds
 
 interface UseServicesOptions {
@@ -47,7 +47,7 @@ export function useServices(options: UseServicesOptions): UseServicesResult {
     if (!enabled) return
 
     try {
-      const response = await proxyFetch(`${LOCAL_API}/v1/services`)
+      const response = await proxyFetch(localApiUrl('/v1/services'))
 
       if (!mountedRef.current) return
 
@@ -74,7 +74,7 @@ export function useServices(options: UseServicesOptions): UseServicesResult {
 
     if (enabled) {
       setIsLoading(true)
-      fetchServices()
+      void fetchServices()
     }
 
     return () => {
@@ -86,7 +86,7 @@ export function useServices(options: UseServicesOptions): UseServicesResult {
   useEffect(() => {
     if (!enabled) return
 
-    intervalRef.current = window.setInterval(fetchServices, POLL_INTERVAL)
+    intervalRef.current = window.setInterval(() => void fetchServices(), POLL_INTERVAL)
 
     return () => {
       if (intervalRef.current) {
