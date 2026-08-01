@@ -17,16 +17,19 @@
 Platform detection and configuration for Lem.
 
 Centralizes all platform-specific behavior:
-- OS detection (macOS, Linux, Windows)
-- Docker socket path detection
+- OS detection (macOS, Linux, Linux-under-WSL2)
+- Docker endpoint detection (DOCKER_HOST / socket path)
 - Standard paths (LEM_HOME, HARBOR_SCRIPT)
 
+Windows is supported through WSL2 only, where ``platform.system()`` reports
+"Linux". Native Windows (Python running outside WSL) is rejected explicitly
+rather than half-supported.
+
 Usage:
-    from app.config.platform import PLATFORM, DOCKER_HOST, LEM_HOME
+    from app.config.platform import DOCKER_HOST, LEM_HOME, PLATFORM
 
     if PLATFORM == "macos":
-        # macOS-specific code
-        pass
+        ...
 """
 
 from __future__ import annotations
@@ -36,100 +39,117 @@ import platform
 from pathlib import Path
 from typing import Literal
 
-# Detect operating system
+PlatformType = Literal["macos", "linux"]
+
+# Raw values, kept for reporting (e.g. /v1/health)
 OS_TYPE: str = platform.system()  # "Darwin", "Linux", "Windows"
 ARCH: str = platform.machine()  # "x86_64", "arm64", "aarch64"
 
-PlatformType = Literal["macos", "linux", "windows"]
+# Schemes that address a local socket file rather than a network endpoint.
+_LOCAL_SOCKET_SCHEMES = frozenset({"unix", "npipe"})
 
 
 def get_platform() -> PlatformType:
     """
-    Returns normalized platform name.
+    Return the normalized platform name.
 
     Returns:
-        "macos", "linux", or "windows"
+        "macos" or "linux" (WSL2 reports "linux")
 
     Raises:
-        RuntimeError: If platform is not supported
+        RuntimeError: If the platform is not supported
     """
-    if OS_TYPE == "Darwin":
+    os_type = platform.system()
+
+    if os_type == "Darwin":
         return "macos"
-    elif OS_TYPE == "Linux":
+    if os_type == "Linux":
         return "linux"
-    elif OS_TYPE == "Windows":
-        return "windows"
-    else:
-        raise RuntimeError(f"Unsupported platform: {OS_TYPE}")
+    if os_type == "Windows":
+        raise RuntimeError(
+            "Native Windows is not supported. Run Lem inside WSL2, where Docker "
+            "and Harbor see Linux-style paths."
+        )
+    raise RuntimeError(f"Unsupported platform: {os_type}")
+
+
+def is_wsl() -> bool:
+    """
+    Return True when running inside the Windows Subsystem for Linux.
+
+    WSL kernels advertise themselves in /proc/version (e.g.
+    "Linux version 5.15.0-microsoft-standard-WSL2 ..."). This is informational
+    only: WSL behaves like Linux for Docker and Harbor purposes.
+    """
+    if platform.system() != "Linux":
+        return False
+
+    try:
+        proc_version = Path("/proc/version").read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    return "microsoft" in proc_version.lower()
 
 
 PLATFORM: PlatformType = get_platform()
+IS_WSL: bool = is_wsl()
 
 # Standard paths
 LEM_HOME: Path = Path.home() / ".lem"
 HARBOR_DIR: Path = LEM_HOME / "harbor"
 HARBOR_SCRIPT: Path = HARBOR_DIR / "harbor.sh"
-DATA_DIR: Path = LEM_HOME / "data"
-LOGS_DIR: Path = LEM_HOME / "logs"
 
 
-def get_docker_socket_path() -> Path:
+def get_docker_socket_path() -> Path | None:
     """
-    Returns platform-specific Docker socket path.
+    Return the local Docker socket path, if there is one.
 
-    Checks DOCKER_HOST environment variable first, then uses platform defaults:
+    Honours a DOCKER_HOST override when it names a local socket
+    (``unix://`` or ``npipe://``). Remote endpoints (``tcp://``, ``ssh://``,
+    ...) have no socket file, so None is returned.
+
+    Platform defaults:
     - macOS: ~/.docker/run/docker.sock (Docker Desktop)
-    - Linux: /var/run/docker.sock (native Docker)
-    - Windows: /var/run/docker.sock (inside WSL2)
+    - Linux (incl. WSL2): /var/run/docker.sock
 
     Returns:
-        Path to Docker socket
+        Path to the Docker socket, or None for a remote Docker endpoint
     """
-    # Allow override via environment variable
-    if override := os.getenv("DOCKER_HOST"):
-        # Strip protocol prefix if present
-        path_str = override.replace("unix://", "").replace("npipe://", "")
-        return Path(path_str)
+    override = os.getenv("DOCKER_HOST")
+    if override:
+        scheme, separator, remainder = override.partition("://")
+        if not separator:
+            # No scheme at all - treat it as a bare socket path.
+            return Path(override)
+        if scheme.lower() in _LOCAL_SOCKET_SCHEMES:
+            return Path(remainder)
+        return None
 
     if PLATFORM == "macos":
-        # Docker Desktop for Mac
         return Path.home() / ".docker" / "run" / "docker.sock"
 
-    elif PLATFORM == "linux":
-        # Native Docker on Linux
-        return Path("/var/run/docker.sock")
-
-    elif PLATFORM == "windows":
-        # Windows with WSL2: use WSL socket path
-        # (Harbor runs inside WSL, so it sees Linux-style paths)
-        wsl_socket = Path("/var/run/docker.sock")
-        if wsl_socket.exists():
-            return wsl_socket
-
-        # Fallback to Windows named pipe (if running outside WSL)
-        return Path("//./pipe/docker_engine")
-
-    else:
-        raise RuntimeError(f"Cannot determine Docker socket for platform: {PLATFORM}")
+    return Path("/var/run/docker.sock")
 
 
 def get_docker_host_uri() -> str:
     """
-    Returns DOCKER_HOST environment variable value.
+    Return the value to export as DOCKER_HOST for Docker/Harbor subprocesses.
+
+    A DOCKER_HOST already present in the environment is passed through
+    untouched so remote daemons keep working; previously
+    ``tcp://10.0.0.5:2375`` was rewritten to ``unix://tcp:/10.0.0.5:2375``.
 
     Returns:
-        URI string like "unix:///path/to/socket" or "npipe://./pipe/docker_engine"
+        URI string, e.g. "unix:///var/run/docker.sock" or "tcp://10.0.0.5:2375"
     """
-    socket_path = get_docker_socket_path()
+    override = os.getenv("DOCKER_HOST")
+    if override:
+        return override
 
-    # Windows named pipe uses npipe:// protocol
-    if str(socket_path).startswith("//./pipe/"):
-        return f"npipe://{socket_path}"
-
-    # Unix sockets use unix:// protocol
-    return f"unix://{socket_path}"
+    return f"unix://{get_docker_socket_path()}"
 
 
 # Pre-computed values for common use
-DOCKER_SOCKET: Path = get_docker_socket_path()
+DOCKER_SOCKET: Path | None = get_docker_socket_path()
 DOCKER_HOST: str = get_docker_host_uri()
