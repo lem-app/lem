@@ -29,10 +29,11 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from app.jobs.db import (
-    create_job,
     delete_old_jobs,
+    fail_orphaned_jobs,
     get_job,
     get_pending_jobs,
+    init_jobs_schema,
     update_job_progress,
     update_job_status,
 )
@@ -53,7 +54,7 @@ class JobQueue:
         queue.register_handler(JobType.INSTALL, handle_install)
         await queue.start()  # Start background worker
 
-        job_id = await queue.enqueue(JobType.INSTALL, "ollama")
+        job = create_job(JobType.INSTALL, "ollama")
 
         await queue.stop()  # Stop background worker
     """
@@ -117,27 +118,6 @@ class JobQueue:
     def current_job(self) -> Job | None:
         """Get the currently processing job, if any."""
         return self._current_job
-
-    async def enqueue(
-        self,
-        job_type: JobType,
-        service_id: str,
-        extra: dict[str, str] | None = None,
-    ) -> str:
-        """
-        Add a job to the queue.
-
-        Args:
-            job_type: Type of job
-            service_id: Service ID to operate on
-            extra: Additional job-specific data
-
-        Returns:
-            Job ID
-        """
-        job = create_job(job_type, service_id, extra)
-        logger.info(f"Enqueued job {job.id}: {job_type.value} for {service_id}")
-        return job.id
 
     async def _worker(self) -> None:
         """Background worker that processes jobs from the database."""
@@ -236,11 +216,16 @@ async def init_job_queue() -> JobQueue:
     """
     Initialize and start the global job queue.
 
-    This should be called during app startup.
+    Recovers jobs orphaned by a previous crash before enforcing (and relying
+    on) the one-active-job-per-service constraint. This should be called during
+    app startup.
 
     Returns:
         Started JobQueue instance
     """
+    fail_orphaned_jobs()
+    init_jobs_schema()
+
     queue = get_job_queue()
     if not queue.is_running:
         await queue.start()

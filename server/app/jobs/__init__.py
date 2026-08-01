@@ -24,12 +24,15 @@ Provides:
 """
 
 from app.jobs.db import (
+    ActiveJobExistsError,
     create_job,
     delete_old_jobs,
+    fail_orphaned_jobs,
     get_active_job_for_service,
     get_job,
     get_pending_jobs,
     get_recent_jobs,
+    init_jobs_schema,
     update_job_progress,
     update_job_status,
 )
@@ -44,11 +47,14 @@ __all__ = [
     # Queue
     "JobQueue",
     # Database operations
+    "ActiveJobExistsError",
     "create_job",
+    "fail_orphaned_jobs",
     "get_job",
     "get_pending_jobs",
     "get_recent_jobs",
     "get_active_job_for_service",
+    "init_jobs_schema",
     "update_job_status",
     "update_job_progress",
     "delete_old_jobs",
