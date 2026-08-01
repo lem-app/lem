@@ -25,16 +25,26 @@ need pinning:
   disables the relay fallback for the session;
 * a **terminal** rejection (bad credentials, spent grant) must still stop it -
   otherwise the client loops forever against a rejection that cannot change.
+
+The classifier is only half the fix. The bug this file exists for was that the
+receive loop *ignored text frames entirely*, so a perfectly correct classifier
+was never reached. Unit tests that call ``_handle_control_message`` directly
+cannot see that: reintroducing the historical defect leaves every one of them
+green. ``TestRealReceiveLoop`` therefore drives ``aiohttp`` messages through
+the real ``_handle_messages()`` loop instead, which is the wiring that broke.
 """
 
 import json
+from collections.abc import AsyncIterator
 
+import aiohttp
 import pytest
 
 from app.tunnel.relay_client import (
     AUTH_RELAY_REASONS,
     RETRYABLE_RELAY_REASONS,
     RelayClient,
+    RelayConnectionState,
     RelayRejection,
 )
 
@@ -202,3 +212,144 @@ def test_error_frame_wins_over_a_later_close_code() -> None:
     client._apply_close_code()
 
     assert client.should_reconnect is True
+
+
+class _ScriptedSocket:
+    """Stand-in for ``aiohttp.ClientWebSocketResponse`` that replays a script.
+
+    ``_handle_messages`` consumes the socket with ``async for``, so anything
+    that wants to test the *wiring* - as opposed to the classifier the wiring
+    calls - has to be iterable in exactly that way. The messages are real
+    :class:`aiohttp.WSMessage` instances so the ``msg.type`` comparisons under
+    test are the production ones.
+    """
+
+    def __init__(self, messages: list[aiohttp.WSMessage], close_code: int | None = None) -> None:
+        """Initialize the scripted socket.
+
+        Args:
+            messages: Frames to deliver, in order, before the iterator ends
+            close_code: Code readable after the iterator is exhausted
+        """
+        self.messages = messages
+        self.close_code = close_code
+        self.closed = False
+
+    def __aiter__(self) -> AsyncIterator[aiohttp.WSMessage]:
+        """Iterate the scripted messages.
+
+        Returns:
+            Async iterator over the script
+        """
+        return self._replay()
+
+    async def _replay(self) -> AsyncIterator[aiohttp.WSMessage]:
+        """Yield each scripted message once.
+
+        Yields:
+            The next scripted message
+        """
+        for message in self.messages:
+            yield message
+
+
+def _text(payload: str) -> aiohttp.WSMessage:
+    """Build a real text WebSocket message.
+
+    Args:
+        payload: Frame body
+
+    Returns:
+        Message the receive loop will see as ``WSMsgType.TEXT``
+    """
+    return aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, payload, "")
+
+
+class TestRealReceiveLoop:
+    """Drive rejections through ``_handle_messages``, not the classifier.
+
+    ``relay_client.py``'s historical bug was in this loop: the ``TEXT`` branch
+    did not exist, so error frames were dropped before any classification
+    happened. A test that calls ``_handle_control_message`` directly stays
+    green against that defect. These do not.
+    """
+
+    @staticmethod
+    def _armed(
+        client: RelayClient,
+        monkeypatch: pytest.MonkeyPatch,
+        messages: list[aiohttp.WSMessage],
+        close_code: int | None = None,
+    ) -> list[bool]:
+        """Point the client at a scripted socket and trap its reconnects.
+
+        ``_handle_reconnect`` itself is left real, so the ``should_reconnect``
+        gate inside it is part of what these tests exercise; only the socket
+        rebuild underneath it is stubbed out.
+
+        Args:
+            client: Client under test
+            monkeypatch: Fixture used to stub the reconnect
+            messages: Frames the socket delivers before the iterator ends
+            close_code: Code the socket reports once exhausted
+
+        Returns:
+            List that gains an entry per real reconnection attempt
+        """
+        client.ws = _ScriptedSocket(messages, close_code)  # type: ignore[assignment]  # stub socket
+        client.reconnect_delay = 0.0
+
+        attempts: list[bool] = []
+
+        async def _record() -> None:
+            attempts.append(True)
+
+        monkeypatch.setattr(client, "_reconnect_full", _record)
+        return attempts
+
+    async def test_a_terminal_error_frame_over_the_wire_stops_reconnection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live text frame carrying an auth failure must reach the classifier.
+
+        This is the exact regression: with the loop's ``TEXT`` branch removed,
+        the rejection is never seen, the client reports a plain close and keeps
+        reconnecting forever against credentials that will never be accepted.
+        """
+        client = _client()
+        attempts = self._armed(
+            client,
+            monkeypatch,
+            [_text(_error_frame("auth-failed", retryable=False, message="Authentication failed"))],
+        )
+
+        await client._handle_messages()
+
+        assert client.last_rejection is not None, "the receive loop never classified the frame"
+        assert client.last_rejection.reason == "auth-failed"
+        assert client.last_rejection.retryable is False
+        assert client.should_reconnect is False
+        assert client.get_state() is RelayConnectionState.FAILED
+        assert attempts == []
+
+    async def test_a_retryable_error_frame_over_the_wire_keeps_reconnecting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A busy relay closing with 1013 must not disable the fallback path.
+
+        The frame arrives first and the close follows, which is the ordering
+        the relay actually produces; the frame's ``retryable`` is what decides,
+        and the loop has to deliver it for that to be true.
+        """
+        client = _client()
+        busy = _error_frame("relay-at-capacity", retryable=True, message="Relay is at capacity")
+        attempts = self._armed(client, monkeypatch, [_text(busy)], close_code=1013)
+
+        await client._handle_messages()
+
+        assert client.last_rejection is not None, "the receive loop never classified the frame"
+        assert client.last_rejection.reason == "relay-at-capacity"
+        assert client.last_rejection.retryable is True
+        assert client.should_reconnect is True
+        assert client.get_state() is RelayConnectionState.CLOSED
+        assert attempts == [True]
