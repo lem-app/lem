@@ -14,23 +14,34 @@
 // Public License for more details.
 
 /**
- * WebSocket proxy over the tunnel transport.
+ * WebSocket proxy over the tunnel transport (protocol v3).
  *
- * Provides a WebSocket-like API that proxies connections through the
- * active transport (WebRTC DataChannel or relay WebSocket) to the local server.
+ * The defect this closes: v2 sent WS_CONNECT and waited forever.
+ * `handleConnectionOpened()` existed but nothing called it, there was no ack
+ * frame, and the server's own comment said the client "assumes success". So
+ * `readyState` stayed CONNECTING, `onopen` never fired, and every `send()`
+ * threw - which is why Open WebUI's socket.io and Ollama streaming hung.
+ *
+ * v3 adds `WS_CONNECT_ACK` / `WS_CONNECT_ERROR` and the state machine around
+ * them, including buffering `send()` calls made before the ack: real apps call
+ * `send()` synchronously after construction.
  */
 
 import type { Transport } from './proxy-fetch'
+import { FrameType, MAX_CHUNK_BYTES } from './http-frame'
 import {
+  MAX_WS_MESSAGE_BYTES,
+  WSOpcode,
+  deserializeWSClose,
+  deserializeWSConnectAck,
+  deserializeWSConnectError,
+  deserializeWSData,
+  serializeWSClose,
   serializeWSConnect,
   serializeWSData,
-  serializeWSClose,
-  deserializeWSData,
-  deserializeWSClose,
-  WSOpcode,
-  type WSOpcodeValue,
-  type WSDataFrame,
   type WSCloseFrame,
+  type WSDataFrame,
+  type WSOpcodeValue,
 } from './ws-frame'
 
 /**
@@ -44,6 +55,32 @@ export const ProxiedWSState = {
 } as const
 
 export type ProxiedWSStateValue = (typeof ProxiedWSState)[keyof typeof ProxiedWSState]
+
+/** No ack within this window fails the connection with 4003. */
+export const WS_CONNECT_TIMEOUT_MS = 10_000
+
+/** How long `close()` waits for the peer's WS_CLOSE before giving up. */
+export const WS_CLOSE_TIMEOUT_MS = 5_000
+
+/** Close code used when the tunnel transport is gone. */
+const WS_CODE_ABNORMAL = 1006
+
+/** Close code used when no ack arrived in time (spec section 7.2). */
+const WS_CODE_CONNECT_TIMEOUT = 4003
+
+/** Close code used when a reassembled message exceeds its cap. */
+const WS_CODE_MESSAGE_TOO_LARGE = 4005
+
+interface BufferedSend {
+  opcode: WSOpcodeValue
+  payload: ArrayBuffer
+}
+
+interface PendingMessage {
+  opcode: WSOpcodeValue
+  parts: Uint8Array[]
+  size: number
+}
 
 /**
  * Proxied WebSocket connection.
@@ -62,6 +99,7 @@ export class ProxiedWebSocket implements EventTarget {
   private _readyState: ProxiedWSStateValue = ProxiedWSState.CONNECTING
   private _url: string
   private _protocol = ''
+  private _requestedProtocols: string[] = []
   private _extensions = ''
   private _binaryType: BinaryType = 'blob'
 
@@ -76,15 +114,29 @@ export class ProxiedWebSocket implements EventTarget {
 
   // Tunnel transport
   private transport: Transport
+  private maxChunkBytes = MAX_CHUNK_BYTES
+
+  /**
+   * Frames queued while the connection is still CONNECTING.
+   *
+   * Throwing here (what v2 did) breaks every app that calls `send()` in the
+   * same turn as the constructor, which is most of them.
+   */
+  private sendBuffer: BufferedSend[] = []
+  private bufferedBytes = 0
+
+  /** Fragments of an inbound message awaiting its FIN. */
+  private pendingMessage: PendingMessage | null = null
+
+  private connectTimer: number | null = null
+  private closeTimer: number | null = null
 
   /**
    * Tail of the outbound send chain, or null when nothing is in flight.
    *
    * Blob payloads have to be read asynchronously. Firing `.arrayBuffer().then()`
-   * and forgetting about it (the previous behaviour) both floated a rejection
-   * and let a later string `send()` overtake an earlier Blob one. Chaining keeps
-   * frames in call order; the chain is skipped entirely for the common case
-   * where nothing is pending and the payload is already an ArrayBuffer.
+   * and forgetting about it both floated a rejection and let a later string
+   * `send()` overtake an earlier Blob one. Chaining keeps frames in call order.
    */
   private sendQueue: Promise<void> | null = null
 
@@ -98,14 +150,13 @@ export class ProxiedWebSocket implements EventTarget {
     this.transport = transport
     this.connectionId = connectionId
 
-    // Normalize protocols
     if (typeof protocols === 'string') {
-      this._protocol = protocols
-    } else if (Array.isArray(protocols) && protocols.length > 0) {
-      this._protocol = protocols[0] // Use first protocol
+      this._requestedProtocols = [protocols]
+    } else if (Array.isArray(protocols)) {
+      this._requestedProtocols = [...protocols]
     }
 
-    // Send WS_CONNECT frame *after* the current task, so a caller doing
+    // Send WS_CONNECT *after* the current task, so a caller doing
     //   const ws = new WebSocket(url); ws.onerror = handler
     // still sees a synchronous failure. Dispatching from the constructor meant
     // the handler was assigned too late to ever fire - the real WebSocket never
@@ -141,8 +192,7 @@ export class ProxiedWebSocket implements EventTarget {
   }
 
   get bufferedAmount(): number {
-    // Not implemented (would require tracking queued messages)
-    return 0
+    return this.bufferedBytes
   }
 
   /**
@@ -153,17 +203,23 @@ export class ProxiedWebSocket implements EventTarget {
   }
 
   /**
-   * Send WS_CONNECT frame to establish connection.
+   * Apply the chunk limit negotiated in HELLO.
+   */
+  setMaxChunkBytes(maxChunkBytes: number): void {
+    this.maxChunkBytes = Math.max(1, Math.min(MAX_CHUNK_BYTES, maxChunkBytes))
+  }
+
+  /**
+   * Send WS_CONNECT and start the ack timeout.
    */
   private sendConnectFrame(): void {
     try {
       const frame = serializeWSConnect({
         connectionId: this.connectionId,
         url: this._url,
-        headers: {
-          // Add any necessary headers
-          'Sec-WebSocket-Protocol': this._protocol,
-        },
+        headers: this._requestedProtocols.length
+          ? [['Sec-WebSocket-Protocol', this._requestedProtocols.join(', ')]]
+          : [],
       })
 
       if (!this.transport.isOpen()) {
@@ -172,6 +228,15 @@ export class ProxiedWebSocket implements EventTarget {
       }
 
       this.transport.sendData(frame)
+      this.connectTimer = window.setTimeout(() => {
+        this.connectTimer = null
+        console.warn(`[WSProxy] No ack for connection ${this.connectionId}`)
+        this.handleClose({
+          connectionId: this.connectionId,
+          closeCode: WS_CODE_CONNECT_TIMEOUT,
+          reason: 'WebSocket handshake timed out',
+        })
+      }, WS_CONNECT_TIMEOUT_MS)
       console.log(`[WSProxy] Sent WS_CONNECT for connection ${this.connectionId}: ${this._url}`)
     } catch (error) {
       this.handleError(error instanceof Error ? error : new Error(String(error)))
@@ -180,46 +245,51 @@ export class ProxiedWebSocket implements EventTarget {
 
   /**
    * Send data over WebSocket.
+   *
+   * Buffers while CONNECTING; throws in CLOSING/CLOSED, matching the platform.
    */
   send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
-    if (this._readyState !== ProxiedWSState.OPEN) {
-      throw new Error('WebSocket is not open')
+    if (this._readyState === ProxiedWSState.CLOSING || this._readyState === ProxiedWSState.CLOSED) {
+      throw new DOMException('WebSocket is already in CLOSING or CLOSED state', 'InvalidStateError')
     }
 
     if (typeof data === 'string') {
       const payload = new TextEncoder().encode(data)
-      this.sendSync(
+      this.enqueue(
         WSOpcode.TEXT,
         payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
       )
     } else if (data instanceof Blob) {
-      this.sendAsync(WSOpcode.BINARY, data.arrayBuffer())
+      this.enqueueAsync(WSOpcode.BINARY, data.arrayBuffer())
     } else if (ArrayBuffer.isView(data)) {
       // Copy out of the view's window; the buffer may be a SharedArrayBuffer or
       // hold unrelated bytes on either side.
-      this.sendSync(
+      this.enqueue(
         WSOpcode.BINARY,
         new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer
       )
     } else {
-      this.sendSync(WSOpcode.BINARY, data as ArrayBuffer)
+      this.enqueue(WSOpcode.BINARY, data as ArrayBuffer)
     }
   }
 
   /**
-   * Send a payload that is already in hand. Goes out immediately unless an
-   * async payload is still queued ahead of it.
+   * Route a payload that is already in hand.
    */
-  private sendSync(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+  private enqueue(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+    if (this._readyState === ProxiedWSState.CONNECTING) {
+      this.buffer(opcode, payload)
+      return
+    }
     if (this.sendQueue === null) {
-      this.sendDataFrame(opcode, payload)
+      this.sendMessage(opcode, payload)
       return
     }
     this.chainSend(opcode, Promise.resolve(payload))
   }
 
-  /** Send a payload that still has to be read (Blob). */
-  private sendAsync(opcode: WSOpcodeValue, payload: Promise<ArrayBuffer>): void {
+  /** Route a payload that still has to be read (Blob). */
+  private enqueueAsync(opcode: WSOpcodeValue, payload: Promise<ArrayBuffer>): void {
     this.chainSend(opcode, payload)
   }
 
@@ -230,7 +300,12 @@ export class ProxiedWebSocket implements EventTarget {
     const previous = this.sendQueue ?? Promise.resolve()
     const next: Promise<void> = previous
       .then(async () => {
-        this.sendDataFrame(opcode, await payload)
+        const resolved = await payload
+        if (this._readyState === ProxiedWSState.CONNECTING) {
+          this.buffer(opcode, resolved)
+          return
+        }
+        this.sendMessage(opcode, resolved)
       })
       .catch((error: unknown) => {
         this.handleError(error instanceof Error ? error : new Error(String(error)))
@@ -245,18 +320,48 @@ export class ProxiedWebSocket implements EventTarget {
   }
 
   /**
-   * Send WS_DATA frame.
+   * Hold a frame until the ack arrives.
    */
-  private sendDataFrame(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
-    try {
-      const frame = serializeWSData({
-        connectionId: this.connectionId,
-        opcode,
-        payload,
-      })
+  private buffer(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+    if (this.bufferedBytes + payload.byteLength > MAX_WS_MESSAGE_BYTES) {
+      this.handleError(new Error('Buffered too much data before the connection opened'))
+      return
+    }
+    this.bufferedBytes += payload.byteLength
+    this.sendBuffer.push({ opcode, payload })
+  }
 
-      this.transport.sendData(frame)
-      console.log(`[WSProxy] Sent WS_DATA for connection ${this.connectionId} (opcode: ${opcode})`)
+  /**
+   * Send one message, fragmenting it to the negotiated chunk size.
+   */
+  private sendMessage(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+    try {
+      const bytes = new Uint8Array(payload)
+      const limit = this.maxChunkBytes
+
+      if (bytes.byteLength <= limit) {
+        this.transport.sendData(
+          serializeWSData({
+            connectionId: this.connectionId,
+            opcode,
+            payload: bytes,
+            fin: true,
+          })
+        )
+        return
+      }
+
+      for (let offset = 0; offset < bytes.byteLength; offset += limit) {
+        const slice = bytes.subarray(offset, offset + limit)
+        this.transport.sendData(
+          serializeWSData({
+            connectionId: this.connectionId,
+            opcode: offset === 0 ? opcode : WSOpcode.CONTINUATION,
+            payload: slice,
+            fin: offset + limit >= bytes.byteLength,
+          })
+        )
+      }
     } catch (error) {
       this.handleError(error instanceof Error ? error : new Error(String(error)))
     }
@@ -264,6 +369,10 @@ export class ProxiedWebSocket implements EventTarget {
 
   /**
    * Close WebSocket connection.
+   *
+   * The close event is *not* synthesised locally any more; it waits for the
+   * peer's WS_CLOSE, with a timeout. Firing it immediately told the app the
+   * socket was closed while the upstream was still being torn down.
    */
   close(code = 1000, reason = ''): void {
     if (this._readyState === ProxiedWSState.CLOSING || this._readyState === ProxiedWSState.CLOSED) {
@@ -271,26 +380,63 @@ export class ProxiedWebSocket implements EventTarget {
     }
 
     this._readyState = ProxiedWSState.CLOSING
+    this.clearConnectTimer()
 
     try {
-      const frame = serializeWSClose({
-        connectionId: this.connectionId,
-        closeCode: code,
-        reason,
-      })
-
-      this.transport.sendData(frame)
+      this.transport.sendData(
+        serializeWSClose({ connectionId: this.connectionId, closeCode: code, reason })
+      )
       console.log(`[WSProxy] Sent WS_CLOSE for connection ${this.connectionId} (code: ${code})`)
 
-      // Transition to CLOSED immediately (server will acknowledge)
-      this.handleClose({ connectionId: this.connectionId, closeCode: code, reason })
+      this.closeTimer = window.setTimeout(() => {
+        this.closeTimer = null
+        this.handleClose({ connectionId: this.connectionId, closeCode: code, reason })
+      }, WS_CLOSE_TIMEOUT_MS)
     } catch (error) {
       this.handleError(error instanceof Error ? error : new Error(String(error)))
     }
   }
 
   /**
-   * Handle incoming WS_DATA frame from server.
+   * Handle WS_CONNECT_ACK: this is what reaches readyState OPEN.
+   */
+  handleConnectAck(protocol: string): void {
+    if (this._readyState !== ProxiedWSState.CONNECTING) {
+      return
+    }
+
+    this.clearConnectTimer()
+    this._protocol = protocol
+    this._readyState = ProxiedWSState.OPEN
+
+    const event = new Event('open')
+    this.onopen?.(event)
+    this.dispatchEvent(event)
+
+    // Flush anything the app sent before the socket was open.
+    const buffered = this.sendBuffer
+    this.sendBuffer = []
+    this.bufferedBytes = 0
+    buffered.forEach(({ opcode, payload }) => {
+      this.sendMessage(opcode, payload)
+    })
+  }
+
+  /**
+   * Handle WS_CONNECT_ERROR: fail fast rather than waiting out the timeout.
+   */
+  handleConnectError(code: number, reason: string): void {
+    this.clearConnectTimer()
+
+    const errorEvent = new Event('error')
+    this.onerror?.(errorEvent)
+    this.dispatchEvent(errorEvent)
+
+    this.handleClose({ connectionId: this.connectionId, closeCode: code, reason })
+  }
+
+  /**
+   * Handle incoming WS_DATA frame from the server.
    */
   handleData(frame: WSDataFrame): void {
     if (frame.connectionId !== this.connectionId) {
@@ -300,16 +446,21 @@ export class ProxiedWebSocket implements EventTarget {
       return
     }
 
-    // Dispatch message event
-    let data: string | ArrayBuffer | Blob
+    const assembled = this.reassemble(frame)
+    if (!assembled) return
 
-    if (frame.opcode === WSOpcode.TEXT) {
-      // Text message
-      data = new TextDecoder().decode(frame.payload)
+    const [opcode, payload] = assembled
+
+    let data: string | ArrayBuffer | Blob
+    if (opcode === WSOpcode.TEXT) {
+      data = new TextDecoder().decode(payload)
     } else if (this._binaryType === 'blob') {
-      data = new Blob([frame.payload])
+      data = new Blob([payload as BlobPart])
     } else {
-      data = frame.payload
+      data = payload.buffer.slice(
+        payload.byteOffset,
+        payload.byteOffset + payload.byteLength
+      ) as ArrayBuffer
     }
 
     const event = new MessageEvent('message', {
@@ -322,7 +473,53 @@ export class ProxiedWebSocket implements EventTarget {
   }
 
   /**
-   * Handle incoming WS_CLOSE frame from server.
+   * Reassemble a possibly-fragmented inbound message.
+   */
+  private reassemble(frame: WSDataFrame): [WSOpcodeValue, Uint8Array] | null {
+    if (frame.opcode === WSOpcode.CONTINUATION) {
+      const pending = this.pendingMessage
+      if (!pending) {
+        console.warn(`[WSProxy] CONTINUATION with no message in progress`)
+        return null
+      }
+      if (pending.size + frame.payload.byteLength > MAX_WS_MESSAGE_BYTES) {
+        this.pendingMessage = null
+        this.handleClose({
+          connectionId: this.connectionId,
+          closeCode: WS_CODE_MESSAGE_TOO_LARGE,
+          reason: 'Message too large',
+        })
+        return null
+      }
+      pending.parts.push(frame.payload)
+      pending.size += frame.payload.byteLength
+
+      if (!frame.fin) return null
+
+      this.pendingMessage = null
+      const joined = new Uint8Array(pending.size)
+      let offset = 0
+      pending.parts.forEach((part) => {
+        joined.set(part, offset)
+        offset += part.byteLength
+      })
+      return [pending.opcode, joined]
+    }
+
+    if (!frame.fin) {
+      this.pendingMessage = {
+        opcode: frame.opcode,
+        parts: [frame.payload],
+        size: frame.payload.byteLength,
+      }
+      return null
+    }
+
+    return [frame.opcode, frame.payload]
+  }
+
+  /**
+   * Handle incoming WS_CLOSE frame from the server.
    */
   handleClose(frame: WSCloseFrame): void {
     if (frame.connectionId !== this.connectionId) {
@@ -332,7 +529,16 @@ export class ProxiedWebSocket implements EventTarget {
       return
     }
 
+    if (this._readyState === ProxiedWSState.CLOSED) {
+      return
+    }
+
+    this.clearConnectTimer()
+    this.clearCloseTimer()
     this._readyState = ProxiedWSState.CLOSED
+    this.sendBuffer = []
+    this.bufferedBytes = 0
+    this.pendingMessage = null
 
     const event = new CloseEvent('close', {
       code: frame.closeCode,
@@ -341,17 +547,6 @@ export class ProxiedWebSocket implements EventTarget {
     })
 
     this.onclose?.(event)
-    this.dispatchEvent(event)
-  }
-
-  /**
-   * Handle connection opened (called by WSProxyManager).
-   */
-  handleOpen(): void {
-    this._readyState = ProxiedWSState.OPEN
-
-    const event = new Event('open')
-    this.onopen?.(event)
     this.dispatchEvent(event)
   }
 
@@ -365,13 +560,26 @@ export class ProxiedWebSocket implements EventTarget {
     this.onerror?.(event)
     this.dispatchEvent(event)
 
-    // Close connection on error
     if (this._readyState !== ProxiedWSState.CLOSED) {
       this.handleClose({
         connectionId: this.connectionId,
-        closeCode: 1006, // Abnormal closure
+        closeCode: WS_CODE_ABNORMAL,
         reason: error.message,
       })
+    }
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
+  }
+
+  private clearCloseTimer(): void {
+    if (this.closeTimer !== null) {
+      clearTimeout(this.closeTimer)
+      this.closeTimer = null
     }
   }
 
@@ -420,12 +628,13 @@ export class ProxiedWebSocket implements EventTarget {
 /**
  * WebSocket proxy manager.
  *
- * Manages multiple proxied WebSocket connections and routes messages.
+ * Manages multiple proxied WebSocket connections and routes frames.
  */
 export class WSProxyManager {
   private transport: Transport
   private connections = new Map<number, ProxiedWebSocket>()
   private nextConnectionId = 1
+  private maxChunkBytes = MAX_CHUNK_BYTES
 
   constructor(transport: Transport) {
     this.transport = transport
@@ -433,11 +642,6 @@ export class WSProxyManager {
 
   /**
    * Point this manager (and every live connection) at a different transport.
-   *
-   * Used when the WebRTC leg fails and we switch to the relay. This used to
-   * force a `RelayClient` into a `WebRTCConnectionManager`-typed field and write
-   * another object's private property behind two `@ts-expect-error`s; the
-   * `Transport` interface exists precisely so it doesn't have to.
    */
   updateTransport(transport: Transport): void {
     this.transport = transport
@@ -448,11 +652,24 @@ export class WSProxyManager {
   }
 
   /**
+   * Apply the chunk limit negotiated in HELLO.
+   */
+  setNegotiatedLimits(peerMaxChunkBytes: number): void {
+    this.maxChunkBytes = Math.max(1, Math.min(MAX_CHUNK_BYTES, peerMaxChunkBytes))
+    this.connections.forEach((connection) => {
+      connection.setMaxChunkBytes(this.maxChunkBytes)
+    })
+  }
+
+  /**
    * Create a new proxied WebSocket connection.
    */
   createConnection(url: string, protocols?: string | string[]): ProxiedWebSocket {
-    const connectionId = this.nextConnectionId++
+    const connectionId = this.nextConnectionId
+    this.nextConnectionId = this.nextConnectionId >= 0xffffffff ? 1 : this.nextConnectionId + 1
+
     const ws = new ProxiedWebSocket(url, protocols, this.transport, connectionId)
+    ws.setMaxChunkBytes(this.maxChunkBytes)
     this.connections.set(connectionId, ws)
 
     console.log(`[WSProxyManager] Created connection ${connectionId} for ${url}`)
@@ -461,11 +678,38 @@ export class WSProxyManager {
   }
 
   /**
+   * Route one inbound frame.
+   *
+   * Returns true when the frame belonged to this manager.
+   */
+  handleFrame(buffer: ArrayBuffer): boolean {
+    const view = new Uint8Array(buffer)
+    if (view.byteLength < 1) return false
+
+    switch (view[0]) {
+      case FrameType.WS_DATA:
+        this.handleDataFrame(buffer)
+        return true
+      case FrameType.WS_CLOSE:
+        this.handleCloseFrame(buffer)
+        return true
+      case FrameType.WS_CONNECT_ACK:
+        this.handleConnectAckFrame(buffer)
+        return true
+      case FrameType.WS_CONNECT_ERROR:
+        this.handleConnectErrorFrame(buffer)
+        return true
+      default:
+        return false
+    }
+  }
+
+  /**
    * Handle incoming WS_DATA frame.
    */
   handleDataFrame(buffer: ArrayBuffer): void {
     try {
-      const frame = deserializeWSData(buffer)
+      const frame = deserializeWSData(buffer, this.maxChunkBytes)
       const connection = this.connections.get(frame.connectionId)
 
       if (connection) {
@@ -500,10 +744,40 @@ export class WSProxyManager {
   }
 
   /**
-   * Handle connection opened (WS_CONNECT response - currently auto-opens).
+   * Handle incoming WS_CONNECT_ACK frame - the frame v2 never had.
    */
-  handleConnectionOpened(connectionId: number): void {
-    this.connections.get(connectionId)?.handleOpen()
+  handleConnectAckFrame(buffer: ArrayBuffer): void {
+    try {
+      const frame = deserializeWSConnectAck(buffer)
+      const connection = this.connections.get(frame.connectionId)
+
+      if (connection) {
+        connection.handleConnectAck(frame.protocol)
+      } else {
+        console.warn(`[WSProxyManager] Ack for unknown connection: ${frame.connectionId}`)
+      }
+    } catch (error) {
+      console.error('[WSProxyManager] Error handling WS_CONNECT_ACK frame:', error)
+    }
+  }
+
+  /**
+   * Handle incoming WS_CONNECT_ERROR frame.
+   */
+  handleConnectErrorFrame(buffer: ArrayBuffer): void {
+    try {
+      const frame = deserializeWSConnectError(buffer)
+      const connection = this.connections.get(frame.connectionId)
+
+      if (connection) {
+        connection.handleConnectError(frame.errorCode, frame.reason)
+        this.connections.delete(frame.connectionId)
+      } else {
+        console.warn(`[WSProxyManager] Connect error for unknown connection: ${frame.connectionId}`)
+      }
+    } catch (error) {
+      console.error('[WSProxyManager] Error handling WS_CONNECT_ERROR frame:', error)
+    }
   }
 
   /**

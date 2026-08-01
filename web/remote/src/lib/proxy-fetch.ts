@@ -14,25 +14,61 @@
 // Public License for more details.
 
 /**
- * HTTP proxy over WebRTC DataChannel or WebSocket Relay.
+ * Streaming HTTP proxy over the tunnel transport (protocol v3).
  *
- * Provides a fetch()-like API that proxies requests through either
- * WebRTC DataChannel (P2P) or WebSocket Relay (fallback).
+ * `fetch()` resolves as soon as `HTTP_RESPONSE_HEAD` arrives, with a `Response`
+ * wrapping a live `ReadableStream` that later chunks feed. That is what makes
+ * a `<script>` start executing, an `EventSource` start firing, and model tokens
+ * paint as they arrive - v2 delivered a whole response in one frame, so nothing
+ * could stream and nothing over ~64 KiB could cross at all.
  */
 
 import type { WebRTCConnectionManager } from './webrtc'
 import type { RelayClient } from './relay-client'
-import { serializeRequest, deserializeResponse, type HTTPResponseFrame } from './http-frame'
+import {
+  FrameType,
+  MAX_BODY_BYTES,
+  MAX_CHUNK_BYTES,
+  deserializeCancel,
+  deserializeChunk,
+  deserializeResponseHead,
+  serializeCancel,
+  serializeRequestChunk,
+  serializeRequestHead,
+  type HeaderList,
+} from './http-frame'
+import { LemProxyError, TunnelErrorCode, errorNameForCode } from './tunnel-errors'
 
-/** How long a tunneled request may stay outstanding before it is failed. */
-const REQUEST_TIMEOUT_MS = 30000
+/** No RESPONSE_HEAD within this window fails the fetch. */
+export const HEAD_TIMEOUT_MS = 30_000
 
 /**
- * Pending request awaiting response.
+ * No chunk within this window fails an in-flight stream.
+ *
+ * Deliberately not a single blanket timer: v2's 30s clock started at send and
+ * killed any generation that took longer, however healthy. This one resets on
+ * every chunk, so a five-minute model response with a token every two seconds
+ * survives while a genuinely stalled stream still fails.
  */
-interface PendingRequest {
-  resolve: (response: Response) => void
-  reject: (error: Error) => void
+export const CHUNK_IDLE_TIMEOUT_MS = 60_000
+
+/** Bytes tolerated on a torn-down request_id before the peer is misbehaving. */
+const POST_CANCEL_DRAIN_BYTES = 512 * 1024
+
+/**
+ * One in-flight exchange.
+ */
+interface PendingExchange {
+  resolveResponse: (response: Response) => void
+  rejectResponse: (error: Error) => void
+  controller: ReadableStreamDefaultController<Uint8Array> | null
+  /** Cumulative body bytes; the accumulator of spec section 5.5.1. */
+  received: number
+  headSettled: boolean
+  timer: number | null
+  /** Queued chunks that arrived before the stream's `start` ran. */
+  queued: Uint8Array[]
+  closeAfterQueue: boolean
 }
 
 /**
@@ -82,15 +118,61 @@ export class RelayTransport implements Transport {
 }
 
 /**
+ * Normalize any `RequestInit` body to bytes.
+ *
+ * Everything goes through `new Request(...).arrayBuffer()`, so Blob,
+ * ArrayBuffer, typed arrays, FormData (with its multipart boundary intact) and
+ * URLSearchParams all serialize the way the platform would serialize them. v2
+ * stringified anything it did not recognise, which turned a Blob into the
+ * literal text "[object Blob]".
+ */
+async function bodyToBytes(url: string, init: RequestInit | undefined): Promise<Uint8Array> {
+  if (init?.body === undefined || init.body === null) {
+    return new Uint8Array(0)
+  }
+  const buffer = await new Request(url, {
+    method: init.method ?? 'POST',
+    body: init.body,
+  }).arrayBuffer()
+  return new Uint8Array(buffer)
+}
+
+/**
+ * Collect `init.headers` into an ordered pair list.
+ *
+ * Pairs, not an object: an object silently collapses duplicates, which loses
+ * every `Set-Cookie` after the first and breaks login for real apps.
+ */
+function headersToPairs(init: RequestInit | undefined): HeaderList {
+  const pairs: HeaderList = []
+  const source = init?.headers
+  if (!source) return pairs
+
+  if (source instanceof Headers) {
+    source.forEach((value, key) => pairs.push([key, value]))
+  } else if (Array.isArray(source)) {
+    source.forEach(([key, value]) => pairs.push([key, value]))
+  } else {
+    Object.entries(source).forEach(([key, value]) => pairs.push([key, value]))
+  }
+  return pairs
+}
+
+/**
  * HTTP proxy manager.
  *
- * Manages request/response correlation and provides fetch()-like API.
- * Works with either WebRTC DataChannel or WebSocket Relay transport.
+ * Manages request/response correlation and provides a fetch()-like API over
+ * either the WebRTC DataChannel or the relay WebSocket.
  */
 export class HTTPProxy {
   private transport: Transport
   private nextRequestId = 1
-  private pendingRequests = new Map<number, PendingRequest>()
+  private pending = new Map<number, PendingExchange>()
+  /** request_id -> bytes seen since teardown, so late chunks are not buffered. */
+  private tombstoned = new Map<number, number>()
+
+  private maxChunkBytes = MAX_CHUNK_BYTES
+  private maxBodyBytes = MAX_BODY_BYTES
 
   constructor(transport: Transport) {
     this.transport = transport
@@ -104,126 +186,19 @@ export class HTTPProxy {
   }
 
   /**
-   * Proxy fetch() implementation.
+   * Apply limits negotiated in HELLO.
    *
-   * Sends HTTP request over DataChannel and returns Response.
+   * Clamped with `min`: a peer may lower what this side will send or accept,
+   * never raise it.
    */
-  async fetch(url: string, init?: RequestInit): Promise<Response> {
-    // Parse URL
-    const urlObj = new URL(url)
+  setNegotiatedLimits(peerMaxChunkBytes: number, peerMaxBodyBytes: number): void {
+    this.maxChunkBytes = Math.max(1, Math.min(MAX_CHUNK_BYTES, peerMaxChunkBytes))
+    this.maxBodyBytes = Math.min(MAX_BODY_BYTES, peerMaxBodyBytes)
+  }
 
-    // Add client parameter if present in current page URL
-    const pageParams = new URLSearchParams(window.location.search)
-    const clientParam = pageParams.get('client')
-    if (clientParam) {
-      urlObj.searchParams.set('client', clientParam)
-      console.log(`[ProxyFetch] Added client parameter: ${clientParam}`)
-    }
-
-    const path = urlObj.pathname + urlObj.search
-
-    // Extract method, headers, and body
-    const method = init?.method || 'GET'
-    const headers: Record<string, string> = {}
-
-    if (init?.headers) {
-      if (init.headers instanceof Headers) {
-        init.headers.forEach((value, key) => {
-          headers[key] = value
-        })
-      } else if (Array.isArray(init.headers)) {
-        init.headers.forEach(([key, value]) => {
-          headers[key] = value
-        })
-      } else {
-        Object.entries(init.headers).forEach(([key, value]) => {
-          headers[key] = value
-        })
-      }
-    }
-
-    // Get body.
-    //
-    // The wire format carries a UTF-8 string, so only text-shaped bodies round
-    // trip. Anything else (Blob, ArrayBuffer, streams) is rejected loudly rather
-    // than silently sent as "[object Object]"; binary bodies belong to the
-    // tunnel-protocol track.
-    let body = ''
-    if (init?.body !== undefined && init.body !== null) {
-      if (typeof init.body === 'string') {
-        body = init.body
-      } else if (init.body instanceof URLSearchParams) {
-        body = init.body.toString()
-      } else if (init.body instanceof FormData) {
-        // Convert FormData to JSON (simplified)
-        const formObj: Record<string, string> = {}
-        init.body.forEach((value, key) => {
-          formObj[key] = typeof value === 'string' ? value : value.name
-        })
-        body = JSON.stringify(formObj)
-        headers['Content-Type'] = 'application/json'
-      } else {
-        throw new TypeError('proxyFetch only supports string, URLSearchParams and FormData bodies')
-      }
-    }
-
-    // Generate request ID
-    const requestId = this.nextRequestId++
-
-    // Serialize request
-    const frame = serializeRequest({
-      requestId,
-      method,
-      path,
-      headers,
-      body,
-    })
-
-    // Send over DataChannel
-    return new Promise<Response>((resolve, reject) => {
-      let timeout: number | null = null
-
-      // Single settle path. The previous version deleted the entry in its catch
-      // block and then *fell through* to re-insert it, so every send failure
-      // leaked a permanently-pending entry into the map.
-      const settle = () => {
-        if (timeout !== null) {
-          clearTimeout(timeout)
-          timeout = null
-        }
-        this.pendingRequests.delete(requestId)
-      }
-
-      const pending: PendingRequest = {
-        resolve: (response: Response) => {
-          settle()
-          resolve(response)
-        },
-        reject: (error: Error) => {
-          settle()
-          reject(error)
-        },
-      }
-
-      this.pendingRequests.set(requestId, pending)
-
-      timeout = window.setTimeout(() => {
-        timeout = null
-        pending.reject(new Error(`Request timeout after ${REQUEST_TIMEOUT_MS}ms`))
-      }, REQUEST_TIMEOUT_MS)
-
-      try {
-        if (!this.transport.isOpen()) {
-          throw new Error('Transport not open')
-        }
-
-        // Send ArrayBuffer over transport (DataChannel or WebSocket)
-        this.transport.sendData(frame)
-        console.log(`[ProxyFetch] Sent request ${requestId}: ${method} ${path}`)
-      } catch (error) {
-        pending.reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
+  /** Effective per-frame payload limit for this channel. */
+  get effectiveMaxChunk(): number {
+    return this.maxChunkBytes
   }
 
   /**
@@ -231,78 +206,329 @@ export class HTTPProxy {
    * diagnostics - a monotonically growing value means responses are being lost.
    */
   get pendingCount(): number {
-    return this.pendingRequests.size
+    return this.pending.size
   }
 
   /**
-   * Handle incoming response frame.
+   * Proxy fetch() implementation.
    *
-   * Called by WebRTC client when response is received.
+   * Resolves when the response *head* arrives; the body streams in behind it.
    */
-  handleResponse(buffer: ArrayBuffer): void {
-    try {
-      // Deserialize response
-      const frame = deserializeResponse(buffer)
-      console.log(`[ProxyFetch] Received response ${frame.requestId}: ${frame.statusCode}`)
+  async fetch(url: string, init?: RequestInit): Promise<Response> {
+    const urlObj = new URL(url)
+    const path = urlObj.pathname + urlObj.search
+    const method = init?.method ?? 'GET'
+    const headers = headersToPairs(init)
+    const body = await bodyToBytes(url, init)
 
-      // Find pending request
-      const pending = this.pendingRequests.get(frame.requestId)
-      if (!pending) {
-        console.warn(`[ProxyFetch] No pending request for ID ${frame.requestId}`)
-        return
+    const requestId = this.nextRequestId
+    // Wrap at 2^32-1 back to 1; 0 is reserved.
+    this.nextRequestId = this.nextRequestId >= 0xffffffff ? 1 : this.nextRequestId + 1
+
+    return new Promise<Response>((resolve, reject) => {
+      const exchange: PendingExchange = {
+        resolveResponse: resolve,
+        rejectResponse: reject,
+        controller: null,
+        received: 0,
+        headSettled: false,
+        timer: null,
+        queued: [],
+        closeAfterQueue: false,
       }
+      this.pending.set(requestId, exchange)
+      this.armTimer(requestId, exchange, HEAD_TIMEOUT_MS, 'E_TIMEOUT_HEAD')
 
-      // Remove from pending
-      this.pendingRequests.delete(frame.requestId)
+      try {
+        if (!this.transport.isOpen()) {
+          throw new Error('Transport not open')
+        }
 
-      // Create Response object
-      const response = this.createResponse(frame)
+        this.transport.sendData(
+          serializeRequestHead({
+            requestId,
+            method,
+            path,
+            headers,
+            bodyFollows: body.byteLength > 0,
+          })
+        )
 
-      // NOTE on 401s: a 401 arriving here came from the *local* Lem server at
-      // the far end of the tunnel, which authenticates separately from the
-      // cloud session this browser holds a JWT for. Dropping the cloud session
-      // on it would log the user out for an unrelated failure, so the status is
-      // handed to the caller untouched. Cloud-session 401s are intercepted in
-      // `api/auth.ts`, and relay/signaling token rejection surfaces through
-      // `RelayAuthError`.
-      if (frame.statusCode === 401 || frame.statusCode === 403) {
-        console.warn(
-          `[ProxyFetch] Local server rejected request ${frame.requestId} with ${frame.statusCode}`
+        for (let offset = 0; offset < body.byteLength; offset += this.maxChunkBytes) {
+          const slice = body.subarray(offset, offset + this.maxChunkBytes)
+          const isLast = offset + this.maxChunkBytes >= body.byteLength
+          this.transport.sendData(serializeRequestChunk(requestId, slice, isLast))
+        }
+
+        if (init?.signal) {
+          this.bindAbort(requestId, init.signal)
+        }
+      } catch (error) {
+        this.failExchange(
+          requestId,
+          error instanceof Error ? error : new Error(String(error)),
+          false
         )
       }
+    })
+  }
 
-      pending.resolve(response)
-    } catch (error) {
-      console.error('[ProxyFetch] Error handling response:', error)
+  /**
+   * Route one inbound frame.
+   *
+   * Returns true when the frame belonged to this proxy.
+   */
+  handleFrame(buffer: ArrayBuffer): boolean {
+    const view = new Uint8Array(buffer)
+    if (view.byteLength < 1) return false
+
+    switch (view[0]) {
+      case FrameType.HTTP_RESPONSE_HEAD:
+        this.handleResponseHead(buffer)
+        return true
+      case FrameType.HTTP_RESPONSE_CHUNK:
+        this.handleResponseChunk(buffer)
+        return true
+      case FrameType.HTTP_CANCEL:
+        this.handleCancel(buffer)
+        return true
+      default:
+        return false
     }
   }
 
   /**
-   * Create Response object from frame.
+   * Handle HTTP_RESPONSE_HEAD: resolve the fetch immediately with a streaming
+   * body.
    */
-  private createResponse(frame: HTTPResponseFrame): Response {
-    // Create Headers object
+  private handleResponseHead(buffer: ArrayBuffer): void {
+    let frame
+    try {
+      frame = deserializeResponseHead(buffer)
+    } catch (error) {
+      console.error('[ProxyFetch] Malformed response head:', error)
+      return
+    }
+
+    const exchange = this.pending.get(frame.requestId)
+    if (!exchange || exchange.headSettled) {
+      if (!this.tombstoned.has(frame.requestId)) {
+        console.warn(`[ProxyFetch] No pending request for ID ${frame.requestId}`)
+      }
+      return
+    }
+
     const headers = new Headers()
-    Object.entries(frame.headers).forEach(([key, value]) => {
-      headers.set(key, value)
+    // append, never set: duplicates are the reason the wire carries pairs.
+    frame.headers.forEach(([name, value]) => headers.append(name, value))
+
+    exchange.headSettled = true
+
+    if (!frame.bodyFollows) {
+      this.clearTimer(exchange)
+      this.pending.delete(frame.requestId)
+      exchange.resolveResponse(new Response(null, { status: frame.statusCode, headers }))
+      return
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        exchange.controller = controller
+        // Chunks can land before `start` runs; replay them in order.
+        exchange.queued.forEach((chunk) => controller.enqueue(chunk))
+        exchange.queued = []
+        if (exchange.closeAfterQueue) {
+          controller.close()
+        }
+      },
+      cancel: () => {
+        // The consumer walked away: tell the server to stop producing.
+        this.sendCancel(frame.requestId, TunnelErrorCode.E_SESSION_CLOSED)
+        this.pending.delete(frame.requestId)
+        this.tombstone(frame.requestId)
+      },
     })
 
-    // Create Response
-    return new Response(frame.body, {
-      status: frame.statusCode,
-      headers,
-    })
+    // The clock now measures inter-chunk silence, not total duration.
+    this.armTimer(frame.requestId, exchange, CHUNK_IDLE_TIMEOUT_MS, 'E_TIMEOUT_STREAM')
+
+    exchange.resolveResponse(new Response(stream, { status: frame.statusCode, headers }))
   }
 
   /**
-   * Fail every outstanding request. Called when the transport goes away so the
-   * map cannot accumulate resolvers nobody will ever call.
+   * Handle HTTP_RESPONSE_CHUNK: enqueue, or fail on the cumulative cap.
+   */
+  private handleResponseChunk(buffer: ArrayBuffer): void {
+    let frame
+    try {
+      frame = deserializeChunk(buffer, this.maxChunkBytes)
+    } catch (error) {
+      console.error('[ProxyFetch] Rejected response chunk:', error)
+      return
+    }
+
+    const drained = this.tombstoned.get(frame.requestId)
+    if (drained !== undefined) {
+      const seen = drained + frame.payload.byteLength
+      this.tombstoned.set(frame.requestId, seen)
+      if (frame.final || seen > POST_CANCEL_DRAIN_BYTES) {
+        this.tombstoned.delete(frame.requestId)
+      }
+      return
+    }
+
+    const exchange = this.pending.get(frame.requestId)
+    if (!exchange) {
+      console.warn(`[ProxyFetch] Chunk for unknown request ${frame.requestId}`)
+      return
+    }
+
+    // THE CHECK, before the enqueue, on the running total (spec 5.5.1).
+    if (exchange.received + frame.payload.byteLength > this.maxBodyBytes) {
+      // error(), never close(): a closed stream hands the app a truncated body
+      // it believes is complete. An errored one rejects the fetch, exactly as
+      // an interrupted download does.
+      this.failExchange(frame.requestId, new LemProxyError('E_TOO_LARGE'), true)
+      this.sendCancel(frame.requestId, TunnelErrorCode.E_TOO_LARGE)
+      return
+    }
+
+    exchange.received += frame.payload.byteLength
+
+    if (frame.payload.byteLength > 0) {
+      if (exchange.controller) {
+        exchange.controller.enqueue(frame.payload)
+      } else {
+        exchange.queued.push(frame.payload)
+      }
+    }
+
+    if (frame.final) {
+      this.clearTimer(exchange)
+      if (exchange.controller) {
+        exchange.controller.close()
+      } else {
+        exchange.closeAfterQueue = true
+      }
+      this.pending.delete(frame.requestId)
+      return
+    }
+
+    // Reset the idle clock: this stream is demonstrably alive.
+    this.armTimer(frame.requestId, exchange, CHUNK_IDLE_TIMEOUT_MS, 'E_TIMEOUT_STREAM')
+  }
+
+  /**
+   * Handle an inbound HTTP_CANCEL.
+   *
+   * Always `controller.error()`, never `close()` - a cancel mid-stream means
+   * the body is incomplete, and saying otherwise is silent corruption.
+   */
+  private handleCancel(buffer: ArrayBuffer): void {
+    let frame
+    try {
+      frame = deserializeCancel(buffer)
+    } catch (error) {
+      console.error('[ProxyFetch] Malformed cancel:', error)
+      return
+    }
+
+    const name = errorNameForCode(frame.reasonCode) ?? 'E_INTERNAL'
+    this.failExchange(frame.requestId, new LemProxyError(name), true)
+  }
+
+  /**
+   * Fail one exchange, whether or not its head has been delivered.
+   */
+  private failExchange(requestId: number, error: Error, tombstone: boolean): void {
+    const exchange = this.pending.get(requestId)
+    if (!exchange) return
+
+    this.clearTimer(exchange)
+    this.pending.delete(requestId)
+    if (tombstone) {
+      this.tombstone(requestId)
+    }
+
+    if (exchange.controller) {
+      exchange.controller.error(error)
+      return
+    }
+    if (exchange.headSettled) {
+      // Head delivered, stream not started yet: the queued bytes go with it.
+      exchange.queued = []
+      return
+    }
+    exchange.rejectResponse(error)
+  }
+
+  private tombstone(requestId: number): void {
+    this.tombstoned.set(requestId, 0)
+    // Bounded: the oldest entry goes when the map is full.
+    if (this.tombstoned.size > 128) {
+      const oldest = this.tombstoned.keys().next()
+      if (!oldest.done) this.tombstoned.delete(oldest.value)
+    }
+  }
+
+  private sendCancel(requestId: number, reasonCode: number): void {
+    try {
+      if (this.transport.isOpen()) {
+        this.transport.sendData(serializeCancel(requestId, reasonCode))
+      }
+    } catch (error) {
+      console.warn('[ProxyFetch] Could not send cancel:', error)
+    }
+  }
+
+  private bindAbort(requestId: number, signal: AbortSignal): void {
+    if (signal.aborted) {
+      this.sendCancel(requestId, TunnelErrorCode.E_SESSION_CLOSED)
+      this.failExchange(requestId, new LemProxyError('E_SESSION_CLOSED', 'Aborted'), true)
+      return
+    }
+    signal.addEventListener(
+      'abort',
+      () => {
+        this.sendCancel(requestId, TunnelErrorCode.E_SESSION_CLOSED)
+        this.failExchange(requestId, new LemProxyError('E_SESSION_CLOSED', 'Aborted'), true)
+      },
+      { once: true }
+    )
+  }
+
+  private armTimer(
+    requestId: number,
+    exchange: PendingExchange,
+    delayMs: number,
+    code: 'E_TIMEOUT_HEAD' | 'E_TIMEOUT_STREAM'
+  ): void {
+    this.clearTimer(exchange)
+    exchange.timer = window.setTimeout(() => {
+      exchange.timer = null
+      this.failExchange(requestId, new LemProxyError(code), true)
+      this.sendCancel(requestId, TunnelErrorCode[code])
+    }, delayMs)
+  }
+
+  private clearTimer(exchange: PendingExchange): void {
+    if (exchange.timer !== null) {
+      clearTimeout(exchange.timer)
+      exchange.timer = null
+    }
+  }
+
+  /**
+   * Fail everything outstanding. Called when the transport goes away so the map
+   * cannot accumulate resolvers nobody will ever call, and so an open stream is
+   * errored rather than left hanging.
    */
   clearPending(): void {
-    const pending = [...this.pendingRequests.values()]
-    this.pendingRequests.clear()
-    pending.forEach((request) => {
-      request.reject(new Error('Connection closed'))
+    const ids = [...this.pending.keys()]
+    ids.forEach((requestId) => {
+      this.failExchange(requestId, new Error('Connection closed'), false)
     })
+    this.pending.clear()
+    this.tombstoned.clear()
   }
 }

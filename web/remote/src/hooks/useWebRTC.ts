@@ -23,7 +23,7 @@ import { RelayClient } from '../lib/relay-client'
 import { HTTPProxy, WebRTCTransport, RelayTransport } from '../lib/proxy-fetch'
 import { WSProxyManager } from '../lib/ws-proxy'
 import { setupWebSocketIntercept, teardownWebSocketIntercept } from '../lib/websocket-intercept'
-import { FrameType } from '../lib/http-frame'
+import { TunnelSession } from '../lib/tunnel-session'
 import type { ConnectionState, DataChannelState } from '../api/types'
 
 interface UseWebRTCOptions {
@@ -74,6 +74,7 @@ export function useWebRTC(options: UseWebRTCOptions) {
   const relayClientRef = useRef<RelayClient | null>(null)
   const httpProxyRef = useRef<HTTPProxy | null>(null)
   const wsProxyManagerRef = useRef<WSProxyManager | null>(null)
+  const tunnelSessionRef = useRef<TunnelSession | null>(null)
   const pollingIntervalRef = useRef<number | null>(null)
   const webrtcFailureCountRef = useRef<number>(0)
   const isRelayFallbackRef = useRef<boolean>(false)
@@ -96,10 +97,14 @@ export function useWebRTC(options: UseWebRTCOptions) {
 
     managerRef.current?.disconnect()
 
-    // Fail anything still waiting on the tunnel rather than leaking resolvers.
+    // Fail anything still waiting on the tunnel rather than leaking resolvers,
+    // and error every open response stream instead of leaving it hanging.
     httpProxyRef.current?.clearPending()
 
     wsProxyManagerRef.current?.closeAll()
+
+    // The next channel renegotiates from scratch.
+    tunnelSessionRef.current?.reset()
 
     // Point the proxies back at the WebRTC transport for the next attempt.
     if (managerRef.current) {
@@ -178,18 +183,24 @@ export function useWebRTC(options: UseWebRTCOptions) {
     httpProxyRef.current = httpProxy
     wsProxyManagerRef.current = wsProxyManager
 
-    function routeBinaryFrame(message: ArrayBuffer): void {
-      const frameType = new DataView(message).getUint8(0)
+    // One session for both transports: the frame dispatch existed twice in v2,
+    // once per transport, and the two copies were free to drift.
+    const session = new TunnelSession({
+      transport: webrtcTransport,
+      httpProxy,
+      wsProxyManager,
+      onProtocolError: (protocolError) => {
+        setError(protocolError)
+      },
+      closeChannel: () => {
+        managerRef.current?.disconnect()
+        relayClientRef.current?.disconnect()
+      },
+    })
+    tunnelSessionRef.current = session
 
-      if (frameType === FrameType.HTTP_RESPONSE) {
-        httpProxy.handleResponse(message)
-      } else if (frameType === FrameType.WS_DATA) {
-        wsProxyManager.handleDataFrame(message)
-      } else if (frameType === FrameType.WS_CLOSE) {
-        wsProxyManager.handleCloseFrame(message)
-      } else {
-        console.warn(`[useWebRTC] Unknown frame type: 0x${frameType.toString(16)}`)
-      }
+    function routeBinaryFrame(message: ArrayBuffer): void {
+      session.handleFrame(message)
     }
 
     // Install (or re-point) WebSocket interception for this proxy manager
@@ -202,7 +213,13 @@ export function useWebRTC(options: UseWebRTCOptions) {
       if (relayClientRef.current && connectionModeRef.current === 'relay') {
         setDataChannelState(relayClientRef.current.getDataChannelState())
       } else if (managerRef.current) {
-        setDataChannelState(managerRef.current.getDataChannelState())
+        const state = managerRef.current.getDataChannelState()
+        setDataChannelState(state)
+        // HELLO is the first frame on a newly opened channel, before any other
+        // traffic (spec section 5.8).
+        if (state === 'open' && !session.sentHello) {
+          session.begin()
+        }
       }
     }, DATA_CHANNEL_POLL_MS)
 
@@ -245,6 +262,11 @@ export function useWebRTC(options: UseWebRTCOptions) {
         const relayTransport = new RelayTransport(relayClient)
         httpProxy.setTransport(relayTransport)
         wsProxyManager.updateTransport(relayTransport)
+
+        // A new channel renegotiates from scratch: the relay peer advertises
+        // its own limits, and the relay path has no SCTP ceiling.
+        session.setTransport(relayTransport)
+        session.begin()
 
         // Clear any previous WebRTC errors since relay connected successfully
         setError(null)
