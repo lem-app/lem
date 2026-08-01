@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+#
+# Dependency updates for the three uv projects, the two pnpm apps, and the
+# GitHub Actions used by CI.
+#
+# Updates are grouped so a week's worth of bumps arrives as a handful of PRs
+# rather than dozens. Note that Dependabot does not sign off its commits, so
+# the `dco` job in ci.yml skips dependabot[bot] by design.
+
+version: 2
+
+updates:
+  # --- GitHub Actions -------------------------------------------------------
+  # Actions in ci.yml are pinned to full commit SHAs. Dependabot understands
+  # the `# vX.Y.Z` comment next to each SHA and updates both together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # --- Python (uv) ----------------------------------------------------------
+  - package-ecosystem: uv
+    directories:
+      - /server
+      - /cloud/signaling
+      - /cloud/relay
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+    labels:
+      - dependencies
+      - python
+    groups:
+      python-minor-patch:
+        update-types:
+          - minor
+          - patch
+      # Majors stay separate: they are the ones that need a human to read the
+      # changelog.
+      python-major:
+        update-types:
+          - major
+
+  # --- TypeScript (pnpm) ----------------------------------------------------
+  # pnpm lockfiles are handled by the `npm` ecosystem.
+  - package-ecosystem: npm
+    directories:
+      - /web/local
+      - /web/remote
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      # React, Radix, and the Tailwind/Vite toolchain each move together;
+      # splitting them keeps a broken bump easy to bisect.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      radix:
+        patterns:
+          - "@radix-ui/*"
+      build-tooling:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "vitest"
+          - "@vitest/*"
+          - "typescript"
+          - "typescript-eslint"
+          - "eslint"
+          - "@eslint/*"
+          - "eslint-plugin-*"
+          - "prettier"
+          - "tailwindcss"
+          - "@tailwindcss/*"
+          - "postcss"
+          - "autoprefixer"
+      js-minor-patch:
+        update-types:
+          - minor
+          - patch
+      js-major:
+        update-types:
+          - major

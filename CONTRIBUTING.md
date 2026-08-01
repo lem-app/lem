@@ -30,7 +30,22 @@ This adds a sign-off line that looks like:
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
-**Important:** The name and email must match your git configuration and your GitHub account.
+**Important:** The name and email must match the commit's own author identity.
+
+This is enforced by the `dco` CI check, which compares every non-merge commit's
+`Signed-off-by:` line against that commit's author name and email (ignoring
+case and surrounding whitespace). A syntactically valid sign-off belonging to
+*someone else* is rejected. Using `git commit -s` derives the line from your
+git config, so it matches automatically.
+
+If a commit is rejected because the author identity itself is wrong, fix your
+config and amend:
+
+```bash
+git config user.name "Your Name"
+git config user.email "your.email@example.com"
+git commit --amend --reset-author -s
+```
 
 ### Configure Git
 
@@ -116,26 +131,64 @@ Please read and follow our coding standards in [CLAUDE.md](./CLAUDE.md):
 
 Run these checks locally:
 
+These are the same commands, in the same order, that CI runs. Run them from
+inside each service directory.
+
 ```bash
-# Python (server/)
-uv run ruff format server/
-uv run ruff check server/
-uv run mypy server/
-uv run pytest
+# Python — repeat in server/, cloud/signaling/ and cloud/relay/
+cd server
+uv run ruff format --check app/
+uv run ruff check app/ tests/
+uv run mypy app/
+uv run pytest --cov=app --cov-report=term-missing
 
 # TypeScript (web/)
 cd web/local
 pnpm run format
 pnpm run lint
-pnpm tsc --noEmit
+pnpm exec tsc -b --noEmit   # -b is required: see note below
 pnpm run test  # if tests exist
 
 cd ../remote
 pnpm run format
 pnpm run lint
-pnpm run type-check
+pnpm exec tsc -b --noEmit
 pnpm run test
 ```
+
+> **Why `tsc -b --noEmit` and not `tsc --noEmit`?**
+> Both web apps use solution-style `tsconfig.json` files (`"files": []` plus
+> `"references"`). A bare `tsc --noEmit` builds a program with **zero** root
+> files, checks nothing, and exits 0 — it looks like a passing type-check but
+> is not one. `-b` (`--build`) follows the project references and checks all
+> ~137 (local) / ~115 (remote) files. CI uses the `-b` form.
+
+### Coverage ratchet
+
+CI enforces a **minimum coverage floor per Python service** via
+`--cov-fail-under`. The floors live in one obvious place —
+the `matrix.include` block at the top of
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — and are set to each
+service's measured coverage, rounded down slightly for noise:
+
+| Service | Floor | Measured | Gap to the 80% target |
+| --- | --- | --- | --- |
+| `server` | 17% | 19.32% | ~61 points |
+| `cloud/signaling` | 65% | 67.05% | ~13 points |
+| `cloud/relay` | 0% | 0.00% (no tests yet) | 80 points |
+
+**These numbers may only ever go up.**
+
+- If your change raises a service's coverage, raise that service's floor to
+  match. That is how the project climbs toward the >80% target in
+  [CLAUDE.md](./CLAUDE.md).
+- **Never lower a floor to make a red build green.** A dropping floor is
+  exactly the silent regression this gate exists to catch. If coverage fell,
+  add tests instead.
+
+The floors are deliberately set at today's reality rather than at the 80%
+target: a permanently-red gate teaches everyone to ignore CI, which is worse
+than no gate at all. They are a starting position, not a destination.
 
 ## 🔄 Contribution Workflow
 
