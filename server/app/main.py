@@ -116,8 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info(f"✓ Lem local API {posture.describe()}; {enforcement}")
     elif posture.verified:
         logger.warning(
-            f"⚠ Lem local API {posture.describe()}: {enforcement} "
-            f"(token in {TOKEN_PATH})"
+            f"⚠ Lem local API {posture.describe()}: {enforcement} (token in {TOKEN_PATH})"
         )
     else:
         logger.warning(
