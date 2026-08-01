@@ -88,10 +88,8 @@ function shouldProxyWebSocket(url: string): boolean {
  */
 export function setupWebSocketIntercept(wsProxyManager: WSProxyManager): void {
   // Save original WebSocket if not already saved
-  if (!OriginalWebSocket) {
-    OriginalWebSocket = window.WebSocket
-    console.log('[WSIntercept] Saved original WebSocket constructor')
-  }
+  OriginalWebSocket ??= window.WebSocket
+  const nativeWebSocket = OriginalWebSocket
 
   // Store proxy manager reference
   activeProxyManager = wsProxyManager
@@ -113,26 +111,26 @@ export function setupWebSocketIntercept(wsProxyManager: WSProxyManager): void {
     // Use native WebSocket
     console.log('[WSIntercept] Using native WebSocket for:', urlString)
     if (protocols !== undefined) {
-      return new OriginalWebSocket!(urlString, protocols)
+      return new nativeWebSocket(urlString, protocols)
     }
-    return new OriginalWebSocket!(urlString)
+    return new nativeWebSocket(urlString)
   } as unknown as typeof WebSocket
 
   // Copy static properties from original WebSocket
   Object.defineProperty(ProxiedWebSocketConstructor, 'CONNECTING', {
-    value: OriginalWebSocket.CONNECTING,
+    value: nativeWebSocket.CONNECTING,
     writable: false,
   })
   Object.defineProperty(ProxiedWebSocketConstructor, 'OPEN', {
-    value: OriginalWebSocket.OPEN,
+    value: nativeWebSocket.OPEN,
     writable: false,
   })
   Object.defineProperty(ProxiedWebSocketConstructor, 'CLOSING', {
-    value: OriginalWebSocket.CLOSING,
+    value: nativeWebSocket.CLOSING,
     writable: false,
   })
   Object.defineProperty(ProxiedWebSocketConstructor, 'CLOSED', {
-    value: OriginalWebSocket.CLOSED,
+    value: nativeWebSocket.CLOSED,
     writable: false,
   })
 
@@ -153,11 +151,4 @@ export function teardownWebSocketIntercept(): void {
   }
 
   activeProxyManager = null
-}
-
-/**
- * Check if WebSocket interception is currently active.
- */
-export function isWebSocketInterceptActive(): boolean {
-  return window.WebSocket !== OriginalWebSocket && OriginalWebSocket !== null
 }

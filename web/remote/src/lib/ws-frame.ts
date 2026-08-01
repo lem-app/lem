@@ -133,46 +133,6 @@ export function serializeWSConnect(frame: WSConnectFrame): ArrayBuffer {
 }
 
 /**
- * Deserialize binary frame to WebSocket CONNECT.
- */
-export function deserializeWSConnect(buffer: ArrayBuffer): WSConnectFrame {
-  const view = new DataView(buffer)
-  let offset = 0
-
-  // Read frame_type (uint8) and validate
-  const frameType = view.getUint8(offset)
-  offset += 1
-
-  if (frameType !== FrameType.WS_CONNECT) {
-    throw new Error(`Expected WS_CONNECT frame (0x10), got 0x${frameType.toString(16)}`)
-  }
-
-  // Read connection_id (uint32)
-  const connectionId = view.getUint32(offset, false)
-  offset += 4
-
-  // Read url_len (uint16) and url
-  const urlLen = view.getUint16(offset, false)
-  offset += 2
-  const urlBytes = new Uint8Array(buffer, offset, urlLen)
-  const url = textDecoder.decode(urlBytes)
-  offset += urlLen
-
-  // Read headers_len (uint32) and headers
-  const headersLen = view.getUint32(offset, false)
-  offset += 4
-  const headersBytes = new Uint8Array(buffer, offset, headersLen)
-  const headersJson = textDecoder.decode(headersBytes)
-  const headers = JSON.parse(headersJson) as Record<string, string>
-
-  return {
-    connectionId,
-    url,
-    headers,
-  }
-}
-
-/**
  * Serialize WebSocket DATA frame to binary.
  */
 export function serializeWSData(frame: WSDataFrame): ArrayBuffer {
