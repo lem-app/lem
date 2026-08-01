@@ -15,11 +15,10 @@
 
 """Tests for WebRTC tunnel agent."""
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from aiortc import RTCDataChannel, RTCIceCandidate, RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCDataChannel, RTCPeerConnection, RTCSessionDescription
 
 from app.tunnel.webrtc_client import ConnectionState, TunnelAgent
 
@@ -195,7 +194,11 @@ class TestTunnelAgent:
                 channel.send = Mock()  # type: ignore[method-assign]
 
                 # Mock readyState property
-                with patch.object(type(channel), "readyState", new_callable=lambda: property(lambda self: "open")):
+                with patch.object(
+                    type(channel),
+                    "readyState",
+                    new_callable=lambda: property(lambda self: "open"),
+                ):
                     await agent.send_data("test message")
                     channel.send.assert_called_once_with("test message")
 
@@ -215,7 +218,11 @@ class TestTunnelAgent:
                 channel = await agent.create_data_channel()
 
                 # Mock readyState property to return "closed"
-                with patch.object(type(channel), "readyState", new_callable=lambda: property(lambda self: "closed")):
+                with patch.object(
+                    type(channel),
+                    "readyState",
+                    new_callable=lambda: property(lambda self: "closed"),
+                ):
                     with pytest.raises(RuntimeError, match="DataChannel not open"):
                         await agent.send_data("test message")
 
