@@ -33,8 +33,11 @@
  * visible error. Until the relay grows an explicit ack, this client:
  *
  * 1. stays in `connecting` after sending auth,
- * 2. treats an explicit `{"type": "error"}` control frame or a 1008 close as a
- *    **permanent** auth failure - surfaced to the caller, reconnection stopped,
+ * 2. classifies an explicit `{"type": "error"}` control frame by its own
+ *    `reason` / `retryable` fields - terminal rejections stop reconnection and
+ *    are surfaced to the caller, retryable ones (a busy relay) back off and
+ *    retry - and falls back to the close code (1008 terminal, 1013 retryable)
+ *    only when no frame arrived,
  * 3. treats an explicit `{"type": "connected"}` / `{"type": "auth-ok"}` control
  *    frame, or the first binary frame, as proof the tunnel is live (so we adopt
  *    a real ack automatically once the server sends one),
@@ -48,13 +51,82 @@
 import type { ConnectionState } from '../api/types'
 
 /**
- * Raised when the relay rejects our credentials. Reconnecting will not help.
+ * The relay refused this connection.
+ *
+ * `retryable` comes off the error frame itself, not from the close code: the
+ * relay sends the two independently and the frame arrives first (and sometimes
+ * the close never arrives at all). Conflating them turned "the relay is busy,
+ * come back in a moment" into "sign in again" and disabled relay reconnection
+ * for the whole session.
  */
-export class RelayAuthError extends Error {
-  constructor(message: string) {
+export class RelayRejectedError extends Error {
+  readonly reason: string
+  readonly retryable: boolean
+
+  constructor(message: string, reason: string, retryable: boolean) {
     super(message)
+    this.name = 'RelayRejectedError'
+    this.reason = reason
+    this.retryable = retryable
+  }
+}
+
+/**
+ * Raised when the relay rejects our credentials. Reconnecting will not help;
+ * the user has to authenticate again.
+ */
+export class RelayAuthError extends RelayRejectedError {
+  constructor(message: string, reason = 'auth-failed') {
+    super(message, reason, false)
     this.name = 'RelayAuthError'
   }
+}
+
+/**
+ * Reason codes from `cloud/relay/app/core/errors.py` that mean "the same
+ * request may succeed later, unchanged". Used only when a relay omits the
+ * explicit `retryable` boolean; the boolean wins when present.
+ */
+const RETRYABLE_REASONS = new Set(['relay-at-capacity', 'account-session-limit'])
+
+/** Reason codes whose cure is new credentials rather than a different request. */
+const AUTH_REASONS = new Set(['auth-failed', 'grant-already-used', 'session-mismatch'])
+
+/** Fallback text per reason, used when the relay sends no message. */
+const FALLBACK_MESSAGES: Record<string, string> = {
+  'relay-at-capacity': 'The relay is busy right now. Retrying automatically.',
+  'account-session-limit':
+    'This account already has as many relay sessions open as it may. Close another session, or wait and retry.',
+  'grant-already-used': 'This relay session grant was already used. Reconnecting to get a new one.',
+  'session-mismatch': 'This relay session belongs to a different device pair.',
+  'device-already-connected': 'This device is already connected to that relay session.',
+  'session-full': 'That relay session already has both sides connected.',
+  'session-closed': 'That relay session was closed.',
+  'unsupported-client': 'This Lem client is too old for the relay. Update Lem.',
+  'protocol-error': 'The relay rejected our handshake.',
+}
+
+/**
+ * Turn a relay error frame into a typed error.
+ *
+ * A capacity rejection must never tell the user to sign in again - that is the
+ * whole point of the `reason` field.
+ */
+function buildRejection(reason: string, message: string, retryable: boolean): RelayRejectedError {
+  const text =
+    message ||
+    FALLBACK_MESSAGES[reason] ||
+    (retryable
+      ? 'The relay is temporarily unavailable. Retrying automatically.'
+      : 'The relay rejected the connection.')
+
+  if (!retryable && (AUTH_REASONS.has(reason) || reason === '')) {
+    return new RelayAuthError(
+      message || 'Relay rejected the session token (it may have expired). Sign in again.',
+      reason || 'auth-failed'
+    )
+  }
+  return new RelayRejectedError(text, reason, retryable)
 }
 
 /**
@@ -71,6 +143,9 @@ const MAX_RECONNECT_ATTEMPTS = 5
 /** WebSocket close code the relay uses to reject bad credentials. */
 const WS_POLICY_VIOLATION = 1008
 
+/** WebSocket close code the relay uses for capacity rejections: retry later. */
+const WS_TRY_AGAIN_LATER = 1013
+
 /**
  * Relay client configuration.
  */
@@ -86,6 +161,8 @@ export interface RelayClientConfig {
 interface RelayControlMessage {
   type?: unknown
   message?: unknown
+  reason?: unknown
+  retryable?: unknown
 }
 
 /**
@@ -107,6 +184,10 @@ export class RelayClient {
   private onMessage?: (message: ArrayBuffer) => void
   private onError?: (error: Error) => void
 
+  // Last classified rejection, kept so the close handler reports what the
+  // error frame already established rather than a generic "closed (code N)".
+  private lastRejection: RelayRejectedError | null = null
+
   // Reconnection
   private shouldReconnect = true
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS
@@ -127,6 +208,9 @@ export class RelayClient {
    */
   async connect(): Promise<void> {
     this.shouldReconnect = true
+    // An explicit connect() is a fresh decision by the caller: a terminal
+    // rejection from a previous attempt must not colour this one.
+    this.lastRejection = null
     this.cancelReconnect()
     this.setState('connecting')
 
@@ -271,16 +355,31 @@ export class RelayClient {
         if (this.ws !== ws) return
         this.ws = null
 
-        const authFailure = event.code === WS_POLICY_VIOLATION
-        const error = authFailure
-          ? new RelayAuthError(
-              event.reason ||
-                'Relay rejected the session token (it may have expired). Sign in again.'
-            )
-          : new Error(`Relay connection closed (code ${event.code})`)
+        // The error frame, if one arrived, already classified this close. Only
+        // fall back to the close code when it did not: 1013 is "try again
+        // later" and must not be reported as an authentication failure.
+        const rejection = this.lastRejection
+        const permanent = rejection ? !rejection.retryable : event.code === WS_POLICY_VIOLATION
 
-        markFailed(error, authFailure)
-        this.setState(authFailure ? 'failed' : 'closed')
+        let error: Error
+        if (rejection) {
+          error = rejection
+        } else if (event.code === WS_POLICY_VIOLATION) {
+          error = new RelayAuthError(
+            event.reason || 'Relay rejected the session token (it may have expired). Sign in again.'
+          )
+        } else if (event.code === WS_TRY_AGAIN_LATER) {
+          error = new RelayRejectedError(
+            event.reason || 'The relay is busy right now. Retrying automatically.',
+            'relay-at-capacity',
+            true
+          )
+        } else {
+          error = new Error(`Relay connection closed (code ${event.code})`)
+        }
+
+        markFailed(error, permanent)
+        this.setState(permanent ? 'failed' : 'closed')
         this.scheduleReconnect()
       }
 
@@ -326,7 +425,20 @@ export class RelayClient {
     const message = typeof parsed.message === 'string' ? parsed.message : ''
 
     if (type === 'error') {
-      markFailed(new RelayAuthError(message || 'Relay rejected the connection'), true)
+      const reason = typeof parsed.reason === 'string' ? parsed.reason : ''
+      // Trust the explicit boolean; fall back to the known reason set only
+      // when a relay omits it.
+      const retryable =
+        typeof parsed.retryable === 'boolean' ? parsed.retryable : RETRYABLE_REASONS.has(reason)
+
+      const error = buildRejection(reason, message, retryable)
+      this.lastRejection = error
+      console.warn(
+        `[RelayClient] Relay rejected the connection (reason=${reason || 'unspecified'}, retryable=${retryable})`
+      )
+      // Permanent only when the relay says so. A retryable rejection keeps
+      // reconnection alive so the backoff can do its job.
+      markFailed(error, !retryable)
       return
     }
 

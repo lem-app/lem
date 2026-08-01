@@ -35,6 +35,62 @@ from .ws_proxy import WSProxyHandler
 
 logger = logging.getLogger(__name__)
 
+# Reason codes the relay puts on ``{"type": "error"}`` frames. The authority is
+# ``cloud/relay/app/core/errors.py``; this is the subset a client must branch
+# on. A retryable rejection means the same request may succeed later, unchanged
+# - backing off is correct and disabling reconnection is not.
+RETRYABLE_RELAY_REASONS = frozenset({"relay-at-capacity", "account-session-limit"})
+
+# Reasons whose cure is new credentials, as opposed to a different request.
+AUTH_RELAY_REASONS = frozenset({"auth-failed", "grant-already-used", "session-mismatch"})
+
+# Close codes the relay uses. 1013 is "try again later"; 1008 is a policy
+# rejection. The error frame is authoritative, but the socket may drop before
+# it arrives, so the close code is the fallback classifier.
+WS_POLICY_VIOLATION = 1008
+WS_TRY_AGAIN_LATER = 1013
+
+
+class RelayRejection:
+    """A classified rejection from the relay.
+
+    ``retryable`` is read from the frame, not inferred from the close code:
+    the relay sends the two independently and the frame arrives first.
+    """
+
+    def __init__(self, reason: str, message: str, retryable: bool) -> None:
+        """Initialize the rejection.
+
+        Args:
+            reason: Machine-readable reason code from the relay
+            message: Human-readable message from the relay
+            retryable: Whether reconnecting later could succeed
+        """
+        self.reason = reason
+        self.message = message
+        self.retryable = retryable
+
+    def describe(self) -> str:
+        """Build an operator-facing description.
+
+        Returns:
+            One line naming the cure, not just the failure
+        """
+        if self.retryable:
+            return (
+                f"Relay is temporarily unavailable ({self.reason or 'unknown reason'}): "
+                f"{self.message or 'try again shortly'}. Retrying with backoff."
+            )
+        if self.reason in AUTH_RELAY_REASONS or not self.reason:
+            return (
+                f"Relay rejected our credentials ({self.reason or 'unknown reason'}): "
+                f"{self.message or 'authentication failed'}. Re-authentication is required."
+            )
+        return (
+            f"Relay refused the connection ({self.reason}): "
+            f"{self.message or 'no message'}. Retrying will not help."
+        )
+
 
 class RelayConnectionState(str, Enum):
     """Relay connection states."""
@@ -78,6 +134,10 @@ class RelayClient:
         # Connection state
         self.state: RelayConnectionState = RelayConnectionState.DISCONNECTED
 
+        # Last classified rejection, kept so the close path does not re-decide
+        # what the error frame already settled.
+        self.last_rejection: RelayRejection | None = None
+
         # Callbacks
         self.on_state_change: Callable[[RelayConnectionState], None] | None = None
 
@@ -105,6 +165,11 @@ class RelayClient:
         self.relay_url = relay_url
         self.session_id = session_id
         self.token = token
+
+        # An explicit connect() is a fresh decision by the caller: a terminal
+        # rejection from a previous attempt must not disable this one.
+        self.should_reconnect = True
+        self.last_rejection = None
 
         await self._set_state(RelayConnectionState.CONNECTING)
 
@@ -214,8 +279,17 @@ class RelayClient:
                     logger.debug(f"Relay binary message: {len(msg.data)} bytes")
                     await self._handle_relay_message(msg.data)
 
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    # Control frame. A terminal rejection stops reconnection;
+                    # a retryable one must not, or a busy relay permanently
+                    # disables the fallback path for the session.
+                    if self._handle_control_message(msg.data):
+                        await self._set_state(RelayConnectionState.FAILED)
+                        return
+
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
                     logger.info("Relay WebSocket closed by server")
+                    self._apply_close_code()
                     await self._set_state(RelayConnectionState.CLOSED)
                     if self.should_reconnect:
                         await self._handle_reconnect()
@@ -228,11 +302,90 @@ class RelayClient:
                         await self._handle_reconnect()
                     return
 
+            # The iterator also ends without a CLOSED message when the peer
+            # closes cleanly; the close code is only readable here.
+            self._apply_close_code()
+            await self._set_state(RelayConnectionState.CLOSED)
+            if self.should_reconnect:
+                await self._handle_reconnect()
+
         except Exception as e:
             logger.error(f"Error handling relay messages: {e!r}")
             await self._set_state(RelayConnectionState.FAILED)
             if self.should_reconnect:
                 await self._handle_reconnect()
+
+    def _handle_control_message(self, raw: str) -> bool:
+        """Classify a JSON control frame from the relay.
+
+        The relay sends ``reason`` and ``retryable`` on every error frame
+        precisely so a client does not have to infer permanence from a close
+        code that arrives separately and may never arrive at all.
+
+        Args:
+            raw: Text frame payload
+
+        Returns:
+            True if the rejection is terminal and reconnection must stop
+        """
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Ignoring non-JSON relay control frame")
+            return False
+
+        if not isinstance(parsed, dict) or parsed.get("type") != "error":
+            return False
+
+        reason = parsed.get("reason")
+        message = parsed.get("message")
+        retryable_field = parsed.get("retryable")
+
+        reason_str = reason if isinstance(reason, str) else ""
+        # Trust the explicit boolean; fall back to the known reason set only
+        # when a relay omits it.
+        retryable = (
+            retryable_field
+            if isinstance(retryable_field, bool)
+            else reason_str in RETRYABLE_RELAY_REASONS
+        )
+
+        rejection = RelayRejection(
+            reason=reason_str,
+            message=message if isinstance(message, str) else "",
+            retryable=retryable,
+        )
+        self.last_rejection = rejection
+
+        if rejection.retryable:
+            logger.warning(rejection.describe())
+            return False
+
+        logger.error(rejection.describe())
+        self.should_reconnect = False
+        return True
+
+    def _apply_close_code(self) -> None:
+        """Classify a close that arrived without an error frame.
+
+        Only used as a fallback: if the relay already told us on the frame, its
+        answer stands. 1008 is a policy rejection that a retry cannot fix; 1013
+        explicitly means "try again later" and must keep reconnection alive.
+        """
+        if self.last_rejection is not None:
+            return
+
+        close_code = self.ws.close_code if self.ws is not None else None
+        if close_code == WS_POLICY_VIOLATION:
+            logger.error(
+                "Relay closed the connection with 1008 (policy violation) and no error frame. "
+                "Re-authentication is required; not reconnecting."
+            )
+            self.should_reconnect = False
+        elif close_code == WS_TRY_AGAIN_LATER:
+            logger.warning(
+                "Relay closed the connection with 1013 (try again later). Retrying with backoff."
+            )
 
     async def _handle_relay_message(self, data: bytes) -> None:
         """Handle incoming relay message (HTTP or WebSocket frame).
