@@ -245,6 +245,17 @@ Three things remain genuinely different, and they are the whole case for Lem's e
    label on it. Lem's architecture — accounts, device registration, session negotiation — is
    the right shape for solving this. It just does not work yet.
 
+   **Stated as sharply as the evidence allows, because this is the whole thesis in one
+   sentence:** Harbor's remote layer is undocumented beyond a CLI one-liner, has no
+   authentication of any kind, and the services behind it bind `0.0.0.0` by default — the last
+   of which is an open, unanswered complaint on Harbor's own tracker
+   ([#231](https://github.com/av/harbor/issues/231), §2.5). Harbor has built the management
+   layer and left the access layer as an exercise for the user. **That gap — authenticated,
+   identity-bound access to a managed multi-service stack — is the only ground in §2.2 that
+   nobody occupies, and it is the position the rest of this document argues Lem should take.**
+   An independent competitive research pass, run without sight of this document, reached the
+   same conclusion from the same Harbor evidence.
+
    The stakes are not hypothetical. Tailscale's own research
    ([Sept 2025](https://tailscale.com/blog/AI-endpoints-on-public-web)) cites Cisco Talos
    finding **1,100+ exposed Ollama endpoints** on the public internet via Shodan, ~1,000
@@ -282,7 +293,9 @@ competitive fact in this document:
 
 - Shipped **4 June 2026**; the *Locally* app team was acquired **8 April 2026**.
 - Transport is **Tailscale**, in an announced partnership: *"All communication and data
-  transfer between devices is always end-to-end encrypted, thanks to Tailscale."*
+  transfer between devices is always end-to-end encrypted, thanks to Tailscale"*
+  ([lmstudio.ai/docs/lmlink](https://lmstudio.ai/docs/lmlink)). Confirmed twice, by two research
+  passes working independently.
 - Setup is: install app, follow in-app instructions. No tunnel configuration.
 - **LM Link is free, with a documented 5-device cap.** [lmstudio.ai/pricing](https://lmstudio.ai/pricing)
   lists *"LM Link for up to 5 devices"* in the free tier. This is not an undocumented gap — it
@@ -808,7 +821,7 @@ it is one person, exactly like Lem:
 
 | Harbor signal | Value | Source |
 |---|---|---|
-| Commits in the last 52 weeks by the owner | **980 of 998 — 98.2%** | `gh api repos/av/harbor/stats/participation` |
+| Commits in the last 52 weeks by the owner | **980 of 998 — 98.2%** | `gh api repos/av/harbor/stats/participation` (reproduced; an independent measurement a few days earlier got 97.9% — this is a *rolling* 52-week window, so the exact figure drifts. Anything in the 97–99% band supports the same reading) |
 | Open PRs, all from outside contributors | **5**, oldest opened **2025-05-21** and still unmerged | `gh api repos/av/harbor/pulls` |
 | Discord members | **~100** | Discord invite API |
 | Desktop app downloads, v0.5.4, first ~10 days | **321 across all platforms** | GitHub releases API |
@@ -820,6 +833,17 @@ building on a foundation with no revenue, no co-maintainers, unreliable packagin
 ([#234](https://github.com/av/harbor/issues/234) install-script bug open since April;
 [#253](https://github.com/av/harbor/issues/253) Windows Defender flagging v0.5.4 — its
 single most-downloaded artifact), and a stale PyPI package.
+
+**Be precise about what kind of dependency risk this is, because the document overstated it.**
+Harbor is **Apache-2.0** and ships **`harbor eject`**, which renders a standalone Compose config.
+Lem can fork it, vendor it, or walk away from it at any time, and keep the catalog. **There is
+no entrapment risk and no licensing risk — the exposure is maintenance and direction.** Namely:
+Harbor's compose-file conventions can change under a catalog scanner that parses them, its
+packaging can break for Lem's users (#234, #253), and its single maintainer sets a roadmap Lem
+does not influence. Those are real and worth mitigating, but they are the risks of depending on
+*any* small upstream, not the risk of being locked into a proprietary one. An earlier framing
+here treated the two as equivalent; they are not, and the cheap exit is a genuine strategic
+asset rather than a caveat.
 
 **Also correct the framing elsewhere in this document:** Harbor's *catalog* is ~130–140
 services by its own wiki (21 frontends / 24 backends / 92 satellites), not 89. The 89 figure
