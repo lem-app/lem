@@ -541,8 +541,13 @@ Phase 6). Two consequences worth knowing before changing this code:
   `HttpOnly` refresh cookie that removes the cost is
   [#79](https://github.com/lem-app/lem/issues/79) and belongs to `cloud/signaling`.
 - The ESLint rule banning `localStorage`/`sessionStorage` in `web/remote/src` is a tripwire, not
-  the guarantee. It cannot see IndexedDB, a cookie, a Cache entry or a URL fragment; the sweep in
-  `lib/token-persistence.test.ts` covers those, with a positive control per surface.
+  the guarantee — it is defeated by any store it does not name. The guarantee is
+  `lib/token-persistence.test.ts`, which asserts the positive property: after `storeToken()` the
+  token is **not reachable from `globalThis`**, checked by walking the object graph rather than
+  enumerating storage APIs. An earlier version of that test *did* enumerate, and was defeated in
+  review by a single `Reflect.set(window, '__lemDebugCache', token)`. The walk states its own
+  boundaries (closures and function-object properties are out of scope, with the reasons and the
+  measurements); IndexedDB, the Cache API and cookies are instrumented separately.
 
 The **device** keypair is a separate matter and still lives in IndexedDB (`api/device-key.ts`):
 it is a non-extractable `CryptoKey`, so framed code can neither read it nor copy it out.

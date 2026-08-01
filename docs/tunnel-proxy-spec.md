@@ -1759,12 +1759,20 @@ design:**
    in `localStorage`, `sessionStorage`, or IndexedDB once the SW proxy is enabled. It MUST hold it
    in a module-scoped variable.
 
-   > Phase 6 read this requirement wider than its letter, deliberately. A rule naming three
-   > stores is satisfied by a cookie, a Cache entry or a URL fragment, so the shipped test sweeps
-   > **eight** surfaces with a positive control on each, and the ESLint rule bans the storage
-   > globals rather than the key name `'token'` (which a rename defeats). The requirement's own
-   > closing sentence — that a green lint rule with the token re-persisted elsewhere must fail —
-   > is what forced the wider reading.
+   > Phase 6 read this requirement wider than its letter, deliberately, and then had to widen it
+   > again. A rule naming three stores is satisfied by a cookie, a Cache entry or a URL fragment
+   > — but a list of *those* is satisfied by an arbitrary global property, which is how the first
+   > attempt failed review. What ships asserts the positive property instead: **after
+   > `storeToken()`, the token must not be reachable from a global root**, verified by walking the
+   > object graph. The ESLint rule bans the storage globals rather than the key name `'token'`
+   > (which a rename defeats) and is explicitly a tripwire, not the criterion.
+   >
+   > The walk's boundaries are stated in the test rather than left to be discovered: values held
+   > in **closures** are invisible to any property walk — which is exactly the mechanism that
+   > makes `session.ts` correct — and properties on **function objects** are excluded because
+   > including them costs 23 s without terminating against jsdom's constructor graph, versus
+   > ~120 ms without. Out-of-band stores that are not object properties are instrumented
+   > separately. An honest boundary beats a sweep that reads as exhaustive and is not.
 
    **The `HttpOnly` refresh cookie is a prerequisite, not part of this phase — and it does not
    exist.** An `HttpOnly` cookie can only be set by a server response header, so the signaling
@@ -2004,10 +2012,23 @@ through the secure WebRTC tunnel" claims where they are not yet true.
 - [x] The token lives only in a module-scoped variable, asserted by a test that reloads the page
       and observes a forced re-authentication — the accepted interim cost of §8.4 requirement 1.
       A green lint rule with the token silently re-persisted elsewhere must fail this criterion.
-      *`lib/token-persistence.test.ts` sweeps `localStorage`, `sessionStorage`, `document.cookie`,
-      IndexedDB, the Cache API, `location`, `history` and `window.name`, with a positive control
-      per surface. Demonstrated against re-persistence to a cookie and to IndexedDB: the lint rule
-      stays green and the sweep fails, which is exactly what this criterion asks for.*
+      *`lib/token-persistence.test.ts` asserts the **positive** property — after `storeToken()`,
+      the token must not be reachable from `globalThis` — by walking the object graph, rather than
+      enumerating storage APIs. Out-of-band stores that are not object properties (IndexedDB, the
+      Cache API, `document.cookie`) are instrumented separately. Every detector has a positive
+      control. Demonstrated against four re-persistence mutations —
+      `Reflect.set(window, '__lemDebugCache', token)`, `history.pushState`, a DOM `dataset`
+      property and `window.name` — each of which leaves the lint rule **green** and fails the
+      walk.*
+
+      > **The first implementation of this criterion enumerated surfaces, and lost.** A reviewer
+      > defeated it with one line, `Reflect.set(window, '__lemDebugCache', token)`: it names no
+      > banned identifier, so the lint rule passed, and a global property was not one of the eight
+      > surfaces scanned, so the sweep passed. It is also *worse* than `localStorage` — a framed
+      > iframe reads it as `window.parent.__lemDebugCache` with no API call to intercept and no
+      > storage event. The surface set is open-ended, so enumeration always loses; asserting
+      > unreachability tests the property we actually want. Recorded because "add the missing
+      > surface to the list" was the wrong fix and would have failed again.
 - [x] Upstream `Content-Security-Policy` is stripped; the injected shim executes under the
       substituted CSP. *Stripping and substitution are in-suite, including report-only, duplicate
       and mixed-case headers, plus assertions that the substituted policy declares no directive

@@ -662,8 +662,14 @@ precedence (`sw-bridge.test.ts`), the degraded UI and the absence of an iframe f
 (`ClientViewer.test.tsx`), Launch disabled while install/start/stop stay live
 (`ServiceCard.test.tsx`), CSP stripping and substitution including report-only and duplicate
 headers (`lem-app-sw.test.ts`), the shim landing first under a hostile upstream policy
-(`sw-shim.test.ts`), and the token-persistence sweep with a positive control per surface plus the
-forced re-authentication on reload (`token-persistence.test.ts`).
+(`sw-shim.test.ts`), and the token-reachability walk with a positive control per case — including
+the `Reflect.set(window, …)` mutation that defeated the earlier surface-enumeration version — plus
+the instrumented out-of-band stores and the forced re-authentication on reload
+(`token-persistence.test.ts`).
+
+Step C below is worth running even though the walk is in-suite: the walk is bounded (it does not
+follow closures or function-object properties, and it stops at depth 8), so a real browser with
+real DevTools remains the broader check.
 
 ---
 
