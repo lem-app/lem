@@ -62,19 +62,51 @@
 #                     credential word. Catches labelled secrets that are too
 #                     short for the rule above - `password:"hunter2hunter2hu"`.
 #
+# THE ONE EXCLUSION, AND WHY IT IS VERIFIED RATHER THAN ASSUMED. Vite inlines
+# assets below build.assetsInlineLimit as base64 `data:` URIs, and those bytes
+# are long, opaque and digit-bearing, so they would be reported on every run.
+# An earlier version of this script therefore skipped anything matching the
+# *textual shape* of a data: URI. That was a hole you could drive a bus
+# through: `'data:text/plain;base64,<secret>'` is one static literal, and it
+# was skipped whole, before either value rule ran. The secret shipped in
+# dist/assets/*.js and this script said PASS.
+#
+# A payload is now skipped only if BOTH hold:
+#   1. its MIME type is in ASSET_MAGIC below - an explicit image/font list, so
+#      text/plain and anything unrecognised is scanned like ordinary content;
+#   2. the payload actually decodes to that format's magic bytes - so
+#      `data:image/png;base64,<secret>` is scanned too, because a secret does
+#      not start with the PNG signature.
+# Anything that fails either test is scanned. The exclusion is now a statement
+# about bytes, not about punctuation.
+#
 # WHAT THIS CANNOT DO. It is a heuristic scan over build output, not a proof.
 # It will not see a secret that is split across concatenated literals, encoded
 # (rot13, char codes, escape sequences), shaped like ordinary prose, or shorter
-# than the thresholds without a nearby keyword. Do not read a pass as "there is
-# no secret in the bundle"; read it as "nothing credential-shaped was found by
-# the rules below". The final report says exactly that, on purpose.
+# than the thresholds without a nearby keyword. A secret hidden inside a real
+# PNG's pixel data would also pass. Do not read a pass as "there is no secret
+# in the bundle"; read it as "nothing credential-shaped was found by the rules
+# below". The final report says exactly that, on purpose.
 #
 # SELF-TEST. After the real scan, the value rules are re-run against a COPY of
-# the built output with freshly generated credential-shaped canaries appended.
-# If the scanner fails to flag them, this script fails - a gate that has never
-# been shown to fail is not a gate, and this project has now found four CI
-# gates that were silently passing. The demonstration runs on every invocation
-# rather than once, by hand, at review time.
+# the built output with freshly generated canaries appended. If the scanner
+# fails to flag them, this script fails - a gate that has never been shown to
+# fail is not a gate, and this project has now found four CI gates that were
+# silently passing. The demonstration runs on every invocation rather than
+# once, by hand, at review time.
+#
+# The canaries deliberately sit at the BOUNDARY of each rule, not in a
+# comfortable middle, because a self-test whose inputs are easier than reality
+# passes while blind. An earlier version used three middle-of-the-distribution
+# canaries, and review showed two one-line mutations - narrowing KEYWORD_RE to
+# just `password`, and anchoring OPAQUE_RE to a leading letter - that broke
+# detection of real secrets while the self-test still reported success. So the
+# set now includes: one canary per keyword alternative; shapes that start with
+# a digit and end with a digit; letter-heavy and digit-heavy shapes; strings
+# exactly AT the 32- and 16-char thresholds; the data: URI shapes above; and
+# NEGATIVE canaries one character BELOW each threshold plus a genuine inlined
+# PNG, which must NOT be reported. Both directions fail the script, so a rule
+# cannot silently narrow or silently widen.
 #
 # Usage:
 #   ./scripts/check-bundle-secrets.sh
@@ -110,6 +142,42 @@ readonly -a FORBIDDEN_NAMES=(
 
 readonly OPAQUE_RE='[A-Za-z0-9_+/=-]{32,}'
 readonly KEYWORD_RE='(token|secret|password|passwd|bearer|credential|api[_-]?key|apikey)[A-Za-z_]{0,12}["'"'"']?[[:space:]]*[:=,(][[:space:]]*["'"'"'][A-Za-z0-9_+/=-]{16,}'
+
+# Every keyword alternative in KEYWORD_RE above. The self-test plants one canary
+# per entry, so deleting an alternative from the regex without deleting it here
+# turns the self-test red. Keep the two in step.
+readonly -a KEYWORDS=(
+  token secret password passwd bearer credential apikey api_key api-key
+)
+
+# A base64 `data:` URI, in two halves so extraction and elision are composed
+# from the SAME parts. They have to describe exactly the same set: a payload
+# that could be elided without also being extracted would be a hole.
+readonly DATA_URI_PREFIX_RE='data:[A-Za-z0-9._+-]*/?[A-Za-z0-9._+-]*;base64,'
+readonly DATA_URI_PAYLOAD_RE='[A-Za-z0-9+/=]+'
+readonly DATA_URI_RE="${DATA_URI_PREFIX_RE}${DATA_URI_PAYLOAD_RE}"
+
+# MIME types whose payload may be skipped, and the hex magic bytes the payload
+# must ACTUALLY begin with for the skip to apply. Both halves are required: the
+# MIME type is a claim made by whoever wrote the string, and the magic bytes are
+# what is really there.
+#
+# image/svg+xml is deliberately absent. SVG is text, so a "verified" SVG payload
+# could carry anything; it gets scanned like any other content.
+asset_magic_for() {
+  case "$1" in
+    image/png) printf '89504e470d0a1a0a' ;;
+    image/jpeg) printf 'ffd8ff' ;;
+    image/gif) printf '474946383' ;;
+    image/webp) printf '52494646' ;;
+    image/x-icon | image/vnd.microsoft.icon) printf '00000100' ;;
+    font/woff | application/font-woff) printf '774f4646' ;;
+    font/woff2 | application/font-woff2) printf '774f4632' ;;
+    font/otf | application/x-font-opentype) printf '4f54544f' ;;
+    font/ttf | application/x-font-ttf) printf '00010000' ;;
+    *) return 1 ;;
+  esac
+}
 
 # Strings that legitimately trip `opaque-literal`. Matched whole-line against an
 # extracted candidate, never as a substring, so an entry cannot quietly widen
@@ -149,27 +217,68 @@ printf '%s\n' "${VALUE_ALLOWLIST[@]}" > "$ALLOWLIST_FILE"
 #
 # $1: path to the file
 # stdout: one finding per line, "<rule> <match>"; empty when clean.
+
+# Decode base64, tolerating both GNU (-d) and BSD/macOS (-D) spellings.
+decode_b64() {
+  printf '%s' "$1" | base64 -d 2>/dev/null \
+    || printf '%s' "$1" | base64 -D 2>/dev/null \
+    || true
+}
+
+# True when a data: URI payload is really an inlined image or font.
+#
+# $1: MIME type as claimed by the URI
+# $2: base64 payload
+is_inlined_asset() {
+  local mime="$1" payload="$2" expected magic
+
+  expected="$(asset_magic_for "$mime")" || return 1
+
+  # 16 base64 chars is a whole number of quanta and decodes to 12 bytes, which
+  # covers every signature in the table. A payload too short to hold a header
+  # is not an asset.
+  [[ ${#payload} -ge 16 ]] || return 1
+  magic="$(decode_b64 "${payload:0:16}" | od -An -tx1 -v | tr -d ' \n')"
+  [[ -n "$magic" && "$magic" == "$expected"* ]]
+}
+
 scan_file() {
   local file="$1"
-  local stripped="${TMP_DIR}/stripped"
+  local scannable="${TMP_DIR}/scannable"
+  local extras="${TMP_DIR}/extras"
+  local uri mime payload
 
-  # Vite inlines assets below build.assetsInlineLimit as base64 `data:` URIs.
-  # Those payloads are image and font bytes - long, opaque, digit-and-letter
-  # bearing, and reported on every single run if left in. The payload is
-  # replaced and the prefix kept, so the exclusion is visible here in the diff
-  # rather than hidden inside a narrowed pattern. Neither app inlines anything
-  # today; this is for the first icon that crosses the threshold.
-  sed -E 's#(data:[A-Za-z0-9.;+/-]*base64,)[A-Za-z0-9+/=]+#\1DATA-URI-PAYLOAD-STRIPPED#g' \
-    "$file" > "$stripped" 2>/dev/null || cp "$file" "$stripped"
+  : > "$extras"
 
-  grep -oaE "$OPAQUE_RE" "$stripped" 2>/dev/null \
+  # Decide, per URI, whether it is a genuine inlined asset. Anything that is
+  # not - wrong MIME, or a MIME whose bytes do not back it up - has its payload
+  # appended to the scan input, so eliding it below cannot hide it.
+  while IFS= read -r uri; do
+    [[ -n "$uri" ]] || continue
+    mime="${uri#data:}"
+    mime="${mime%%;*}"
+    payload="${uri#*;base64,}"
+    if is_inlined_asset "$mime" "$payload"; then
+      continue
+    fi
+    printf '%s\n' "$payload" >> "$extras"
+  done < <(grep -oaE "$DATA_URI_RE" "$file" 2>/dev/null || true)
+
+  # Elide every payload, then add back the ones that were not vouched for. The
+  # elision keeps a verified asset from drowning the report; the add-back is
+  # what makes the exclusion safe.
+  sed -E "s#(${DATA_URI_PREFIX_RE})${DATA_URI_PAYLOAD_RE}#\1PAYLOAD-ELIDED#g" \
+    "$file" > "$scannable" 2>/dev/null || cp "$file" "$scannable"
+  cat "$extras" >> "$scannable"
+
+  grep -oaE "$OPAQUE_RE" "$scannable" 2>/dev/null \
     | grep -E '[0-9]' \
     | grep -E '[A-Za-z]' \
     | grep -vxF -f "$ALLOWLIST_FILE" \
     | sort -u \
     | sed 's/^/opaque-literal /' || true
 
-  grep -oaiE "$KEYWORD_RE" "$stripped" 2>/dev/null \
+  grep -oaiE "$KEYWORD_RE" "$scannable" 2>/dev/null \
     | sort -u \
     | sed 's/^/keyword-adjacent /' || true
 }
@@ -185,56 +294,131 @@ scan_tree() {
   done < <(find "$dir" -type f | sort)
 }
 
-# Prove the value rules actually fire.
+# A 1x1 transparent PNG. Not a secret - a published constant, used as a
+# negative canary: it is a genuine inlined asset, so the scan must stay quiet
+# about it. If the MIME-plus-magic verification ever breaks open, this 96-char
+# opaque run starts being reported and the self-test says so.
+readonly PNG_1X1_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+
+# Draw $2 random characters from the character class $1.
 #
-# Copies the real build output and appends canaries built from fresh randomness:
-# an unlabelled url-safe token (the shape that defeated the names-only gate), an
-# unlabelled hex token (the shape that defeats an entropy threshold), and a short
-# labelled one (too short for the opaque rule, so only the keyword rule can see
-# it). All three must be flagged.
+# Built from a bounded pool rather than `tr < /dev/urandom | head -c`: that
+# pipeline makes `head` close the pipe under tr, and with `set -o pipefail` the
+# resulting SIGPIPE takes the whole script down.
+rand_chars() {
+  local class="$1" want="$2" pool=''
+  while [[ ${#pool} -lt $want ]]; do
+    pool+="$(head -c 4096 /dev/urandom | LC_ALL=C tr -dc "$class" || true)"
+  done
+  printf '%s' "${pool:0:want}"
+}
+
+rand_letters() { rand_chars 'A-Za-z' "$1"; }
+rand_digits() { rand_chars '0-9' "$1"; }
+rand_urlsafe() { rand_chars 'A-Za-z0-9_-' "$1"; }
+rand_b64std() { rand_chars 'A-Za-z0-9' "$1"; }
+rand_hex() { rand_chars '0-9a-f' "$1"; }
+
+# Prove the value rules still fire, at the edges where they are drawn.
+#
+# Copies the real build output, appends freshly generated canaries, and re-runs
+# the scan. Positive canaries must be reported; negative ones must not. Both
+# directions matter: missing a positive means a rule has narrowed, and reporting
+# a negative means a threshold has drifted or the asset exclusion has broken.
+#
+# Every canary carries randomness, so none of this can pass by matching a string
+# the scanner happens to know.
 verify_scanner_detects_canaries() {
   local dir="$1"
   local canary_dir="${TMP_DIR}/canary"
-  local random_hex canary_a canary_b canary_c found target canary missing
+  local found target canary missing spurious keyword literal index
+  local -a must_detect=() must_not_detect=() lines=()
 
   rm -rf "$canary_dir"
   cp -r "$dir" "$canary_dir"
-
-  random_hex="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  # The 'lemCanary9' prefix guarantees a letter and a digit whatever the
-  # randomness produced, so the self-test cannot flake on an all-numeric draw.
-  canary_a="lemCanary9$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_')"
-  canary_b="lemCanary9${random_hex}"
-  canary_c="lemCanary9${random_hex:0:8}"
-
   target="$(find "$canary_dir" -type f -name '*.js' | head -1)"
   [[ -n "$target" ]] || fail "self-test could not run: no .js file under ${dir}."
 
-  {
-    # Deliberately shaped like a debug leftover: no credential keyword anywhere
-    # near it, and no name from FORBIDDEN_NAMES. This is the exact shape that
-    # passed the names-only version of this gate.
-    printf 'console.debug("lem-boot","%s");\n' "$canary_a"
-    printf 'console.debug("lem-boot","%s");\n' "$canary_b"
-    # Short enough that only the keyword rule can see it.
-    printf 'const lemCanaryCfg={password:"%s"};\n' "$canary_c"
-  } >> "$target"
+  # --- opaque-literal, positive -------------------------------------------
+  # Fixed first and last characters pin the property under test; the middle is
+  # random. Anchoring the rule to a leading letter, or requiring more than one
+  # digit or letter, breaks one of these.
+  local starts_digit ends_digit hex_at_32 letter_heavy digit_heavy
+  starts_digit="$(rand_digits 1)$(rand_urlsafe 41)$(rand_letters 1)"   # 43, leads with a digit
+  ends_digit="$(rand_letters 1)$(rand_urlsafe 41)$(rand_digits 1)"     # 43, trails with a digit
+  hex_at_32="$(rand_chars 'a-f' 1)$(rand_hex 30)$(rand_digits 1)"      # 32, exactly at threshold
+  letter_heavy="$(rand_letters 16)$(rand_digits 1)$(rand_letters 15)"  # 32, a single digit
+  digit_heavy="$(rand_digits 16)$(rand_letters 1)$(rand_digits 15)"    # 32, a single letter
+  must_detect+=("$starts_digit" "$ends_digit" "$hex_at_32" "$letter_heavy" "$digit_heavy")
+  lines+=(
+    "$(printf 'console.debug("lem-boot","%s");' "$starts_digit")"
+    "$(printf 'console.debug("lem-boot","%s");' "$ends_digit")"
+    "$(printf 'console.debug("lem-boot","%s");' "$hex_at_32")"
+    "$(printf 'console.debug("lem-boot","%s");' "$letter_heavy")"
+    "$(printf 'console.debug("lem-boot","%s");' "$digit_heavy")"
+  )
 
+  # --- data: URI, positive ------------------------------------------------
+  # Standard-base64 alphabet, because that is what the URI grammar allows and
+  # what a real payload uses. The first is an unrecognised MIME type; the second
+  # claims to be a PNG and is not. Both must be scanned rather than elided.
+  local data_text_secret data_png_secret
+  data_text_secret="$(rand_letters 1)$(rand_b64std 41)$(rand_digits 1)"
+  data_png_secret="$(rand_letters 1)$(rand_b64std 41)$(rand_digits 1)"
+  must_detect+=("$data_text_secret" "$data_png_secret")
+  lines+=(
+    "$(printf 'console.debug("lem-boot","data:text/plain;base64,%s");' "$data_text_secret")"
+    "$(printf 'console.debug("lem-boot","data:image/png;base64,%s");' "$data_png_secret")"
+  )
+
+  # --- keyword-adjacent, positive -----------------------------------------
+  # One per alternative in KEYWORD_RE, each with a literal exactly at the
+  # 16-char threshold. Deleting any alternative from the regex fails here.
+  index=0
+  for keyword in "${KEYWORDS[@]}"; do
+    literal="$(rand_letters 1)$(rand_urlsafe 14)$(rand_digits 1)"
+    must_detect+=("$literal")
+    lines+=("$(printf 'const lemCanaryCfg%d={"%s":"%s"};' "$index" "$keyword" "$literal")")
+    index=$((index + 1))
+  done
+
+  # --- negative canaries ---------------------------------------------------
+  # One character below each threshold, plus a genuine inlined asset. Reporting
+  # any of these means a rule has widened or the exclusion has broken.
+  local below_opaque below_keyword
+  below_opaque="$(rand_letters 1)$(rand_urlsafe 29)$(rand_digits 1)"  # 31
+  below_keyword="$(rand_letters 1)$(rand_urlsafe 13)$(rand_digits 1)" # 15
+  must_not_detect+=("$below_opaque" "$below_keyword" "$PNG_1X1_B64")
+  lines+=(
+    "$(printf 'console.debug("lem-canary-neg","%s");' "$below_opaque")"
+    "$(printf 'const lemCanaryNeg={"password":"%s"};' "$below_keyword")"
+    "$(printf 'const lemCanaryPng="data:image/png;base64,%s";' "$PNG_1X1_B64")"
+  )
+
+  printf '%s\n' "${lines[@]}" >> "$target"
   found="$(scan_tree "$canary_dir")"
+  rm -rf "$canary_dir"
 
   missing=0
-  for canary in "$canary_a" "$canary_b" "$canary_c"; do
-    if ! printf '%s' "$found" | grep -qF -- "$canary"; then
-      missing=$((missing + 1))
+  for canary in "${must_detect[@]}"; do
+    printf '%s' "$found" | grep -qF -- "$canary" || missing=$((missing + 1))
+  done
+
+  spurious=0
+  for canary in "${must_not_detect[@]}"; do
+    if printf '%s' "$found" | grep -qF -- "$canary"; then
+      spurious=$((spurious + 1))
     fi
   done
 
-  rm -rf "$canary_dir"
-
   if [[ "$missing" -ne 0 ]]; then
-    fail "SELF-TEST FAILED: the value scan missed ${missing} of 3 planted canaries in ${dir}. The scanner is broken, so a clean result from it means nothing. Do not treat this run as evidence of anything."
+    fail "SELF-TEST FAILED: the value scan missed ${missing} of ${#must_detect[@]} planted canaries in ${dir}. A rule has narrowed, so a clean result from it means nothing. Do not treat this run as evidence of anything."
   fi
-  printf '  self-test: 3/3 planted canaries detected (unlabelled url-safe, unlabelled hex, short labelled).\n'
+  if [[ "$spurious" -ne 0 ]]; then
+    fail "SELF-TEST FAILED: the value scan reported ${spurious} of ${#must_not_detect[@]} canaries that it must ignore in ${dir}. Either a length threshold has drifted below its documented value, or the verified-asset exclusion has stopped working."
+  fi
+  printf '  self-test: %d/%d boundary canaries detected, %d/%d correctly ignored.\n' \
+    "${#must_detect[@]}" "${#must_detect[@]}" "${#must_not_detect[@]}" "${#must_not_detect[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -353,9 +537,13 @@ PASS. Checked, across ${#APPS[@]} app(s):
   - ${scanned_files} built file(s) (${sourcemaps} sourcemap(s)) for credential-shaped
     literals: opaque runs of >=32 chars carrying both a digit and a letter, and
     literals of >=16 chars adjacent to a credential keyword
-  - the value scan itself, against 3 freshly planted canaries per app
+  - base64 data: URIs, whose payloads are skipped ONLY when the MIME type is a
+    known image/font AND the bytes decode to that format's magic number
+  - the value scan itself, per app, against 16 boundary canaries that must be
+    reported and 3 that must not
 
 Nothing credential-shaped was found by those rules. That is not the same as
-"the bundles contain no secret": this is a heuristic scan, and a value that is
-split across literals, encoded, or shaped like ordinary text would pass it.
+"the bundles contain no secret": this is a heuristic scan. A value split across
+literals, encoded, shaped like ordinary text, or buried in the pixels of a real
+image would pass it.
 EOF
