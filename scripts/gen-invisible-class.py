@@ -92,9 +92,22 @@ ISSPACE_EXTRAS = frozenset({0x1C, 0x1D, 0x1E, 0x1F})
 # Categories that do not advance the cursor.
 NON_ADVANCING = ('Zs', 'Zl', 'Zp', 'Cf', 'Mn', 'Me')
 
-# Categories an "extra" member may legitimately have: things this interpreter
-# cannot classify, which is what a future Unicode addition looks like from here.
-UNASSIGNED = ('Cn', 'Co', 'Cs')
+# Categories an "extra" member may legitimately have.
+#
+# Cn/Co/Cs: unassigned here, which is what a future addition looks like from an
+# older interpreter.
+#
+# M*/Cf/Z*: a character some OTHER Unicode version calls non-advancing. These
+# happen - CI caught U+1171E AHOM CONSONANT SIGN MEDIAL RA, which is Mn in
+# Unicode 15.0.0 and was reclassified to Mc in 16.0.0. Neither version's set is
+# a superset of the other, which is why the class is a UNION rather than
+# whatever the newest interpreter says (see render()). Stripping a combining
+# mark from build output is harmless; failing to strip one is a bypass.
+#
+# Everything else - letters, digits, punctuation, symbols - is rejected.
+# Stripping those would corrupt content, and review showed the previous version
+# accepting 'A' as a "harmless superset".
+PLAUSIBLE_EXTRA = ('Cn', 'Co', 'Cs', 'Mn', 'Mc', 'Me', 'Cf', 'Zs', 'Zl', 'Zp')
 
 SPACE = 0x20
 MAX_CODEPOINT = 0x110000
@@ -266,13 +279,33 @@ def build_canary_separators(code_points: list[int]) -> list[str]:
     return separators
 
 
+def committed_class() -> list[int]:
+    """The class as currently committed, or empty if there is none.
+
+    Returns:
+        Sorted code points
+    """
+    if not OUTPUT.exists():
+        return []
+    found = re.search(r"INVISIBLE_RANGES='([^']*)'", OUTPUT.read_text(encoding='utf-8'))
+    return parse_ranges(found.group(1)) if found else []
+
+
 def render() -> str:
     """Build the shell fragment.
+
+    The class is MONOTONE: whatever is already committed is unioned in rather
+    than replaced. Unicode reclassifies characters between releases in both
+    directions - U+1171E is Mn in 15.0.0 and Mc in 16.0.0 - so "regenerate on
+    the newest interpreter" would silently drop members that an older one still
+    considers non-advancing. Losing a member is a bypass; keeping a spurious one
+    costs nothing measurable, because a combining mark never legitimately
+    appears inside a credential run.
 
     Returns:
         The complete file contents
     """
-    code_points = derive_class()
+    code_points = sorted(set(derive_class()) | set(committed_class()))
     lines = [
         '# SPDX-License-Identifier: AGPL-3.0-or-later',
         '# Copyright (c) 2025 Lem',
@@ -364,12 +397,12 @@ def check() -> int:
     # interpreter can classify as a real, advancing character is not a plausible
     # future member, and stripping it would corrupt content.
     extras = sorted(set(committed) - set(derived))
-    implausible = [cp for cp in extras if unicodedata.category(chr(cp)) not in UNASSIGNED]
+    implausible = [cp for cp in extras if unicodedata.category(chr(cp)) not in PLAUSIBLE_EXTRA]
     if implausible:
         print(
             f'{OUTPUT} contains {len(implausible)} character(s) that Unicode '
-            f'{unicodedata.unidata_version} says DO advance, so they cannot be future '
-            'additions to the class:\n'
+            f'{unicodedata.unidata_version} says are ordinary content, so they cannot '
+            'be members of this class under any reading:\n'
             + '\n'.join(
                 f'    U+{cp:04X} category {unicodedata.category(chr(cp))} '
                 f'{unicodedata.name(chr(cp), "<unnamed>")}'
@@ -381,9 +414,10 @@ def check() -> int:
         return 1
     if extras:
         print(
-            f'  NOTE: {OUTPUT.name} covers {len(extras)} code point(s) unassigned in '
-            f'Unicode {unicodedata.unidata_version}; it was generated against a newer '
-            'release. Superset of what this interpreter knows, so nothing is missed.'
+            f'  NOTE: {OUTPUT.name} carries {len(extras)} code point(s) this interpreter '
+            f'(Unicode {unicodedata.unidata_version}) does not class as non-advancing - '
+            'unassigned here, or reclassified between releases. The class is a union '
+            'across versions, so this is expected; nothing is missed.'
         )
 
     # The regex and the tr set are compiled artefacts of the canonical ranges.
