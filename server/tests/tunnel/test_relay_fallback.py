@@ -15,12 +15,11 @@
 
 """Test relay fallback functionality."""
 
-import asyncio
 import logging
 
 import pytest
 
-from app.tunnel.relay_client import RelayClient, RelayConnectionState
+from app.tunnel.relay_client import RelayClient
 from app.tunnel.webrtc_client import TunnelAgent
 
 # Set up logging for test visibility

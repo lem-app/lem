@@ -50,6 +50,11 @@ import struct
 from enum import IntEnum
 from typing import TypedDict
 
+# Declared lengths are uint32, so a peer can claim up to 4 GiB. Cap what we are
+# willing to accept before allocating anything on its behalf.
+MAX_BODY_BYTES = 32 * 1024 * 1024  # 32 MiB
+MAX_HEADERS_BYTES = 256 * 1024  # 256 KiB
+
 
 class FrameType(IntEnum):
     """Frame type constants."""
@@ -172,6 +177,9 @@ def deserialize_request(data: bytes) -> HTTPRequestFrame:
     (headers_len,) = struct.unpack(">I", data[offset : offset + 4])
     offset += 4
 
+    if headers_len > MAX_HEADERS_BYTES:
+        raise ValueError(f"Headers too large: {headers_len} > {MAX_HEADERS_BYTES}")
+
     if len(data) < offset + headers_len:
         raise ValueError("Insufficient data for headers")
     headers_json = data[offset : offset + headers_len].decode("utf-8")
@@ -183,6 +191,9 @@ def deserialize_request(data: bytes) -> HTTPRequestFrame:
         raise ValueError("Insufficient data for body_len")
     (body_len,) = struct.unpack(">I", data[offset : offset + 4])
     offset += 4
+
+    if body_len > MAX_BODY_BYTES:
+        raise ValueError(f"Body too large: {body_len} > {MAX_BODY_BYTES}")
 
     if len(data) < offset + body_len:
         raise ValueError("Insufficient data for body")
@@ -265,6 +276,9 @@ def deserialize_response(data: bytes) -> HTTPResponseFrame:
     (headers_len,) = struct.unpack(">I", data[offset : offset + 4])
     offset += 4
 
+    if headers_len > MAX_HEADERS_BYTES:
+        raise ValueError(f"Headers too large: {headers_len} > {MAX_HEADERS_BYTES}")
+
     if len(data) < offset + headers_len:
         raise ValueError("Insufficient data for headers")
     headers_json = data[offset : offset + headers_len].decode("utf-8")
@@ -276,6 +290,9 @@ def deserialize_response(data: bytes) -> HTTPResponseFrame:
         raise ValueError("Insufficient data for body_len")
     (body_len,) = struct.unpack(">I", data[offset : offset + 4])
     offset += 4
+
+    if body_len > MAX_BODY_BYTES:
+        raise ValueError(f"Body too large: {body_len} > {MAX_BODY_BYTES}")
 
     if len(data) < offset + body_len:
         raise ValueError("Insufficient data for body")

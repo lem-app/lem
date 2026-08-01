@@ -36,10 +36,24 @@ pnpm format
 ### A note on `dev:lan`
 
 The dev server proxies `/v1/*` straight to the local Lem API, which can start
-and stop Docker containers and has no authentication of its own. `pnpm dev`
-therefore binds to loopback only. `pnpm dev:lan` binds every interface - use it
-when you deliberately want to reach the dashboard from another device on a
-network you trust, and not otherwise.
+and stop Docker containers. `pnpm dev` therefore binds to loopback only.
+`pnpm dev:lan` binds every interface - use it when you deliberately want to
+reach the dashboard from another device on a network you trust, and not
+otherwise.
+
+Two things to understand before you do:
+
+- **`dev:lan` in front of a loopback-bound server bypasses the server's own
+  protection.** The proxy hop is made by Vite from `127.0.0.1`, so the API sees
+  a loopback client, correctly reports "loopback only", and requires no bearer
+  token - while the dashboard is reachable from the whole LAN. The API cannot
+  see a hop it is not part of. This is the same limitation as putting any
+  reverse proxy in front of it.
+- **Against a non-loopback server bind, the dashboard just 401s.** It sends no
+  bearer token. See "Using the dashboard over the LAN" in
+  [`server/README.md`](../../server/README.md), and
+  [#48](https://github.com/lem-app/lem/issues/48) for the credential-delivery
+  design that would make LAN dashboards actually work.
 
 ## Configuration
 

@@ -50,6 +50,13 @@ from app.drivers.runners.ollama import (
 )
 from app.jobs import JobStatus, get_job, get_recent_jobs
 from app.jobs.queue import init_job_queue, shutdown_job_queue
+from app.security import (
+    TOKEN_PATH,
+    LocalApiSecurityMiddleware,
+    ensure_api_token,
+    get_allowed_origins,
+    get_bind_posture,
+)
 from app.services import (
     get_all_services_with_status,
     get_service_endpoint,
@@ -76,6 +83,9 @@ logger = logging.getLogger(__name__)
 # Global TunnelManager instance
 tunnel_manager: TunnelManager | None = None
 
+# Browser origins allowed to drive the API (built-ins plus $LEM_ALLOWED_ORIGINS).
+BROWSER_ORIGINS = get_allowed_origins()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -88,6 +98,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Startup: Initialize database
     init_db()
     logger.info("✓ Database initialized at ~/.lem/lem.db")
+
+    # Startup: Ensure the API token exists (never log the token itself)
+    ensure_api_token()
+    logger.info(f"✓ API token available at {TOKEN_PATH}")
+
+    # Report what was actually verified about the listening socket and the
+    # enforcement decision that follows from it - never a claim we have not
+    # checked. app.serve installs this posture before the socket accepts.
+    posture = get_bind_posture()
+    enforcement = (
+        "bearer token REQUIRED on /v1/*"
+        if posture.require_token
+        else "bearer token accepted but not required on /v1/*"
+    )
+    if posture.verified and posture.loopback_only:
+        logger.info(f"✓ Lem local API {posture.describe()}; {enforcement}")
+    elif posture.verified:
+        logger.warning(
+            f"⚠ Lem local API {posture.describe()}: {enforcement} (token in {TOKEN_PATH})"
+        )
+    else:
+        logger.warning(
+            f"⚠ Lem local API {posture.describe()}. Failing closed: {enforcement} "
+            f"(token in {TOKEN_PATH})"
+        )
 
     # Startup: Initialize job queue
     await init_job_queue()
@@ -129,18 +164,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS for local development
-# In v0.1, we allow localhost origins. In production, this will be restricted.
+# Access control. Added first so the CORS middleware wraps it and can still
+# attach CORS headers to rejections. require_token is deliberately left at its
+# default: it reads the live, verified bind posture on every request instead of
+# a value frozen from an environment variable at import time.
+app.add_middleware(
+    LocalApiSecurityMiddleware,
+    allowed_origins=BROWSER_ORIGINS,
+)
+
+# Configure CORS for local development.
+# The allowlist is shared with the CSRF middleware so the two cannot drift.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Vite dev server (web/remote)
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",  # Vite dev server (web/local)
-        "http://127.0.0.1:5174",
-        "http://localhost:3000",  # Future: served by FastAPI
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=list(BROWSER_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

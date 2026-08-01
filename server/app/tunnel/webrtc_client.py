@@ -39,6 +39,7 @@ from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
 from .http_proxy import HTTPProxyHandler
 from .message_dispatcher import MessageDispatcher
+from .peer_auth import PeerIdentity, PeerVerifier, build_peer_verifier
 from .relay_client import RelayClient, RelayConnectionState
 from .router import create_router_with_client_discovery
 from .ws_proxy import WSProxyHandler
@@ -67,13 +68,19 @@ class TunnelAgent:
         self,
         local_server_url: str = "http://localhost:5142",
         relay_url: str = "ws://localhost:8001",
+        peer_verifier: PeerVerifier | None = None,
     ) -> None:
         """Initialize the tunnel agent.
 
         Args:
             local_server_url: Base URL of local Lem server to proxy to
             relay_url: Base URL of relay server for WebSocket fallback
+            peer_verifier: Gate deciding which peers may use the tunnel
+                (defaults to the registered-device check)
         """
+        # Peers are denied until this verifier says otherwise.
+        self.peer_verifier: PeerVerifier = peer_verifier or build_peer_verifier()
+
         self.signal_url: str | None = None
         self.device_id: str | None = None
         self.token: str | None = None
@@ -386,6 +393,10 @@ class TunnelAgent:
         """Disconnect and clean up resources."""
         self.should_reconnect = False
 
+        # The peer is gone; the next one must be authorized from scratch.
+        self.http_proxy.revoke_peer()
+        self.peer_device_id = None
+
         # Stop proxy handlers
         await self.http_proxy.stop()
         await self.ws_proxy.stop()
@@ -498,13 +509,15 @@ class TunnelAgent:
             logger.info("Signaling connection confirmed")
 
         elif msg_type == "offer":
-            # Received SDP offer - create answer
+            # Received SDP offer - authorize the peer before answering it.
+            # Answering establishes a DataChannel onto a proxy that presents
+            # this server's own credentials, so an unknown peer gets nothing.
             sender_device_id = message.get("sender_device_id")
+            if not await self._authorize_peer(sender_device_id, message):
+                return
 
             # Store peer device ID for ICE candidate exchange
-            if sender_device_id:
-                self.peer_device_id = sender_device_id
-                logger.info(f"Received offer from {sender_device_id}")
+            self.peer_device_id = sender_device_id
 
             payload = message.get("payload", {})
             offer = RTCSessionDescription(
@@ -548,6 +561,40 @@ class TunnelAgent:
             # Handle incoming connection request with transport preference
             await self._handle_connect_request(message)
 
+    async def _authorize_peer(self, device_id: str | None, message: dict[str, Any]) -> bool:
+        """Decide whether a peer may use this device's tunnel.
+
+        On success the HTTP proxy is told which peer it is acting for, which is
+        what unlocks credential injection towards the local API.
+
+        Args:
+            device_id: Device ID the signaling server attributed to the sender
+            message: The signaling message, carrying any proof payload
+
+        Returns:
+            True if the peer is authorized
+        """
+        proof = message.get("proof")
+        identity = PeerIdentity(
+            device_id=device_id or "",
+            proof=proof if isinstance(proof, dict) else None,
+        )
+        decision = await self.peer_verifier.verify(identity)
+
+        if not decision.authorized:
+            # Deliberately does not revoke an existing authorization: a stranger
+            # must not be able to knock out the legitimate peer's session by
+            # sending offers.
+            logger.warning(
+                f"Denied tunnel access to peer {device_id!r}: {decision.reason}. "
+                f"No answer sent; the local API stays unreachable to this peer."
+            )
+            return False
+
+        logger.info(f"Authorized tunnel peer {device_id!r}: {decision.reason}")
+        self.http_proxy.authorize_peer(identity.device_id)
+        return True
+
     async def _handle_connect_request(self, message: dict[str, Any]) -> None:
         """Handle incoming connection request with transport preference.
 
@@ -557,6 +604,11 @@ class TunnelAgent:
         from_device_id: str | None = message.get("from_device_id")
         if not from_device_id:
             logger.warning("Received connect-request without from_device_id")
+            return
+
+        # Same gate as the WebRTC offer path: a relay session hands the peer the
+        # very same credential-injecting proxy.
+        if not await self._authorize_peer(from_device_id, message):
             return
 
         preferred_transport = message.get("preferred_transport", "auto")
@@ -575,6 +627,9 @@ class TunnelAgent:
                 relay_client = RelayClient(
                     local_server_url=self.http_proxy.local_server_url
                 )
+                # The relay session's proxy is a separate instance, so it needs
+                # the authorization decision made above.
+                relay_client.http_proxy.authorize_peer(from_device_id)
 
                 # Connect to relay server with the specified session ID
                 await relay_client.connect(

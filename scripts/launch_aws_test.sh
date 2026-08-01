@@ -18,12 +18,25 @@ trap cleanup EXIT INT TERM
 echo "Starting local services for AWS testing..."
 echo ""
 
-# Start Lem local server with AWS signaling URL override
-echo "→ Local Lem Server (port 5142)"
-(cd ../server && LEM_SIGNAL_URL=https://signal.lem.gg uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 5142) &
+# Start Lem local server with AWS signaling URL override.
+#
+# This harness points at cloud signaling/relay; it does not need the API itself
+# to be reachable from the network, so it binds loopback like every other launch
+# path. It goes through lem-serve, so the posture is not taken on trust:
+# lem-serve binds the socket, reads the address back from it, and derives the
+# /v1/* auth decision from that. Watch the startup line - it states the verified
+# address and the decision.
+#
+# Export LEM_HOST=0.0.0.0 if you really want the API on the LAN. Every /v1/*
+# request then needs "Authorization: Bearer $(cat ~/.lem/api_token)", and the
+# dashboard below will 401 on load - it has no way to obtain that token
+# (see https://github.com/lem-app/lem/issues/48).
+echo "→ Local Lem Server (port ${LEM_PORT:-5142})"
+(cd ../server && LEM_SIGNAL_URL=https://signal.lem.gg \
+    LEM_HOST="${LEM_HOST:-127.0.0.1}" LEM_PORT="${LEM_PORT:-5142}" uv run lem-serve) &
 sleep 2
 
-# Start local web dashboard with AWS signaling URL as default
+# Start local web dashboard with AWS signaling URL as default.
 echo "→ Local Web Dashboard (port 5174)"
 (cd ../web/local && VITE_DEFAULT_SIGNALING_URL=https://signal.lem.gg pnpm dev --port 5174) &
 sleep 3

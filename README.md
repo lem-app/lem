@@ -35,10 +35,10 @@ Lem is an open-source platform for managing and remotely accessing your local AI
 git clone https://github.com/lem-app/lem.git
 cd lem
 
-# Start the local server
+# Start the local server (loopback only - see "Network exposure" below)
 cd server
 uv sync
-uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
+uv run lem-serve
 
 # In another terminal, from the repository root, start the web dashboard
 cd web/local
@@ -66,6 +66,65 @@ Lem consists of five main components:
 - **JWT authentication**: Secure access to cloud services
 - **Device registration**: ed25519 public key authentication
 - **Open source**: Full transparency, audit the code yourself
+
+### Network exposure
+
+The local server can install, start, stop and remove Docker services, so it
+binds to **127.0.0.1 only** unless you opt in. Always start it with `lem-serve`
+- it is the single place the bind address is chosen, and the API's auth posture
+is derived from the socket it actually binds rather than from configuration:
+
+```bash
+# Default: reachable from this machine only
+uv run lem-serve
+
+# Opt in to LAN access (bearer token then required on every /v1/* request)
+LEM_HOST=0.0.0.0 uv run lem-serve
+curl -H "X-Lem-Client: curl" \
+     -H "Authorization: Bearer $(cat ~/.lem/api_token)" \
+     http://<host>:5142/v1/services
+```
+
+- **Fails closed**: the bearer token is required unless a loopback-only bind was
+  positively verified from the listening socket. Starting the app some other
+  way (`uvicorn app.main:app --host ...`) means the socket was never seen, so
+  the token is required and the startup log says the bind is unverified.
+- **API token**: generated on first start at `~/.lem/api_token` (mode 0600).
+- **CSRF protection**: every state-changing request must send the
+  `X-Lem-Client` header, and any `Origin` it sends must be allowlisted. This
+  holds on loopback too - it is what stops a web page you are visiting from
+  POSTing to `http://localhost:5142`. Add non-localhost dashboard origins with
+  `LEM_ALLOWED_ORIGINS` (comma-separated; `*` refused).
+- **Secrets at rest**: `~/.lem` is mode 0700 and `lem.db` (plus its WAL/SHM
+  sidecars) and `api_token` are mode 0600.
+
+Two things this deliberately does **not** do yet:
+
+- **The dashboard over the LAN does not work.** `web/local` sends no bearer
+  token, so against a non-loopback bind it gets 401 on every request. A browser
+  cannot read `~/.lem/api_token`, and baking it into the build with a `VITE_*`
+  variable is not a fix - Vite inlines those as plaintext literals into
+  `dist/assets/*.js`, handing the token to everyone who can load the page.
+  Run the dashboard on the same machine as the server; `LEM_HOST=0.0.0.0` is
+  for non-browser clients that can present the token themselves. Proper
+  credential delivery is tracked in
+  [#48](https://github.com/lem-app/lem/issues/48).
+- **A proxy in front of a loopback bind still exposes it.** The posture is read
+  off the socket this process bound; it cannot see a hop it is not part of. A
+  reverse proxy, published container port, or `pnpm run dev:lan` in front of a
+  verified-loopback server makes it reachable off-host while the server
+  correctly reports "loopback only" and requires no token. Bind with
+  `LEM_HOST=0.0.0.0` (so the token is enforced) or authenticate at the proxy.
+
+### Remote access peers
+
+A tunnel peer is proxied into the same local API and is handed the local
+server's own credentials, so peers must be authorized first: the offering
+device is checked against the devices registered to your Lem account, and
+unknown peers are denied. Ed25519 proof-of-possession is the endgame and is
+tracked in [#29](https://github.com/lem-app/lem/issues/29);
+`LEM_TUNNEL_ALLOW_UNVERIFIED_PEERS=1` is a deliberate, loudly-logged opt-out
+that turns the check off.
 
 ## 📖 Documentation
 
