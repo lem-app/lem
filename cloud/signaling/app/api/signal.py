@@ -20,13 +20,12 @@ import json
 import logging
 from typing import Any
 
-import aiosqlite
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
 
 from ..core.config import settings
 from ..core.security import decode_access_token
-from ..db import USE_POSTGRES, get_db
+from ..db import USE_POSTGRES, DBConnection, DBRow, as_postgres, as_sqlite, get_db
 
 router = APIRouter(tags=["signaling"])
 logger = logging.getLogger(__name__)
@@ -105,7 +104,7 @@ manager = ConnectionManager()
 
 
 async def verify_token_and_device(
-    token: str, device_id: str, db: aiosqlite.Connection
+    token: str, device_id: str, db: DBConnection
 ) -> tuple[int, str]:
     """Verify JWT token and device ownership.
 
@@ -127,13 +126,14 @@ async def verify_token_and_device(
             raise ValueError("Invalid token: missing user_id")
 
         # Verify device belongs to user
+        device: DBRow | None
         if USE_POSTGRES:
-            device = await db.fetchrow(
+            device = await as_postgres(db).fetchrow(
                 "SELECT id FROM devices WHERE id = $1 AND user_id = $2",
                 device_id, user_id
             )
         else:
-            async with db.execute(
+            async with as_sqlite(db).execute(
                 "SELECT id FROM devices WHERE id = ? AND user_id = ?",
                 (device_id, user_id),
             ) as cursor:
@@ -257,7 +257,10 @@ async def websocket_signal_endpoint(
                         await websocket.send_json(
                             {
                                 "type": "error",
-                                "message": "Invalid message format: missing type or target_device_id",
+                                "message": (
+                                    "Invalid message format: "
+                                    "missing type or target_device_id"
+                                ),
                             }
                         )
                         continue
@@ -304,7 +307,8 @@ async def websocket_signal_endpoint(
 
                     if success:
                         logger.info(
-                            f"Routed {message['type']} from {verified_device_id} to {target_device_id}"
+                            f"Routed {message['type']} from {verified_device_id} "
+                            f"to {target_device_id}"
                         )
                         # Send acknowledgment
                         await websocket.send_json(

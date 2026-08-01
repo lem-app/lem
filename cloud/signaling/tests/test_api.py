@@ -15,35 +15,25 @@
 
 """API endpoint tests."""
 
-import os
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
-from app.db import init_db
+from app.db import database, init_db
 from app.main import app
 
 
 @pytest.fixture(autouse=True)
-def setup_test_db() -> AsyncIterator[None]:
-    """Set up test database before each test."""
-    # Use a separate test database
-    test_db = "test_signaling.db"
-    if os.path.exists(test_db):
-        os.remove(test_db)
+def setup_test_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the app at a fresh SQLite database for every test.
 
-    # Override database file for tests
-    import app.db.database as db_module
-
-    db_module.DATABASE_FILE = test_db
-
-    yield
-
-    # Cleanup
-    if os.path.exists(test_db):
-        os.remove(test_db)
+    tmp_path is unique per test, so the suite is hermetic and idempotent:
+    it never touches the developer's signaling.db and leaves no state behind.
+    """
+    monkeypatch.setattr(database, "DATABASE_FILE", str(tmp_path / "signaling.db"))
 
 
 @pytest.fixture
@@ -147,13 +137,14 @@ async def test_register_device(client: AsyncClient) -> None:
     )
     token = register_response.json()["access_token"]
 
-    # Register device
+    # Register device. The endpoint is an idempotent upsert, so it answers
+    # 200 OK (not 201) for both the create and the update path.
     response = await client.post(
         "/devices/register",
         json={"device_id": "device-123", "pubkey": "test-pubkey-xyz"},
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 200
     data = response.json()
     assert data["id"] == "device-123"
     assert data["pubkey"] == "test-pubkey-xyz"

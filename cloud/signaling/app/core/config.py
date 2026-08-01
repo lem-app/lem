@@ -64,7 +64,8 @@ class Settings(BaseSettings):
     relay_url: str = "ws://localhost:8001"
 
     # ICE servers configuration (JSON string)
-    # Format: [{"urls": "stun:stun.l.google.com:19302"}, {"urls": "turn:...", "username": "...", "credential": "..."}]
+    # Format: [{"urls": "stun:stun.l.google.com:19302"},
+    #          {"urls": "turn:...", "username": "...", "credential": "..."}]
     # Default: Google's public STUN server
     ice_servers_json: str = '[{"urls": "stun:stun.l.google.com:19302"}]'
 
@@ -72,10 +73,11 @@ class Settings(BaseSettings):
     def ice_servers(self) -> list[dict[str, Any]]:
         """Parse ICE servers from JSON string."""
         try:
-            return json.loads(self.ice_servers_json)
+            parsed: list[dict[str, Any]] = json.loads(self.ice_servers_json)
         except json.JSONDecodeError:
             # Fall back to default STUN server on parse error
             return [{"urls": "stun:stun.l.google.com:19302"}]
+        return parsed
 
 
 settings = Settings()

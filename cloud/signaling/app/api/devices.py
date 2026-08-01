@@ -15,13 +15,14 @@
 
 """Device registration endpoints."""
 
-import aiosqlite
+from collections.abc import Iterable
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
 from ..core.security import decode_access_token
-from ..db import USE_POSTGRES, get_db
+from ..db import USE_POSTGRES, DBConnection, DBRow, as_postgres, as_sqlite, get_db
 from ..models import DeviceRegister, DeviceResponse
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -61,7 +62,7 @@ async def get_current_user_id(
 @router.post("/register", response_model=DeviceResponse)
 async def register_device(
     device_data: DeviceRegister,
-    db: aiosqlite.Connection = Depends(get_db),
+    db: DBConnection = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ) -> DeviceResponse:
     """Register or update a device (idempotent).
@@ -80,9 +81,12 @@ async def register_device(
     Raises:
         HTTPException: If device is owned by another user.
     """
+    device: DBRow | None
+    existing_device: DBRow | None
     if USE_POSTGRES:
         # PostgreSQL syntax
-        existing_device = await db.fetchrow(
+        pg = as_postgres(db)
+        existing_device = await pg.fetchrow(
             "SELECT user_id FROM devices WHERE id = $1", device_data.device_id
         )
         if existing_device and existing_device["user_id"] != user_id:
@@ -92,7 +96,7 @@ async def register_device(
             )
 
         # Atomic upsert: create or update device
-        await db.execute(
+        await pg.execute(
             """
             INSERT INTO devices (id, user_id, pubkey, created_at, last_seen)
             VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -106,13 +110,14 @@ async def register_device(
         )
 
         # Fetch and return the device
-        device = await db.fetchrow(
+        device = await pg.fetchrow(
             "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE id = $1",
             device_data.device_id,
         )
     else:
         # SQLite syntax
-        async with db.execute(
+        sqlite = as_sqlite(db)
+        async with sqlite.execute(
             "SELECT user_id FROM devices WHERE id = ?", (device_data.device_id,)
         ) as cursor:
             existing_device = await cursor.fetchone()
@@ -123,7 +128,7 @@ async def register_device(
                 )
 
         # Atomic upsert: create or update device
-        await db.execute(
+        await sqlite.execute(
             """
             INSERT INTO devices (id, user_id, pubkey, created_at, last_seen)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -133,10 +138,10 @@ async def register_device(
             """,
             (device_data.device_id, user_id, device_data.pubkey),
         )
-        await db.commit()
+        await sqlite.commit()
 
         # Fetch and return the device
-        async with db.execute(
+        async with sqlite.execute(
             "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE id = ?",
             (device_data.device_id,),
         ) as cursor:
@@ -159,7 +164,7 @@ async def register_device(
 
 @router.get("/", response_model=list[DeviceResponse])
 async def list_devices(
-    db: aiosqlite.Connection = Depends(get_db),
+    db: DBConnection = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ) -> list[DeviceResponse]:
     """List all devices for the current user.
@@ -171,15 +176,16 @@ async def list_devices(
     Returns:
         List of user's devices.
     """
+    devices: Iterable[DBRow]
     if USE_POSTGRES:
         # PostgreSQL syntax
-        devices = await db.fetch(
+        devices = await as_postgres(db).fetch(
             "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE user_id = $1",
             user_id,
         )
     else:
         # SQLite syntax
-        async with db.execute(
+        async with as_sqlite(db).execute(
             "SELECT id, user_id, pubkey, created_at, last_seen FROM devices WHERE user_id = ?",
             (user_id,),
         ) as cursor:
