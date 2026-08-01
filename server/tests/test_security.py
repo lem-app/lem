@@ -23,6 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app import db as app_db
 from app import security
 from app.security import (
     ALLOWED_ORIGINS,
@@ -52,6 +53,29 @@ def verified_loopback() -> Generator[None, None, None]:
     )
     yield
     security.reset_bind_posture()
+
+
+@pytest.fixture
+def temp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the app's database at a throwaway directory.
+
+    ``TestClient(app)`` outside a ``with`` block does not run the lifespan, so
+    ``init_db()`` never fires and ``~/.lem`` may not exist. Endpoints that touch
+    the database would then fail with "unable to open database file" - and a
+    test must not write to the developer's real ``~/.lem`` either way.
+
+    Args:
+        tmp_path: Per-test scratch directory
+        monkeypatch: Fixture used to redirect the module-level paths
+
+    Returns:
+        Path to the temporary database
+    """
+    db_path = tmp_path / "lem.db"
+    monkeypatch.setattr(app_db, "LEM_HOME", tmp_path)
+    monkeypatch.setattr(app_db, "DB_PATH", db_path)
+    app_db.init_db()
+    return db_path
 
 
 def build_app(*, require_token: bool = False, token: str | None = TOKEN) -> FastAPI:
@@ -343,6 +367,7 @@ def test_get_api_token_reads_from_disk(token_file: Path) -> None:
 
 def test_real_app_blocks_unauthenticated_state_change(
     verified_loopback: None,
+    temp_db: Path,
 ) -> None:
     """The middleware is actually installed on the shipped app.
 
