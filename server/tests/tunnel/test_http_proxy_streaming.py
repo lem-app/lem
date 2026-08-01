@@ -138,6 +138,19 @@ async def upstream() -> AsyncGenerator[tuple[str, UpstreamState], None]:
     async def redirect() -> Response:
         return Response(status_code=302, headers={"Location": "/auth/callback"})
 
+    @api.post("/login")
+    async def login() -> Response:
+        # Shaped like a real app's login: several cookies, different flags,
+        # one of them deliberately readable by the app's own JavaScript.
+        response = Response(content=b"ok", media_type="text/plain")
+        response.headers.append(
+            "Set-Cookie",
+            "session=s3cret; Path=/; Domain=app.local; HttpOnly; Secure; SameSite=Lax",
+        )
+        response.headers.append("Set-Cookie", "csrftoken=abc123; Path=/api; SameSite=Strict")
+        response.headers.append("Set-Cookie", "theme=dark")
+        return response
+
     server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=0, log_level="error"))
     task = asyncio.create_task(server.serve())
     for _ in range(200):
@@ -317,6 +330,38 @@ async def test_duplicate_response_headers_reach_the_peer(
     links = [value for name, value in collector.response_for(7).headers if name.lower() == "link"]
 
     assert links == ["<a>; rel=next", "<b>; rel=prev"]
+
+
+async def test_login_cookies_reach_the_peer(
+    upstream: tuple[str, UpstreamState],
+) -> None:
+    """#72: every ``Set-Cookie`` a real login sets crosses, unmodified.
+
+    While this header was blocked, the frames a browser received carried no
+    cookie at all, so no framed app could hold a session. Reverting the
+    ``RESPONSE_BLOCKED_HEADERS`` change fails this on the empty list.
+
+    The values are asserted byte-for-byte because the *server* must not
+    rewrite them: only the Service Worker knows the device segment the
+    ``Path`` has to name.
+    """
+    base, _ = upstream
+    handler, collector = authorized_handler(base, RequestRouter(base))
+    await handler.start()
+    try:
+        await send_request(handler, 20, "POST", "/login", body=b"user=a&pass=b")
+    finally:
+        await handler.stop()
+
+    cookies = [
+        value for name, value in collector.response_for(20).headers if name.lower() == "set-cookie"
+    ]
+
+    assert cookies == [
+        "session=s3cret; Path=/; Domain=app.local; HttpOnly; Secure; SameSite=Lax",
+        "csrftoken=abc123; Path=/api; SameSite=Strict",
+        "theme=dark",
+    ]
 
 
 async def test_framing_headers_are_not_forwarded(

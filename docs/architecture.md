@@ -25,7 +25,7 @@ reconciled with reality).
 |---|---|---|---|---|---|
 | 1 | Local server | `server/` | 5142 | Python 3.11+, FastAPI | **Implemented** |
 | 2 | Local dashboard | `web/local/` | 5174 | React 19 + Vite | **Implemented** |
-| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane only ([#6](https://github.com/lem-app/lem/issues/6)) |
+| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane works; app viewing is implemented but unverified end to end ([#6](https://github.com/lem-app/lem/issues/6)) |
 | 4 | Cloud signaling | `cloud/signaling/` | 8000 | Python, FastAPI | **Implemented** |
 | 5 | Cloud relay | `cloud/relay/` | 8001 | Python, FastAPI | **Partial** — reachable, but auto-fallback cannot trigger ([#12](https://github.com/lem-app/lem/issues/12)) |
 
@@ -316,11 +316,13 @@ sequenceDiagram
 **What works**: JSON API calls. `ServicesCatalog`, `ClientSelector`, `APITester`, and job
 polling all go through `proxyFetch` and function.
 
-**What does not**: viewing a service. `ClientViewer.tsx:281-286` renders
-`<iframe src={appInfo.url}>` where `appInfo.url` is the *local machine's* `127.0.0.1:PORT`, so
-the remote browser loads its own loopback. Proxied WebSockets never reach `OPEN`
-(`ws-proxy.ts:99` → nothing calls `handleConnectionOpened` at `ws-proxy.ts:444`; the server side
-says as much at `ws_proxy.py:146`). Full analysis and the fix:
+**What is not yet confirmed**: viewing a service end to end. The two defects that made it
+impossible are fixed — `ClientViewer` frames the same-origin `/app/<deviceId>/<serviceId>/`
+path behind a Service Worker (Phase 4) instead of the local machine's `127.0.0.1:PORT`, and
+proxied WebSockets reach `OPEN` now that `WS_CONNECT_ACK` exists on both sides and a shim is
+injected into the framed document (Phase 5). What has *not* happened is a run against a real
+Open WebUI from a second machine; the procedure that settles it is
+[`testing_checklist.md`](./testing_checklist.md) §4.1. Full design:
 [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md).
 
 ### 3.3 Remote mode, relay fallback — **Partial**
@@ -471,16 +473,16 @@ web/remote/src/
 ├── lib/relay-client.ts      # relay WebSocket transport
 ├── lib/proxy-fetch.ts       # fetch() over the tunnel  (works)
 ├── lib/http-frame.ts        # v2 codec
-├── lib/ws-proxy.ts          # ProxiedWebSocket           (never opens — #6)
-├── lib/ws-frame.ts          # v2 WS codec
-├── lib/websocket-intercept.ts # patches window.WebSocket (wrong realm, dead gate — #6)
+├── lib/ws-proxy.ts          # ProxiedWebSocket + WSProxyManager (v3 ack state machine)
+├── lib/ws-frame.ts          # v3 WS codec
+├── lib/ws-bridge.ts         # window.__lemWsBridge — the framed shim calls in here
 └── components/
     ├── DeviceSelector.tsx   # GET /devices on the signaling server
     ├── ConnectionStatus.tsx
     ├── ServicesCatalog.tsx  # works, over proxyFetch
     ├── ClientSelector.tsx   # works, over proxyFetch
     ├── APITester.tsx        # works, over proxyFetch
-    └── ClientViewer.tsx     # renders <iframe src={localhost URL}> — broken (#6)
+    └── ClientViewer.tsx     # frames /app/<deviceId>/<serviceId>/ via the Service Worker
 ```
 
 Frame routing on receipt reads byte 0 and dispatches to the HTTP proxy or the WS proxy manager,
@@ -503,8 +505,8 @@ app code and requires it to move.
 | Local dashboard | **Implemented** | `web/local/` |
 | WebRTC signaling + DataChannel | **Implemented** | `webrtc_client.py`, `cloud/signaling/` |
 | Remote JSON API access | **Implemented** | `proxy-fetch.ts`, `http_proxy.py` |
-| Remote **app viewing** | **Not working** | `ClientViewer.tsx:281-286` ([#6](https://github.com/lem-app/lem/issues/6)) |
-| Proxied WebSockets | **Not working** | `ws-proxy.ts:99`/`:444`, `ws_proxy.py:146` ([#6](https://github.com/lem-app/lem/issues/6)) |
+| Remote **app viewing** | **Implemented, unverified end to end** | `lem-app-sw.js`, `sw-bridge.ts`, `ClientViewer.tsx`; needs [`testing_checklist.md`](./testing_checklist.md) §4.1 ([#6](https://github.com/lem-app/lem/issues/6)) |
+| Proxied WebSockets | **Implemented, unverified end to end** | `ws-proxy.ts`, `ws-bridge.ts`, `ws_proxy.py`; ack + shim covered in-suite, socket.io needs a browser ([#6](https://github.com/lem-app/lem/issues/6)) |
 | Relay transport | **Implemented** | `relay_client.py`, `cloud/relay/` |
 | Relay **auto-fallback** | **Not working** | `webrtc_client.py:704-743`, `:69` ([#12](https://github.com/lem-app/lem/issues/12)) |
 | Local API authentication | **Not on `main`** | ([#7](https://github.com/lem-app/lem/issues/7)); PR [#25](https://github.com/lem-app/lem/pull/25) |

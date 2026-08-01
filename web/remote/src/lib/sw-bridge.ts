@@ -188,6 +188,9 @@ export class ServiceWorkerBridge {
   /** Exposed for tests: how many exchanges the page refused on device id. */
   deviceMismatches = 0
 
+  /** Exposed for tests: documents delivered without the WebSocket shim. */
+  shimSkips = 0
+
   constructor(options: ServiceWorkerBridgeOptions) {
     this.proxyFetch = options.proxyFetch
     this.container =
@@ -350,6 +353,19 @@ export class ServiceWorkerBridge {
     if (data?.type === 'LEM_SESSION_ACK') {
       const ackId = (data as { ackId?: unknown }).ackId
       if (typeof ackId === 'number') this.sessionAcks.get(ackId)?.()
+      return
+    }
+
+    if (data?.type === 'LEM_SHIM_SKIPPED') {
+      // The document loaded but no insertion point was found in the first
+      // HTML_SNIFF_BYTES, so its WebSockets will fail with 4002. Loud, because
+      // a frame where HTTP works and sockets do not looks like an app bug.
+      const path = (data as { path?: unknown }).path
+      console.warn(
+        `[sw-bridge] WebSocket shim not injected into ${String(path)}; ` +
+          'WebSockets in that document will not reach the tunnel.'
+      )
+      this.shimSkips += 1
       return
     }
 

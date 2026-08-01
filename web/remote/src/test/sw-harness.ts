@@ -49,6 +49,7 @@ import { ServiceWorkerBridge, SW_SCOPE } from '../lib/sw-bridge'
 import {
   LemAppServiceWorker,
   createMemoryBindingStore,
+  installServiceWorker,
   type BindingStore,
 } from '../../public/lem-app-sw.js'
 
@@ -307,12 +308,31 @@ export interface DispatchResult {
   passedThrough: boolean
 }
 
+/** The `fetch` listener `installServiceWorker` wired up. */
+export type FetchListener = (event: {
+  request: Request
+  clientId: string
+  resultingClientId: string
+  respondWith: (value: Response | Promise<Response>) => void
+}) => void
+
 /**
- * Deliver one request to a worker the way a browser would, and report both what
- * came back and whether the worker declined to intercept.
+ * Deliver one request through the worker's **real** `fetch` listener.
+ *
+ * Not through `classify()` directly, which is what this harness used to do
+ * (#75): no test then exercised the listener `installServiceWorker` actually
+ * registers, and a browser enforces something that shape of test cannot see -
+ * `respondWith()` must be called *synchronously*, before the handler returns.
+ * A listener refactored to `async` and awaiting first passes a `classify()`
+ * test and throws `InvalidStateError` in every real browser.
+ *
+ * So `respondWith` here throws exactly as the browser does once the listener
+ * has returned. The rest of the fake stays a fake, and the second gap #75
+ * records - a synchronous `ServiceWorker.postMessage` where the real one is
+ * async - is untouched and still open.
  */
 export async function dispatchFetch(
-  worker: LemAppServiceWorker,
+  listener: FetchListener,
   network: FakeNetwork,
   url: string,
   options: DispatchOptions = {}
@@ -334,21 +354,32 @@ export async function dispatchFetch(
   const framed = Object.create(request, overrides) as Request
 
   let settled: Response | Promise<Response> | null = null
+  let listenerReturned = false
   const event = {
     request: framed,
     clientId: options.clientId ?? '',
     resultingClientId: options.resultingClientId ?? '',
     respondWith: (value: Response | Promise<Response>) => {
+      if (listenerReturned) {
+        throw new DOMException(
+          'respondWith() was called after the fetch listener returned',
+          'InvalidStateError'
+        )
+      }
       settled = value
     },
   }
 
-  const decision = worker.classify(event)
-  if (decision === null) {
+  try {
+    listener(event)
+  } finally {
+    listenerReturned = true
+  }
+
+  if (settled === null) {
     return { response: network.fetch(url), passedThrough: true }
   }
-  event.respondWith(decision)
-  return { response: await (settled as unknown as Promise<Response>), passedThrough: false }
+  return { response: await (settled as Response | Promise<Response>), passedThrough: false }
 }
 
 // -- assembly ----------------------------------------------------------------
@@ -384,16 +415,34 @@ export async function createHarness(
   const proxy = new HTTPProxy(tunnel)
   tunnel.proxy = proxy
 
-  let worker = new LemAppServiceWorker({
-    origin: ORIGIN,
+  // The worker is built through `installServiceWorker`, the same entry point a
+  // browser uses, so the listeners under test are the ones that ship.
+  const swListeners = new Map<string, ((event: never) => void)[]>()
+  const scope = {
+    location: { origin: ORIGIN },
     clients,
-    bindingStore,
-  })
+    addEventListener: (type: string, listener: (event: never) => void) => {
+      swListeners.set(type, [...(swListeners.get(type) ?? []), listener])
+    },
+  }
+
+  const buildWorker = (): LemAppServiceWorker => {
+    swListeners.clear()
+    return installServiceWorker(scope, { bindingStore })
+  }
+
+  const emit = (type: string, event: unknown): void => {
+    for (const listener of swListeners.get(type) ?? []) {
+      ;(listener as (value: unknown) => void)(event)
+    }
+  }
+
+  let worker = buildWorker()
 
   const listeners = new Map<string, Set<EventListener>>()
   const controller: FakeWorkerHandle = {
     postMessage: (message, transfer) => {
-      worker.handleMessage(message, (transfer ?? []) as MessagePort[])
+      emit('message', { data: message, ports: (transfer ?? []) as MessagePort[] })
     },
   }
 
@@ -439,14 +488,22 @@ export async function createHarness(
     restartWorker: async () => {
       // A restarted worker keeps nothing but what it persisted, which is the
       // whole point of resolution step 4.
-      worker = new LemAppServiceWorker({ origin: ORIGIN, clients, bindingStore })
+      worker = buildWorker()
       for (const listener of listeners.get('controllerchange') ?? []) {
         listener(new Event('controllerchange'))
       }
       await settle()
       return worker
     },
-    dispatch: (url, dispatchOptions) => dispatchFetch(worker, network, url, dispatchOptions),
+    dispatch: (url, dispatchOptions) =>
+      dispatchFetch(
+        (event) => {
+          emit('fetch', event)
+        },
+        network,
+        url,
+        dispatchOptions
+      ),
   }
 }
 

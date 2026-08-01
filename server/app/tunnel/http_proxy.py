@@ -110,6 +110,19 @@ PROXY_CONTROLLED_HEADERS = frozenset(
 # anything that would hand the peer upstream state. Content-Length and
 # Content-Encoding are recomputed by the frame (aiohttp already decoded the
 # body), so relaying the upstream values would misdescribe what the peer gets.
+#
+# ``set-cookie`` is deliberately **absent**. It was blocked here until #72, and
+# the consequence was concrete: no framed app could log in, because its session
+# cookie never reached the browser. It crosses the tunnel verbatim and is
+# re-scoped in the Service Worker, which is the only side that knows the
+# ``/app/<deviceId>/<serviceId>/`` path the cookie has to be pinned to - the
+# device id is never on the wire, because the far side *is* the device. See
+# ``web/remote/public/lem-app-sw.js::rewriteSetCookie`` and spec sections 5.6
+# and 8.4.
+#
+# ``set-cookie2`` stays blocked: RFC 6265 obsoleted RFC 2965, its attribute
+# grammar is a different (quoted) one, and rewriting a header no upstream we
+# proxy emits would be untested code on a login path.
 RESPONSE_BLOCKED_HEADERS = frozenset(
     {
         "connection",
@@ -122,7 +135,6 @@ RESPONSE_BLOCKED_HEADERS = frozenset(
         "upgrade",
         "content-length",
         "content-encoding",
-        "set-cookie",
         "set-cookie2",
     }
 )
@@ -212,7 +224,12 @@ def filter_response_headers(headers: Iterable[tuple[str, str]]) -> HeaderList:
     """Drop hop-by-hop and upstream-state headers before relaying to the peer.
 
     The mirror of :func:`filter_request_headers`: without it the peer receives
-    whatever the upstream sent, including cookies and internal debug headers.
+    whatever the upstream sent, including internal debug headers.
+
+    ``Set-Cookie`` crosses (#72). Every one of them: they are not foldable into
+    a single header, which is precisely why this takes pairs rather than a
+    mapping. The browser side re-scopes each cookie's ``Path`` to the service it
+    came from before it reaches the cookie jar.
 
     Takes pairs rather than a mapping, and is fed from aiohttp's ``CIMultiDict``
     via ``.items()``. ``dict(response.headers)`` - what v2 did - collapses every

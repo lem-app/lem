@@ -162,18 +162,18 @@ def test_peer_cannot_supply_proxy_controlled_headers() -> None:
 
 
 def test_upstream_response_headers_are_filtered() -> None:
-    """Hop-by-hop, cookie and framing headers never cross back to the peer.
+    """Hop-by-hop and framing headers never cross back to the peer.
 
     Ordinary application headers still do - the proxy fronts arbitrary client
     UIs, so this is a denylist mirroring the request side, not an allowlist.
     """
     filtered = filter_response_headers(
         [
-            ("Set-Cookie", "session=secret; HttpOnly"),
             ("Connection", "close"),
             ("Transfer-Encoding", "chunked"),
             ("Content-Length", "12"),
             ("Content-Encoding", "gzip"),
+            ("Set-Cookie2", "session=secret; Version=1"),
             ("X-Frame-Options", "DENY"),
             ("Content-Type", "application/json"),
         ]
@@ -182,6 +182,43 @@ def test_upstream_response_headers_are_filtered() -> None:
     assert filtered == [
         ("X-Frame-Options", "DENY"),
         ("Content-Type", "application/json"),
+    ]
+
+
+def test_set_cookie_crosses_the_tunnel_verbatim() -> None:
+    """#72: blocking this header meant no framed app could ever log in.
+
+    The server relays the cookie exactly as the upstream wrote it. Re-scoping
+    it to ``/app/<deviceId>/<serviceId>/`` happens in the Service Worker, the
+    only side that knows the device segment - the far side *is* the device, so
+    the id is never on the wire. Rewriting here would require inventing it.
+    """
+    upstream = "session=secret; Path=/; Domain=app.local; HttpOnly; Secure; SameSite=Lax"
+
+    filtered = filter_response_headers([("Set-Cookie", upstream), ("Content-Type", "text/html")])
+
+    assert filtered == [("Set-Cookie", upstream), ("Content-Type", "text/html")]
+
+
+def test_every_set_cookie_on_a_response_survives_separately() -> None:
+    """Cookies are not foldable into one header; a login sets several.
+
+    ``dict(response.headers)`` - what v2 did - would keep only ``third``.
+    """
+    filtered = filter_response_headers(
+        [
+            ("Set-Cookie", "first=1; Path=/"),
+            ("Set-Cookie", "second=2; Path=/admin"),
+            ("Content-Type", "text/html"),
+            ("Set-Cookie", "third=3"),
+        ]
+    )
+
+    assert filtered == [
+        ("Set-Cookie", "first=1; Path=/"),
+        ("Set-Cookie", "second=2; Path=/admin"),
+        ("Content-Type", "text/html"),
+        ("Set-Cookie", "third=3"),
     ]
 
 

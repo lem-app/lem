@@ -283,6 +283,37 @@ describe('installServiceWorker', () => {
     expect(responded).toBe(false)
     expect(worker.stats.passedThrough).toBe(1)
   })
+
+  it('calls respondWith before the listener returns, as a browser requires', () => {
+    // A real Service Worker throws `InvalidStateError` if `respondWith()` is
+    // called after the handler returns. That makes "the listener must not be
+    // async" a hard constraint, and one that is easy to reintroduce in a
+    // refactor - #75 records that no test used to exercise it at all.
+    const handlers = new Map<string, (event: never) => void>()
+    const scope = {
+      location: { origin: ORIGIN },
+      clients: { get: () => Promise.resolve(undefined), matchAll: () => Promise.resolve([]) },
+      addEventListener: (type: string, listener: (event: never) => void) => {
+        handlers.set(type, listener)
+      },
+    }
+    installServiceWorker(scope)
+
+    let respondedDuringListener = false
+    let listenerReturned = false
+    const onFetch = handlers.get('fetch') as (event: unknown) => void
+    onFetch({
+      request: new Request(`${ORIGIN}/app/dev-7f3a/webui/`),
+      clientId: 'frame-1',
+      resultingClientId: '',
+      respondWith: () => {
+        respondedDuringListener = !listenerReturned
+      },
+    })
+    listenerReturned = true
+
+    expect(respondedDuringListener).toBe(true)
+  })
 })
 
 describe('the worker error table', () => {

@@ -27,7 +27,7 @@
  * address is used only on the far side, by the router, to pick an upstream.
  */
 
-import { type ReactElement, useEffect, useState } from 'react'
+import { type ReactElement, type SyntheticEvent, useCallback, useEffect, useState } from 'react'
 import type { ConnectionState, DataChannelState, Service } from '../api/types'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -37,6 +37,7 @@ import { ArrowLeft, Activity, AlertCircle, Loader2 } from 'lucide-react'
 import { localApiUrl } from '../lib/env'
 import { appPath, type SessionRegistrar, type SwStatus } from '../lib/sw-bridge'
 import { swUnavailableMessage } from '../lib/sw-status'
+import { attachWsBridgeToFrame } from '../lib/ws-bridge'
 
 interface Client {
   id: string
@@ -182,6 +183,14 @@ export function ClientViewer({
       bridge.closeSession(deviceId, appId)
     }
   }, [bridge, deviceId, appId, appInfo?.status])
+
+  // Belt and braces only (spec section 3.7 step 4). By `load` the app has
+  // already opened its first socket, so the shim's own `window.parent` lookup
+  // is what actually has to work; this covers a dashboard that is itself framed
+  // and whose parent is therefore somebody else.
+  const handleFrameLoad = useCallback((event: SyntheticEvent<HTMLIFrameElement>) => {
+    attachWsBridgeToFrame(event.currentTarget, window)
+  }, [])
 
   const getStatusBadge = () => {
     if (!isConnected || loading) {
@@ -380,6 +389,7 @@ export function ClientViewer({
                   className="h-[calc(100vh-300px)] w-full rounded-lg"
                   sandbox="allow-scripts allow-same-origin allow-forms"
                   allow=""
+                  onLoad={handleFrameLoad}
                 />
               </div>
 

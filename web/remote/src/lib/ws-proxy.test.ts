@@ -112,6 +112,52 @@ describe('ProxiedWebSocket', () => {
     expect(ws.protocol).toBe('chat')
   })
 
+  // The pattern this whole phase exists for. `send()` in the *same synchronous
+  // turn* as the constructor, before the WS_CONNECT frame has even left: v2
+  // threw here (`ws-proxy.ts:162-164`), which is why socket.io never got past
+  // its first frame.
+  it('buffers a send issued synchronously after construction', async () => {
+    const transport = new StubTransport()
+    const manager = new WSProxyManager(transport)
+
+    const ws = manager.createConnection('ws://localhost:3000/socket')
+    expect(() => ws.send('40/chat,')).not.toThrow()
+    expect(ws.readyState).toBe(0)
+    // Not even the connect frame has been sent yet.
+    expect(transport.sent).toHaveLength(0)
+
+    await Promise.resolve()
+    expect(transport.frameTypes()).toEqual([FrameType.WS_CONNECT])
+
+    manager.handleFrame(ack(1))
+
+    const dataFrames = transport.sent.slice(1).map((frame) => deserializeWSData(frame))
+    expect(dataFrames.map((frame) => new TextDecoder().decode(frame.payload))).toEqual(['40/chat,'])
+  })
+
+  it('keeps a synchronous string send behind an earlier Blob send', async () => {
+    const transport = new StubTransport()
+    const manager = new WSProxyManager(transport)
+
+    const ws = manager.createConnection('ws://localhost:3000/socket')
+    // The Blob has to be read asynchronously. Buffering the string that
+    // follows it directly - which is what the CONNECTING branch used to do -
+    // put the string on the wire first.
+    ws.send(new Blob([new Uint8Array([1, 2, 3])]))
+    ws.send('after-the-blob')
+
+    await Promise.resolve()
+    manager.handleFrame(ack(1))
+
+    await vi.waitFor(() => {
+      expect(transport.sent).toHaveLength(3)
+    })
+    const frames = transport.sent.slice(1).map((frame) => deserializeWSData(frame))
+    expect(frames[0].opcode).toBe(WSOpcode.BINARY)
+    expect([...frames[0].payload]).toEqual([1, 2, 3])
+    expect(new TextDecoder().decode(frames[1].payload)).toBe('after-the-blob')
+  })
+
   // Real apps call send() in the same turn as the constructor.
   it('buffers sends made before the ack and flushes them after', async () => {
     const transport = new StubTransport()
@@ -155,9 +201,38 @@ describe('ProxiedWebSocket', () => {
       expect(events).toEqual(['error', 'close'])
       expect(closeCode).toBe(1011)
       expect(ws.readyState).toBe(3)
+
+      // The criterion is "in under a second, not at the 10 s timeout". Fake
+      // time has not moved at all, and advancing past the timeout produces no
+      // second close and does not rewrite the code to 4003 - which is what a
+      // connect timer left running would do.
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(events).toEqual(['error', 'close'])
+      expect(closeCode).toBe(1011)
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('reports a refused upstream in well under a second of real time', async () => {
+    const transport = new StubTransport()
+    const manager = new WSProxyManager(transport)
+    const ws = manager.createConnection('ws://localhost:3000/socket')
+    await Promise.resolve()
+
+    const started = performance.now()
+    let closedAt = 0
+    ws.onclose = () => {
+      closedAt = performance.now()
+    }
+
+    manager.handleFrame(
+      serializeWSConnectError({ connectionId: 1, errorCode: 1011, reason: 'Connection failed' })
+    )
+
+    expect(closedAt).toBeGreaterThan(0)
+    expect(closedAt - started).toBeLessThan(1000)
   })
 
   it('closes with 4003 when no ack arrives in time', async () => {
@@ -283,6 +358,67 @@ describe('ProxiedWebSocket', () => {
     expect(frames[1].opcode).toBe(WSOpcode.CONTINUATION)
     expect(frames[2].fin).toBe(true)
     expect(frames.reduce((sum, frame) => sum + frame.payload.byteLength, 0)).toBe(40)
+  })
+
+  // The boundary itself, not "a big message". Off-by-one here either sends a
+  // frame the peer will reject as over-cap, or fragments something that did
+  // not need it and leaves a FIN-less message hanging.
+  it.each([
+    { label: 'one under the limit', size: 15, fragments: 1 },
+    { label: 'exactly the limit', size: 16, fragments: 1 },
+    { label: 'one over the limit', size: 17, fragments: 2 },
+    { label: 'an exact multiple', size: 64, fragments: 4 },
+    { label: 'several multiples and a remainder', size: 70, fragments: 5 },
+  ])('fragments a $label message correctly', async ({ size, fragments }) => {
+    const transport = new StubTransport()
+    const manager = new WSProxyManager(transport)
+    manager.setNegotiatedLimits(16)
+    const ws = manager.createConnection('ws://localhost:3000/socket')
+    await Promise.resolve()
+    manager.handleFrame(ack(1))
+    transport.sent.length = 0
+
+    const payload = new Uint8Array(size).map((_, index) => (index * 7) % 251)
+    ws.send(payload)
+
+    const frames = transport.sent.map((frame) => deserializeWSData(frame, 16))
+    expect(frames).toHaveLength(fragments)
+    expect(frames[0].opcode).toBe(WSOpcode.BINARY)
+    expect(frames.slice(1).every((frame) => frame.opcode === WSOpcode.CONTINUATION)).toBe(true)
+    expect(frames.slice(0, -1).every((frame) => frame.fin === false)).toBe(true)
+    expect(frames[frames.length - 1].fin).toBe(true)
+    expect(frames.every((frame) => frame.payload.byteLength <= 16)).toBe(true)
+
+    // Every fragment reassembles into the original, byte for byte.
+    const joined = new Uint8Array(size)
+    let offset = 0
+    for (const frame of frames) {
+      joined.set(frame.payload, offset)
+      offset += frame.payload.byteLength
+    }
+    expect([...joined]).toEqual([...payload])
+  })
+
+  it('round-trips an over-limit message through its own fragments', async () => {
+    // Outbound fragmentation feeding inbound reassembly: the two halves of the
+    // criterion have to agree, and only a round trip proves they do.
+    const transport = new StubTransport()
+    const manager = new WSProxyManager(transport)
+    manager.setNegotiatedLimits(1024)
+    const ws = manager.createConnection('ws://localhost:3000/socket')
+    await Promise.resolve()
+    manager.handleFrame(ack(1))
+    transport.sent.length = 0
+
+    const message = 'token '.repeat(20_000)
+    ws.send(message)
+    expect(transport.sent.length).toBeGreaterThan(100)
+
+    const received: unknown[] = []
+    ws.onmessage = (event) => received.push(event.data)
+    for (const frame of transport.sent) manager.handleFrame(frame)
+
+    expect(received).toEqual([message])
   })
 
   it('reassembles a fragmented inbound message', async () => {

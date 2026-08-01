@@ -512,6 +512,16 @@ it.
    that opens the session, strictly before the iframe element is appended. The parent never
    reaches into the child; the child reaches *out*.
 
+   > **Correction from the implementation: the callbacks are an argument, not a registry.**
+   > `connect(url, protocols, sink)` takes the shim's `{open, message, error, close}` in the same
+   > call. A registry filled in on the line *after* `connect` can miss the `open` it exists to
+   > deliver: `WS_CONNECT_ACK` may already be in the receive queue, and `handleConnectAck` fires
+   > `onopen` synchronously. Same object, one fewer window in which it is empty.
+   >
+   > `connect` also sets the underlying `ProxiedWebSocket`'s `binaryType` to `arraybuffer` and
+   > hands the shim a plain `ArrayBuffer`, so the *frame* mints the `Blob`. A `Blob` built in the
+   > dashboard's realm fails `instanceof Blob` inside the app, and apps do check.
+
 2. **Service Worker, in the response.** When `proxy()` produces a response for a **navigation**
    request whose `Content-Type` starts with `text/html`, the SW splices a single inline
    `<script>` in as the **first child of `<head>`** (or, if no `<head>` is found before the
@@ -602,6 +612,12 @@ Response headers the SW **strips before constructing the `Response`**:
 were written for the app's own origin and will otherwise block the injected shim),
 `X-Frame-Options`, `Strict-Transport-Security`, `Public-Key-Pins`. The SW substitutes its own
 CSP: `frame-ancestors 'self'; base-uri 'self'`. `sandbox` directives from upstream are dropped.
+
+Response headers the SW **rewrites**: `Location` (above), and `Set-Cookie` — each one
+separately, with `Path` replaced by `/app/<deviceId>/<serviceId>/` and `Domain` removed, and
+every other attribute untouched (§5.6, [#72](https://github.com/lem-app/lem/issues/72)). The
+segments are the ones the *request* named, never the active device's, for the same reason the
+`Location` rewrite uses them.
 
 ### 3.9 Degradation when Service Workers are unavailable
 
@@ -1240,17 +1256,26 @@ token stream is forwarded token-group by token-group. That is G4. Note `iter_chu
 - Keep everything else verbatim, including `Content-Type`, `Cache-Control`, `Set-Cookie`,
   `Location`.
 
-> **Open discrepancy found in Phase 4: `Set-Cookie` is being stripped, not kept.** The landed
-> `filter_response_headers` blocks `set-cookie` and `set-cookie2` via
-> `RESPONSE_BLOCKED_HEADERS` (`server/app/tunnel/http_proxy.py`), which directly contradicts the
-> line above and the duplicate-`Set-Cookie` rationale in §3.5. The consequence is concrete: **no
-> framed app can log in over the tunnel**, because its session cookie never reaches the browser.
-> Phase 4 does not depend on cookies — its criterion is that the document and its subresources
-> load — so this was left alone rather than silently relaxing a control another change
-> deliberately added. It must be resolved before Phase 5's "Open WebUI's socket.io session
-> establishes and a chat message round-trips" can pass, and the resolution needs an explicit
-> decision: either the header crosses (and §3.5's pair encoding earns its keep), or the spec stops
-> claiming it does.
+> **Resolved in Phase 5 ([#72](https://github.com/lem-app/lem/issues/72)): `Set-Cookie` crosses,
+> and the browser re-scopes it.** Phase 4 landed with `set-cookie` in
+> `RESPONSE_BLOCKED_HEADERS` (`server/app/tunnel/http_proxy.py`), which had one concrete
+> consequence: **no framed app could log in over the tunnel**, because its session cookie never
+> reached the browser. Phase 4's criteria do not exercise cookies, so it was recorded rather than
+> quietly widened. The decision, and what shipped:
+>
+> - The **server relays `Set-Cookie` verbatim** — every one of them, which is what §3.5's pair
+>   encoding is for. It does *not* rewrite: the rewrite needs the device segment, and the far
+>   side is the device, so that id is never on the wire for it to use.
+> - The **Service Worker re-scopes each cookie** as it builds the `Response`
+>   (`lem-app-sw.js::rewriteSetCookie`): `Path` is *replaced* with
+>   `/app/<deviceId>/<serviceId>/` — the **request's** segments, matching the device-mismatch
+>   rule — `Domain` is dropped so the cookie stays host-only, and `HttpOnly`, `Secure`,
+>   `SameSite` and everything else are passed through byte for byte. An app that deliberately
+>   sets a cookie its own JavaScript reads needs it readable.
+> - `set-cookie2` stays blocked. RFC 6265 obsoleted RFC 2965, its attribute grammar is a
+>   different quoted one, and no upstream this proxy fronts emits it.
+>
+> **This is functional isolation, not a security boundary** — see §8.4.
 
 **Backpressure.** Before each chunk, if the transport's buffered amount exceeds
 `SEND_HIGH_WATER = 1 MiB`, await the low-water signal:
@@ -1604,6 +1629,23 @@ The same-origin SW design makes this worse in one specific way and better in ano
   origin is not controlled by a Service Worker at all — the proxy would simply not work. So the
   choice is explicit rather than accidental.
 
+**Cookies on the shared origin (Phase 5, [#72](https://github.com/lem-app/lem/issues/72)).**
+Because every framed service shares the dashboard's origin, it also shares its cookie jar. The
+Service Worker therefore re-scopes each upstream `Set-Cookie` to
+`Path=/app/<deviceId>/<serviceId>/` and strips `Domain`, so the browser only *attaches* a
+service's cookie to requests for that service's path — not to another service's, and not to the
+dashboard's own requests. That is what makes login work without one app's session cookie being
+handed to the next.
+
+**It is functional isolation, not a security boundary. Do not describe it as "cookies are
+isolated per service".** Path-scoping governs what the browser sends on its own initiative and
+nothing else. Same-origin JavaScript in one framed app can still `fetch('/app/<other>/…')`
+deliberately and have that request carry the other service's cookies, and it can still read
+anything not marked `HttpOnly` through a request it makes itself. A hostile or compromised
+service framed on this origin is not contained by path scoping. **Per-service origins
+(requirement 4 below) is the actual boundary**; this makes v0.1 usable with a stated, understood
+limitation instead of shipping either a login-less viewer or one shared unpartitioned jar.
+
 **Normative requirements that ship with Phase 6:**
 
 1. The remote dashboard MUST NOT persist the signaling JWT (or any bearer credential) in
@@ -1786,7 +1828,10 @@ device the dashboard has authenticated to signaling, not a value it invents.
 ### Phase 5 — WebSocket ack, shim injection, and streaming apps
 
 **Scope**: `WS_CONNECT_ACK` / `WS_CONNECT_ERROR` on both sides, `ProxiedWebSocket` state
-machine, SW HTML shim injection, deletion of `websocket-intercept.ts`.
+machine, SW HTML shim injection, deletion of `websocket-intercept.ts`. It also carries the
+`Set-Cookie` decision ([#72](https://github.com/lem-app/lem/issues/72)), because without it the
+socket.io criterion below cannot be reached — a session that cannot be established cannot be
+resumed over a WebSocket.
 
 **Acceptance criteria**
 
@@ -1799,6 +1844,22 @@ machine, SW HTML shim injection, deletion of `websocket-intercept.ts`.
       with the mapped code, in < 1 s (not the 10 s timeout).
 - [ ] A WS message larger than `MAX_CHUNK_BYTES` is fragmented and reassembled intact.
 - [ ] The shim is the first `<script>` in the document — asserted by parsing the delivered HTML.
+- [ ] An upstream `Set-Cookie` reaches the browser with `Path` rewritten to the requesting
+      service's segment and `Domain` removed, every other attribute byte-identical; every
+      `Set-Cookie` on a response survives separately; and a cookie set by service A is not sent
+      to service B or to the dashboard root, asserted at the transport.
+
+> **Which of these a test can settle, and which a human has to.** Two criteria above name a
+> product, a browser and a model: "Open WebUI's socket.io session establishes and a chat message
+> round-trips", and "a model response streams token by token — asserted by timestamping the
+> first and last DOM mutation". Neither is reachable from this repository's test suite, which has
+> no browser automation and no Open WebUI. They are **not** met by any test here, and must not be
+> ticked on the strength of one; `docs/testing_checklist.md` carries the manual procedure that
+> settles them. Everything else in the list is verified in-suite: the ack state machine, buffering
+> before the ack (including the synchronous case), sub-second `WS_CONNECT_ERROR`, fragmentation
+> at and around the chunk boundary with a reassembly round trip, the splice asserted by parsing
+> the delivered document, and the cookie rewrite with its cross-service check made through the
+> same cookie implementation jsdom drives `document.cookie` with.
 
 ### Phase 6 — Degradation, security hardening, and truthful UI
 
