@@ -1728,7 +1728,10 @@ The same-origin SW design makes this worse in one specific way and better in ano
   > **The first half alone would have relocated the exposure, not removed it** — and the storage
   > sweep stayed green the whole time the render tree was leaking, which is why the two need
   > separate assertions. Verified by reverting: putting the token back into `useAuth`'s state
-  > leaves `token-persistence.test.ts` at 30/30 and fails `fiber-reachability.test.tsx`. *(The line citations that
+  > leaves `token-persistence.test.ts` fully green and fails three assertions in
+  > `fiber-reachability.test.tsx`. Note the reason the storage sweep misses it is **setup, not
+  > capability** — that walk *can* reach fiber data through `document`; none of its cases render
+  > a component holding a token. The test files carry the full explanation. *(The line citations that
   stood here — `hooks/useAuth.ts:33`, `:44`, `:70`, `:92` — were already stale when Phase 6
   began: [#68](https://github.com/lem-app/lem/pull/68) and #70 had moved custody into
   `lib/session.ts`. Recorded because a `file:line` that has drifted is the failure mode this

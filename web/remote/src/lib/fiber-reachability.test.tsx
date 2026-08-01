@@ -38,18 +38,27 @@
  * Getting the token out of `localStorage` moved it; it did not remove it.
  * That was [#82](https://github.com/lem-app/lem/issues/82).
  *
- * ### Why this is a separate file, and must stay one
+ * ### Why this is a separate file - and the reason is not the obvious one
  *
- * This and `token-persistence.test.ts` ask two independent questions - "is it
- * in a store" and "is it in the page" - and **neither walk can answer the
- * other's**. The proof is reproducible, not theoretical: put the token back
- * into `useAuth`'s React state and the storage suite stays at 30/30 while this
- * one fails three assertions. Those numbers are the reason both exist.
+ * It is **not** that `token-persistence.test.ts` is structurally blind to fiber
+ * data. That was checked directly rather than argued: render a component
+ * holding the token and its `globalThis`-rooted walk finds it through three
+ * paths, because fiber expandos are own properties of DOM elements and
+ * `document` hangs off `globalThis`. The algorithm is perfectly capable.
  *
- * So resist tidying them together, and resist re-rooting either walk to "cover
- * both". The two roots - `globalThis` and `document` - are the whole design.
- * A single merged sweep would have been green through the review round in which
- * the token was readable from the framed subtree.
+ * The actual reason that file stayed green while the token was readable is
+ * that **none of its cases call `render()`** - it exercises `storeToken()` and
+ * a `renderHook` login, and a walk cannot find a rendered token when nothing
+ * rendered one.
+ *
+ * So the split is by **setup, not by capability**, and that is what to preserve.
+ * Merging the files would mean mounting a realistic component tree in every
+ * storage case, which makes a failure ambiguous between "it was persisted" and
+ * "it was rendered". Two files keeps each failure diagnostic: that one says
+ * *stored*, this one says *rendered*.
+ *
+ * The reproducible check either way: put the token back into `useAuth`'s state
+ * and the storage suite stays green while this one fails three assertions.
  *
  * ## The fix this file pins
  *

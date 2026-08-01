@@ -39,21 +39,30 @@
  * remove the *durable, enumerable, cross-tab* copy that the framed realm can
  * lift without the dashboard ever running. See spec §8.4 requirement 1.
  *
- * ### What this does NOT fix, stated here because this is where people look
+ * ### Storage custody is only half of it — stated here because this is where
+ * people look
  *
- * **A framed service can still read the token out of the React render tree.**
- * `useAuth()` puts it in component state and `App.tsx` passes it to children as
- * a prop, so it lives in fiber nodes attached to DOM elements as
- * `__reactFiber$…` expandos — in the very subtree that hosts the service's
- * iframe. Same-origin code in that frame walks `parent.document` to it.
+ * Keeping the token out of storage is not enough on its own. React keeps
+ * component props and hook state on fiber nodes and attaches those to DOM
+ * elements as `__reactFiber$…` expandos, so a token held by *any component*
+ * ends up in the DOM subtree that also hosts the framed service's iframe, where
+ * same-origin code reaches it through `parent.document`. Storing it here and
+ * then handing it to a component would relocate the exposure, not remove it.
  *
- * Storage custody and render-tree custody are two separate problems, and this
- * module solves only the first. The second is
- * [#82](https://github.com/lem-app/lem/issues/82), and its fix is the same
- * shape as this one: components take `isAuthenticated` or a callback that
- * closes over this variable, never the token value itself — a closure is
- * invisible to a fiber walk for exactly the reason it is invisible to the
- * property walk in `token-persistence.test.ts`.
+ * **Both halves are done** ([#82](https://github.com/lem-app/lem/issues/82)):
+ * `useAuth()` returns `isAuthenticated` and never the token, no component takes
+ * it as a prop, and the transport objects (`WebRTCConnectionManager`,
+ * `RelayClient` — both held in React refs, so a `this.token` field would have
+ * been just as reachable) take a `getToken` callback rather than the value.
+ *
+ * **So: if you are about to hand this token to a component, a prop, a ref or a
+ * long-lived object field, don't.** Call {@link readToken} at the point of use
+ * so the value lives on the stack for one call and in this module the rest of
+ * the time. `lib/fiber-reachability.test.tsx` fails if that slips.
+ *
+ * What remains is broader than the token and is Phase 7's: a framed service can
+ * still walk the parent's fiber tree for component structure and other state.
+ * Per-service origins is the only real boundary there.
  *
  * ### The cost, stated plainly
  *

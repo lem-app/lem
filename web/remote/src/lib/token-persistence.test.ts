@@ -62,6 +62,12 @@
  * are covered rather than documented away because *a token in a `Map` keyed by
  * device id needs no adversarial intent at all*.
  *
+ * `Map`/`Set` coverage includes **hostile subclasses**: enumeration goes through
+ * the built-in `Map.prototype.forEach`, captured at module load, so overriding
+ * `Symbol.iterator` or `entries()` to throw does not hide the contents. A
+ * `for...of` walk would have left such a token sitting in plain sight behind
+ * this file's `catch` while `.get()` kept working.
+ *
  * **Not covered. Every one of these is pinned by a test that asserts the miss**,
  * so closing a gap fails loudly and forces this list to be updated, rather than
  * letting the boundary drift while the file still reads as exhaustive:
@@ -104,31 +110,41 @@
  * The union of the two detectors - reachability plus instrumented out-of-band
  * stores - is what backs the criterion. Neither alone does.
  *
- * ## What this file does NOT cover at all: the React render tree
+ * ## What this file does not cover: the React render tree
  *
- * Nothing here says anything about React. That mattered more than it sounds:
- * this file was **green for an entire review round while the token was
- * trivially readable by a framed service**, because React does not keep
- * component state on a global - it keeps it on fiber nodes attached to DOM
- * elements as `__reactFiber$…` expandos, which a same-origin frame reaches
- * through `parent.document`. Getting the token out of browser storage did not
- * get it out of the page.
+ * This file was **green for an entire review round while the token was
+ * trivially readable by a framed service** through React's fiber nodes. That
+ * exposure was [#82](https://github.com/lem-app/lem/issues/82); it is fixed,
+ * and `fiber-reachability.test.tsx` is what holds it fixed.
  *
- * That was [#82](https://github.com/lem-app/lem/issues/82), and it is fixed:
- * `useAuth()` returns `isAuthenticated` and never the token. The assertion that
- * holds it fixed is a **separate sweep** in `fiber-reachability.test.tsx`,
- * rooted at the DOM rather than at `globalThis`.
+ * ### Why the two files stay separate - and be careful about the reason
  *
- * ### Do not merge these two files, or root them at the same place
+ * The tempting explanation is that a `globalThis`-rooted walk structurally
+ * cannot see fiber data. **That is false, and was checked rather than assumed:**
+ * render a component holding the token and this very walk finds it, at
  *
- * They look like near-duplicates - two walks, two needles, two sets of positive
- * controls - and they are not. **A storage sweep is structurally incapable of
- * catching a render-tree exposure**, and this repository has the demonstration
- * rather than the theory: with the token put back into `useAuth`'s React state,
- * this file stays at 30/30 while `fiber-reachability.test.tsx` fails three
- * assertions. That contrast *is* the coverage. Combining them, or re-rooting
- * this walk at `document` to "cover both", collapses two independent questions
- * into one and silently reopens the gap that took a full review round to find.
+ * ```
+ * globalThis.document.body.firstElementChild.__reactContainer$…
+ *   .alternate.child.memoizedState.memoizedState
+ * ```
+ *
+ * and two other paths. Fiber expandos are own properties of DOM elements, and
+ * `document` is reachable from `globalThis`, so the algorithm gets there fine.
+ *
+ * The real reason this file stayed green is duller and more useful: **none of
+ * its cases call `render()`.** It exercises `storeToken()` and a `useAuth`
+ * login through `renderHook`, neither of which mounts a component tree holding
+ * a token. A walk finds nothing if the setup never creates the thing.
+ *
+ * So the two files are separated by **setup, not by capability**. Merging them
+ * would mean rendering a realistic tree in every case here - which changes what
+ * each storage assertion means and makes a failure ambiguous between "it was
+ * persisted" and "it was rendered". Keeping them apart keeps each failure
+ * diagnostic: this file says *stored*, that file says *rendered*.
+ *
+ * If you do merge or re-root them, the thing you must preserve is that some
+ * case actually renders a component holding the token. That is the property
+ * that was missing, and its absence cost a full review round.
  *
  * ## How both halves avoid proving nothing
  *
@@ -172,6 +188,27 @@ const MAX_NODES = 200_000
 
 /** Prototype links climbed per object, to reach platform accessors. */
 const PROTOTYPE_HOPS = 4
+
+/**
+ * The built-in `forEach` for each collection, captured at module load.
+ *
+ * Held by reference so that neither a subclass overriding `Symbol.iterator`
+ * nor later tampering with `Map.prototype` can change what the walk enumerates.
+ * These functions read the [[MapData]] / [[SetData]] internal slots directly.
+ */
+// Unbound on purpose: these are invoked with an explicit receiver via `.call`,
+// which is the entire mechanism - a bound or instance-resolved method could be
+// replaced by the object being inspected.
+/* eslint-disable @typescript-eslint/unbound-method */
+const MAP_FOR_EACH = Map.prototype.forEach as (
+  this: unknown,
+  callback: (value: unknown, key: unknown) => void
+) => void
+const SET_FOR_EACH = Set.prototype.forEach as (
+  this: unknown,
+  callback: (value: unknown) => void
+) => void
+/* eslint-enable @typescript-eslint/unbound-method */
 
 /**
  * Top-level globals that exist only because these tests run in Node under
@@ -319,16 +356,23 @@ function reachableFromGlobals(needle: string): string[] {
     // adversarial intent required - which is why this is traversed rather than
     // documented as a boundary.
     //
-    // Iteration is guarded because `instanceof` is true for a *subclass
-    // prototype* too - `process.allowedNodeEnvironmentFlags.__proto__` and
-    // vitest's `DefaultMap.prototype` are both reached by this walk, are both
-    // `instanceof`, and both throw on iteration because a prototype has no
-    // backing store. Nothing is hidden by skipping them: a prototype holds no
-    // instance data, so there is no token in there to miss.
+    // Enumeration goes through the **built-in** `forEach`, captured at module
+    // load, rather than `for...of`. A `for...of` loop calls the object's own
+    // `Symbol.iterator`, which a subclass can override to throw - leaving the
+    // token sitting in plain sight behind this `catch` while `.get()` keeps
+    // working. `Map.prototype.forEach` reads the [[MapData]] internal slot
+    // directly, so overriding the iterator does not hide anything from it.
+    //
+    // The guard remains because `instanceof` is true for a *subclass prototype*
+    // too - `process.allowedNodeEnvironmentFlags.__proto__` and vitest's
+    // `DefaultMap.prototype` are both reached by this walk, are both
+    // `instanceof`, and both throw here because a prototype has no backing
+    // store. Nothing is hidden by skipping them: a prototype holds no instance
+    // data, so there is no token in there to miss.
     try {
       if (object instanceof Map) {
         let index = 0
-        for (const [entryKey, entryValue] of object) {
+        MAP_FOR_EACH.call(object, (entryValue: unknown, entryKey: unknown) => {
           queue.push({ value: entryKey, path: `${path}.<mapKey ${index}>`, depth: depth + 1 })
           queue.push({
             value: entryValue,
@@ -336,13 +380,13 @@ function reachableFromGlobals(needle: string): string[] {
             depth: depth + 1,
           })
           index += 1
-        }
+        })
       } else if (object instanceof Set) {
         let index = 0
-        for (const entry of object) {
+        SET_FOR_EACH.call(object, (entry: unknown) => {
           queue.push({ value: entry, path: `${path}.<setEntry ${index}>`, depth: depth + 1 })
           index += 1
-        }
+        })
       }
     } catch {
       // Not a real Map/Set instance - see above.
@@ -594,6 +638,48 @@ describe('the reachability walk itself (positive controls)', () => {
     plantGlobal('__lemState', { cache: new Map([['t', NEEDLE]]) })
 
     expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemState.cache.get(t)')
+  })
+
+  // A `for...of` walk calls the object's own `Symbol.iterator`, so a subclass
+  // that throws from it would hide its contents behind the walk's `catch` while
+  // `.get()` kept working perfectly. Going through the built-in `forEach`
+  // defeats that, because it reads the internal slot rather than the iterator.
+  it('finds a token in a Map whose Symbol.iterator has been sabotaged', () => {
+    class HostileMap<K, V> extends Map<K, V> {
+      [Symbol.iterator](): MapIterator<[K, V]> {
+        throw new Error('enumeration refused')
+      }
+      override entries(): MapIterator<[K, V]> {
+        throw new Error('enumeration refused')
+      }
+    }
+
+    const hostile = new HostileMap<string, string>()
+    hostile.set('session', NEEDLE)
+    plantGlobal('__lemHostile', hostile)
+
+    // The sabotage is real: a naive walk would throw here and give up.
+    expect(() => [...hostile]).toThrow('enumeration refused')
+    // ...and the value is still trivially available to anyone holding the Map.
+    expect(hostile.get('session')).toBe(NEEDLE)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemHostile.get(session)')
+  })
+
+  it('finds a token in a Set whose Symbol.iterator has been sabotaged', () => {
+    class HostileSet<T> extends Set<T> {
+      [Symbol.iterator](): SetIterator<T> {
+        throw new Error('enumeration refused')
+      }
+    }
+
+    const hostile = new HostileSet<string>()
+    hostile.add(NEEDLE)
+    plantGlobal('__lemHostileSet', hostile)
+
+    expect(() => [...hostile]).toThrow('enumeration refused')
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemHostileSet.<setEntry 0>')
   })
 
   // Stated as a test rather than a comment so that closing the gap fails here
