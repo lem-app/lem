@@ -37,6 +37,9 @@ from aiortc import (
 )
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
+from app.crypto import SIGNAL_CONTEXT, sign_challenge
+from app.db import get_device
+
 from .http_proxy import HTTPProxyHandler
 from .message_dispatcher import MessageDispatcher
 from .peer_auth import PeerIdentity, PeerVerifier, build_peer_verifier
@@ -46,9 +49,28 @@ from .ws_proxy import WSProxyHandler
 
 logger = logging.getLogger(__name__)
 
+# Backpressure thresholds for the DataChannel's send buffer (spec section 5.6).
+# A streaming response is produced far faster than SCTP drains it; without a
+# wait the buffer grows without bound and the channel is torn down.
+SEND_HIGH_WATER = 1024 * 1024  # 1 MiB buffered: stop producing
+SEND_LOW_WATER = 256 * 1024  # 256 KiB buffered: resume
+# Never park a producer forever on a peer that has stopped reading.
+SEND_DRAIN_TIMEOUT = 30.0
 
-class ConnectionState(str, Enum):
-    """WebRTC connection states."""
+
+class ConnectionState(str, Enum):  # noqa: UP042
+    """WebRTC connection states.
+
+    Deliberately NOT `StrEnum`. Members are interpolated bare (no `.value`) into
+    operator-facing log lines -- `_set_state()` logs
+    `f"State change: {old_state} → {state}"` (this file), and
+    `manager.py::on_state_change` logs `f"TunnelAgent state changed: {state}"`.
+    With `(str, Enum)` those render as `ConnectionState.CONNECTED`; under
+    `StrEnum` they would silently become `connected`. Pydantic/JSON output goes
+    through `.value` and is identical either way, so the test suite cannot catch
+    the difference -- only the logs change. Convert only alongside an
+    intentional update to those log lines.
+    """
 
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
@@ -114,11 +136,25 @@ class TunnelAgent:
 
         # Message dispatcher with HTTP and WebSocket proxies
         self.router = create_router_with_client_discovery(local_server_url)
-        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(local_server_url, router=self.router)
+        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(
+            local_server_url,
+            router=self.router,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
+        )
         self.ws_proxy: WSProxyHandler = WSProxyHandler(self.router, self._send_frame)
         self.message_dispatcher: MessageDispatcher = MessageDispatcher(
-            self.http_proxy, self.ws_proxy
+            self.http_proxy,
+            self.ws_proxy,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
         )
+
+        # Backpressure. SCTP's send buffer is finite: pushing a 30 MB response
+        # into it without waiting fills it and the channel dies. The event is
+        # set by the DataChannel's bufferedamountlow handler.
+        self._drain_event: asyncio.Event = asyncio.Event()
+        self._drain_event.set()
 
         # Connection state
         self.state: ConnectionState = ConnectionState.DISCONNECTED
@@ -264,15 +300,30 @@ class TunnelAgent:
         """
         self.data_channel = channel
 
+        # Ask the transport to tell us when its send buffer has drained.
+        channel.bufferedAmountLowThreshold = SEND_LOW_WATER
+
         @channel.on("open")
         def on_open() -> None:
             """Handle DataChannel open event."""
             logger.info(f"DataChannel '{channel.label}' opened")
+            self._drain_event.set()
+            # HELLO is the first frame on a newly opened channel, before any
+            # other traffic (spec section 5.8).
+            asyncio.create_task(self.message_dispatcher.begin_negotiation())
 
         @channel.on("close")
         def on_close() -> None:
             """Handle DataChannel close event."""
             logger.info(f"DataChannel '{channel.label}' closed")
+            # Never leave a producer parked on a channel that is gone.
+            self._drain_event.set()
+            self.message_dispatcher.reset()
+
+        @channel.on("bufferedamountlow")
+        def on_buffered_amount_low() -> None:
+            """Release producers waiting on the send buffer."""
+            self._drain_event.set()
 
         @channel.on("message")
         def on_message(message: str | bytes) -> None:
@@ -503,7 +554,13 @@ class TunnelAgent:
         """
         msg_type = message.get("type")
 
-        if msg_type == "connected":
+        if msg_type == "challenge":
+            # Proof of possession. The signaling server answers `auth` with a
+            # challenge and will not send `connected` until this device signs
+            # it, so the account token alone no longer opens a device socket.
+            await self._answer_challenge(message)
+
+        elif msg_type == "connected":
             logger.info("Signaling connection confirmed")
 
         elif msg_type == "offer":
@@ -693,6 +750,58 @@ class TunnelAgent:
             }
         )
         logger.info(f"Sent connect-ack to {target_device_id}: {transport}, {status}")
+
+    async def _answer_challenge(self, message: dict[str, Any]) -> None:
+        """Sign the signaling server's challenge and send the auth-response.
+
+        Fails closed. If this device has no private key, or the challenge is
+        malformed, the socket is closed rather than left half-authenticated:
+        an unsigned connection is not a connection, and the server would drop
+        it on timeout anyway.
+
+        Args:
+            message: The challenge frame from the signaling server
+        """
+        challenge = message.get("challenge")
+        if not isinstance(challenge, str) or not challenge:
+            logger.error("Signaling sent a challenge frame with no challenge")
+            await self._close_unauthenticated()
+            return
+
+        device = get_device()
+        if device is None or device.privkey is None:
+            logger.error(
+                "Cannot answer the signaling challenge: this device has no "
+                "private key on file. Log in again to enrol a device key."
+            )
+            await self._close_unauthenticated()
+            return
+
+        if not self.device_id:
+            logger.error("Cannot answer the signaling challenge: no device_id set")
+            await self._close_unauthenticated()
+            return
+
+        try:
+            signature = sign_challenge(device.privkey, SIGNAL_CONTEXT, self.device_id, challenge)
+        except ValueError as e:
+            logger.error(f"Cannot sign the signaling challenge: {e}")
+            await self._close_unauthenticated()
+            return
+
+        await self._send_signaling_message({"type": "auth-response", "signature": signature})
+        logger.info("Answered the signaling device-key challenge")
+
+    async def _close_unauthenticated(self) -> None:
+        """Close the signaling socket after failing to prove key possession.
+
+        Reconnecting would loop on the same failure, so this does not trigger
+        the reconnect path.
+        """
+        self.should_reconnect = False
+        if self.ws is not None and not self.ws.closed:
+            await self.ws.close()
+        await self._set_state(ConnectionState.FAILED)
 
     async def _send_signaling_message(self, message: dict[str, Any]) -> None:
         """Send message to signaling server.
@@ -941,29 +1050,70 @@ class TunnelAgent:
             data: Binary frame (HTTP_REQUEST, WS_CONNECT, WS_DATA, WS_CLOSE)
         """
         try:
-            # Dispatch message to appropriate handler
-            response_data = await self.message_dispatcher.dispatch(data)
-
-            # Send response back if provided (HTTP responses only)
-            if response_data and self.data_channel and self.data_channel.readyState == "open":
-                self.data_channel.send(response_data)
+            # v3 handlers emit their own frames through _send_frame; the
+            # dispatcher no longer returns a response blob to forward.
+            await self.message_dispatcher.dispatch(data)
 
         except Exception as e:
             logger.error(f"Error handling DataChannel message: {e}")
 
+    async def _await_send_capacity(self) -> None:
+        """Wait until the DataChannel's send buffer has room.
+
+        Without this a large response fills SCTP's send buffer and the channel
+        dies. ``bufferedAmountLowThreshold`` is set when the channel is created,
+        so the ``bufferedamountlow`` event releases the wait.
+        """
+        channel = self.data_channel
+        if channel is None or channel.readyState != "open":
+            return
+        if channel.bufferedAmount <= SEND_HIGH_WATER:
+            return
+
+        self._drain_event.clear()
+        # Re-check after clearing: the drain may have happened in between.
+        if channel.bufferedAmount <= SEND_LOW_WATER:
+            self._drain_event.set()
+            return
+
+        try:
+            await asyncio.wait_for(self._drain_event.wait(), timeout=SEND_DRAIN_TIMEOUT)
+        except TimeoutError:
+            logger.warning(
+                f"DataChannel send buffer stayed above {SEND_LOW_WATER} bytes for "
+                f"{SEND_DRAIN_TIMEOUT}s ({channel.bufferedAmount} buffered); sending anyway"
+            )
+
+    async def _close_channel(self, code: int, reason: str) -> None:
+        """Close the active channel after a peer-behaviour violation.
+
+        Args:
+            code: Close code (WebSocket space)
+            reason: Generic reason, logged locally
+        """
+        logger.error(f"Closing tunnel channel: {code} {reason}")
+        self._drain_event.set()
+        if self.connection_mode == "relay" and self.relay_client:
+            await self.relay_client.disconnect()
+            return
+        if self.data_channel:
+            self.data_channel.close()
+
     async def _send_frame(self, data: bytes) -> None:
-        """Send frame back over DataChannel or relay WebSocket (used by WebSocket proxy).
+        """Send frame back over DataChannel or relay WebSocket.
 
         Args:
             data: Binary frame to send
         """
         if self.connection_mode == "relay" and self.relay_client:
-            # Send via relay WebSocket
+            # Send via relay WebSocket. aiohttp's send_bytes already awaits the
+            # transport, so no extra backpressure handling is needed here.
             try:
                 await self.relay_client.send(data)
             except Exception as e:
                 logger.warning(f"Cannot send frame via relay: {e}")
         elif self.data_channel and self.data_channel.readyState == "open":
+            await self._await_send_capacity()
             # Send via WebRTC DataChannel
             self.data_channel.send(data)
         else:

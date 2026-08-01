@@ -21,12 +21,12 @@ This is a strong copyleft license approved by the Open Source Initiative (OSI) a
 
 ### Why did you choose AGPL instead of MIT or Apache?
 
-We chose AGPL to ensure Lem remains truly open source. The key difference from MIT/Apache is the "network use" clause:
+We chose AGPL to keep improvements to Lem in the open. The difference from MIT/Apache is the "network use" clause (§13):
 
 - **MIT/Apache**: Someone can fork Lem, add proprietary features, and offer it as a closed-source SaaS
-- **AGPL**: Anyone running Lem as a network service must share their source code modifications
+- **AGPL**: Someone who **modifies** Lem and offers the modified version over a network must give those users the source of their version
 
-This protects the community from proprietary forks while still allowing all the freedoms of open source.
+Note the condition. §13 is triggered by modification. Running Lem unmodified as a network service — including as a paid service — triggers nothing. AGPL forecloses proprietary forks; it does not foreclose competition. See [Can someone sell Lem as a service without contributing anything back?](#can-someone-sell-lem-as-a-service-without-contributing-anything-back)
 
 ### Is AGPL "real" open source?
 
@@ -37,9 +37,9 @@ This protects the community from proprietary forks while still allowing all the 
 
 ### Can I use Lem even if my company has a "no GPL/AGPL" policy?
 
-Most "no GPL/AGPL" policies apply to **distributing** GPL code or **linking** it into your products. Lem is a **standalone tool** accessed via REST API and WebSocket, which generally falls outside these restrictions.
+Depends on the policy. Many "no GPL/AGPL" policies target **distributing** GPL code or **linking** it into your products, and Lem is a **standalone tool** accessed via REST API and WebSocket, so it often falls outside them. Some policies, though, ban AGPL software outright regardless of how it is used. Read your own policy rather than assuming.
 
-However, we recommend:
+We recommend:
 1. Check with your legal department (we're not lawyers!)
 2. Consider our commercial license option if needed (contact: blake@lem.gg)
 
@@ -98,34 +98,38 @@ Running Lem's cloud services (signaling/relay) for your own use does **not** tri
 
 | Scenario | Must share code? |
 |----------|-----------------|
+| Unmodified, however you run it | ❌ No |
 | Modified for personal use | ❌ No |
 | Modified for internal company use | ❌ No |
 | Modified and run as public network service | ✅ Yes |
 | Modified and distributed to others | ✅ Yes |
 
-The key question: **Are you offering it as a service to other people over a network?**
+Two questions, and both have to be yes: **have you modified Lem?** and **are you putting it in front of other people**, over a network or as a copy? If you have not modified Lem, §13 never fires, no matter who you serve.
 
 ### What counts as "offering as a network service"?
 
+Everything in this section assumes you have **modified** Lem. If you have not, none of it applies.
+
 **Examples that require sharing code:**
-- ✅ Running a public "Lem-as-a-Service" for customers
-- ✅ Offering Lem access to clients/partners
-- ✅ Running a multi-tenant Lem instance
+- ✅ Running a public "Lem-as-a-Service" for customers on your modified build
+- ✅ Giving clients/partners access to your modified build
+- ✅ Running a modified multi-tenant Lem instance
 
 **Examples that do NOT require sharing:**
-- ❌ Using Lem yourself (even remotely)
-- ❌ Your team using Lem internally
-- ❌ Your company's IT department hosting Lem for employees
+- ❌ Running Lem unmodified, for anyone, at any scale
+- ❌ Using your modified Lem yourself (even remotely)
+- ❌ Your team using your modified Lem internally
+- ❌ Your company's IT department hosting your modified Lem for employees
 
 **Gray area (consult a lawyer):**
-- Offering Lem to contractors/consultants
-- Running Lem for subsidiaries or affiliated companies
+- Offering your modified Lem to contractors/consultants
+- Running your modified Lem for subsidiaries or affiliated companies
 
 ### How do I share modifications if required?
 
-If you're running a modified version as a public network service, you must:
+If you're running a modified version and users interact with it over a network, you must:
 
-1. Make your source code available to your users
+1. Offer those users the Corresponding Source of your version, from a network server, at no charge
 2. Include a notice explaining how to get the source
 3. License your modifications under AGPL-3.0-or-later
 4. Preserve existing copyright notices
@@ -191,14 +195,20 @@ But you **must** still provide the source code to your customers.
 
 ### Can I offer Lem as a hosted service (SaaS)?
 
-**Yes**, but with AGPL requirements:
+**Yes.** If you run Lem's cloud services (signaling/relay) **unmodified**, you owe nothing beyond keeping the copyright and license notices intact. You may charge for it.
 
-If you offer Lem's cloud services (signaling/relay) to third parties:
-1. You must provide your source code to your users
-2. Any modifications must be open sourced under AGPL
-3. You cannot add proprietary features to the relay/signaling servers
+If you **modify** them and offer the modified version over a network, §13 applies:
+1. You must offer your users an opportunity to receive the Corresponding Source of your version, from a network server, at no charge
+2. Your modifications are licensed under AGPL-3.0-or-later
+3. You cannot keep proprietary features in the relay/signaling servers to yourself — adding them is a modification
 
-**This is the "network use" clause that makes AGPL different from GPL.**
+**This is the "network use" clause that makes AGPL different from GPL.** It is triggered by modification, not by hosting.
+
+### Can someone sell Lem as a service without contributing anything back?
+
+**Yes, if they don't modify it.** A competitor can stand up Lem exactly as published — local server, signaling, relay — sell access to it, and owe the project nothing. AGPL-3.0 does not prevent that.
+
+What AGPL prevents is the proprietary fork. The moment they change Lem to make their offering better and put that in front of users over a network, §13 obliges them to publish the changed source. They can compete with us on our own code; they cannot build a closed, differentiated product on top of it and keep the differentiation to themselves. Improvements come back.
 
 ### Can I offer consulting/support for Lem?
 
@@ -289,7 +299,7 @@ If you want to distribute a closed-source mobile app that embeds Lem, contact us
 **Generally yes**, but:
 
 - Check your organization's policies on open source software
-- AGPL requires sharing modifications if deployed as network service
+- If you modify Lem and deploy it as a network service, AGPL requires you to share those modifications with its users
 - For classified/sensitive deployments, you may need commercial licensing
 
 Contact us if you need guidance: blake@lem.gg
@@ -348,12 +358,15 @@ For official licensing inquiries, contact: blake@lem.gg
 | Action | Personal | Company Internal | Public SaaS | Commercial Product |
 |--------|----------|-----------------|-------------|-------------------|
 | Use Lem | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
+| Run Lem **unmodified** and share nothing back | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No† |
 | Modify code | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
-| Keep modifications private | ✅ Yes | ✅ Yes | ❌ No* | ❌ No* |
+| Keep **your modifications** private | ✅ Yes | ✅ Yes | ❌ No* | ❌ No* |
 | Charge for services | ✅ Yes | N/A | ✅ Yes | ✅ Yes |
-| Distribute binaries | ✅ Yes | ⚠️ Internal only | ✅ Yes* | ⚠️ Need commercial license |
+| Distribute binaries | ✅ Yes† | ⚠️ Internal only | N/A | ⚠️ Need commercial license |
 
-\* Must provide source code to users
+\* Applies only if you modified Lem. You must offer your version's source to the people using your instance — not to the world. If you have not modified Lem, nothing is owed; see the "Run Lem unmodified" row.
+
+† Distributing a copy — modified or not — carries the source-availability obligations in §4–§6. Those are separate from §13 and are not conditioned on modification, which is why an unmodified Lem inside a product you ship is not "share nothing back", while an unmodified Lem you host is.
 
 ---
 

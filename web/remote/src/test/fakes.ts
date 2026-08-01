@@ -22,6 +22,30 @@
  * drive a single line of behaviour.
  */
 
+import type { DeviceKeyStore, StoredIdentity } from '../api/device-key'
+
+/**
+ * An in-memory device key store.
+ *
+ * jsdom has no IndexedDB, and the production store is a thin adapter around
+ * one. This keeps the protocol logic - key generation, payload construction,
+ * signing - fully testable against real WebCrypto keys.
+ *
+ * @returns A store that keeps one identity in memory.
+ */
+export function memoryKeyStore(): DeviceKeyStore {
+  let saved: StoredIdentity | null = null
+  return {
+    load(): Promise<StoredIdentity | null> {
+      return Promise.resolve(saved)
+    },
+    save(identity: StoredIdentity): Promise<void> {
+      saved = identity
+      return Promise.resolve()
+    },
+  }
+}
+
 /** Sockets created since the last `resetFakeWebSockets()`. */
 export const fakeSockets: FakeWebSocket[] = []
 

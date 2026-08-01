@@ -32,11 +32,14 @@ type FilterOption = 'all' | ServiceCategory | 'installed'
 interface ServicesCatalogProps {
   proxyFetch: (url: string, init?: RequestInit) => Promise<Response>
   onLaunchService: (serviceId: string) => void
+  /** Why Launch is unavailable, or null when it works. */
+  launchBlockedReason?: string | null
 }
 
 export function ServicesCatalog({
   proxyFetch,
   onLaunchService,
+  launchBlockedReason = null,
 }: ServicesCatalogProps): ReactElement {
   const [filter, setFilter] = useState<FilterOption>('all')
   const [searchQuery, setSearchQuery] = useState('')
@@ -203,6 +206,7 @@ export function ServicesCatalog({
             }}
             onRemove={actions.removeService}
             onLaunch={service.has_ui ? onLaunchService : undefined}
+            launchBlockedReason={launchBlockedReason}
             isActionLoading={actions.isServicePending(service.id)}
           />
         ))}

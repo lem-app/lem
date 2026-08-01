@@ -14,32 +14,38 @@
 // Public License for more details.
 
 /**
- * WebSocket-over-DataChannel frame serialization/deserialization.
+ * WebSocket-over-DataChannel frame serialization for tunnel protocol v3.
  *
- * Binary frame format for WebSocket CONNECT:
- * - 1 byte: frame_type (0x10)
- * - 4 bytes: connection_id (uint32)
- * - 2 bytes: url_len (uint16)
- * - url_len bytes: WebSocket URL (UTF-8)
- * - 4 bytes: headers_len (uint32)
- * - headers_len bytes: JSON headers
+ * Mirror of `server/app/tunnel/ws_frame.py`; `protocol/tunnel-v3.json` pins the
+ * two together.
  *
- * Binary frame format for WebSocket DATA:
- * - 1 byte: frame_type (0x11)
- * - 4 bytes: connection_id (uint32)
- * - 1 byte: opcode (0=continuation, 1=text, 2=binary, 8=close, 9=ping, 10=pong)
- * - 4 bytes: payload_len (uint32)
- * - payload_len bytes: WebSocket payload (raw bytes)
- *
- * Binary frame format for WebSocket CLOSE:
- * - 1 byte: frame_type (0x12)
- * - 4 bytes: connection_id (uint32)
- * - 2 bytes: close_code (uint16)
- * - 2 bytes: reason_len (uint16)
- * - reason_len bytes: close reason (UTF-8)
+ *   WS_CONNECT       0x10  type(1) connection_id(4) url_len(2) url
+ *                          headers_len(4) headers (JSON array of pairs)
+ *   WS_DATA          0x11  type(1) connection_id(4) opcode(1) flags(1)
+ *                          payload_len(4) payload
+ *   WS_CLOSE         0x12  type(1) connection_id(4) close_code(2)
+ *                          reason_len(2) reason
+ *   WS_CONNECT_ACK   0x13  type(1) connection_id(4) protocol_len(2) protocol
+ *   WS_CONNECT_ERROR 0x14  type(1) connection_id(4) error_code(2)
+ *                          reason_len(2) reason
  */
 
-import { FrameType } from './http-frame'
+import {
+  FrameType,
+  MAX_CHUNK_BYTES,
+  MAX_HEADERS_BYTES,
+  MAX_URL_BYTES,
+  decodeHeaders,
+  encodeHeaders,
+  type HeaderList,
+} from './http-frame'
+import { LemProxyError } from './tunnel-errors'
+
+/** Total bytes accepted across the fragments of one WebSocket message. */
+export const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
+
+/** WS_DATA flag bits. */
+export const FLAG_FIN = 0x01
 
 /**
  * WebSocket opcode constants (from RFC 6455).
@@ -55,229 +61,257 @@ export const WSOpcode = {
 
 export type WSOpcodeValue = (typeof WSOpcode)[keyof typeof WSOpcode]
 
-/**
- * WebSocket CONNECT frame.
- */
 export interface WSConnectFrame {
   connectionId: number
   url: string
-  headers: Record<string, string>
+  headers: HeaderList
 }
 
-/**
- * WebSocket DATA frame.
- */
 export interface WSDataFrame {
   connectionId: number
   opcode: WSOpcodeValue
-  payload: ArrayBuffer
+  payload: Uint8Array
+  fin: boolean
 }
 
-/**
- * WebSocket CLOSE frame.
- */
 export interface WSCloseFrame {
   connectionId: number
   closeCode: number
   reason: string
 }
 
-/**
- * Text encoder/decoder for UTF-8 conversion.
- */
+export interface WSConnectAckFrame {
+  connectionId: number
+  protocol: string
+}
+
+export interface WSConnectErrorFrame {
+  connectionId: number
+  errorCode: number
+  reason: string
+}
+
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+const textDecoder = new TextDecoder('utf-8', { fatal: true })
 
-/**
- * Serialize WebSocket CONNECT frame to binary.
- */
+function malformed(message: string): LemProxyError {
+  return new LemProxyError('E_PROTO_MALFORMED', message)
+}
+
+function asBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
+  return data instanceof Uint8Array ? data : new Uint8Array(data)
+}
+
+function viewOf(bytes: Uint8Array): DataView {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+}
+
+function requireLength(bytes: Uint8Array, offset: number, size: number, field: string): void {
+  if (bytes.byteLength < offset + size) {
+    throw malformed(`Insufficient data for ${field}`)
+  }
+}
+
+function concat(parts: Uint8Array[]): ArrayBuffer {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0)
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.byteLength
+  }
+  return out.buffer
+}
+
+function u8(value: number): Uint8Array {
+  return new Uint8Array([value & 0xff])
+}
+
+function u16(value: number): Uint8Array {
+  const bytes = new Uint8Array(2)
+  new DataView(bytes.buffer).setUint16(0, value, false)
+  return bytes
+}
+
+function u32(value: number): Uint8Array {
+  const bytes = new Uint8Array(4)
+  new DataView(bytes.buffer).setUint32(0, value, false)
+  return bytes
+}
+
+function decodeText(bytes: Uint8Array, field: string): string {
+  try {
+    return textDecoder.decode(bytes)
+  } catch {
+    throw malformed(`${field} is not valid UTF-8`)
+  }
+}
+
+function readHeader(bytes: Uint8Array, expected: number): number {
+  requireLength(bytes, 0, 1, 'frame_type')
+  if (bytes[0] !== expected) {
+    throw malformed(
+      `Expected frame 0x${expected.toString(16).padStart(2, '0')}, got 0x${bytes[0].toString(16).padStart(2, '0')}`
+    )
+  }
+  requireLength(bytes, 1, 4, 'connection_id')
+  const connectionId = viewOf(bytes).getUint32(1, false)
+  if (connectionId === 0) {
+    throw malformed('connection_id 0 is reserved')
+  }
+  return connectionId
+}
+
 export function serializeWSConnect(frame: WSConnectFrame): ArrayBuffer {
-  // Encode strings to UTF-8
   const urlBytes = textEncoder.encode(frame.url)
-  const headersBytes = textEncoder.encode(JSON.stringify(frame.headers))
+  const headersBytes = encodeHeaders(frame.headers)
 
-  // Calculate total size
-  const totalSize =
-    1 + // frame_type
-    4 + // connection_id
-    2 +
-    urlBytes.length + // url_len + url
-    4 +
-    headersBytes.length // headers_len + headers
-
-  // Create buffer
-  const buffer = new ArrayBuffer(totalSize)
-  const view = new DataView(buffer)
-  let offset = 0
-
-  // Write frame_type (uint8)
-  view.setUint8(offset, FrameType.WS_CONNECT)
-  offset += 1
-
-  // Write connection_id (uint32)
-  view.setUint32(offset, frame.connectionId, false) // big-endian
-  offset += 4
-
-  // Write url_len (uint16) and url
-  view.setUint16(offset, urlBytes.length, false)
-  offset += 2
-  new Uint8Array(buffer, offset, urlBytes.length).set(urlBytes)
-  offset += urlBytes.length
-
-  // Write headers_len (uint32) and headers
-  view.setUint32(offset, headersBytes.length, false)
-  offset += 4
-  new Uint8Array(buffer, offset, headersBytes.length).set(headersBytes)
-
-  return buffer
+  return concat([
+    u8(FrameType.WS_CONNECT),
+    u32(frame.connectionId),
+    u16(urlBytes.byteLength),
+    urlBytes,
+    u32(headersBytes.byteLength),
+    headersBytes,
+  ])
 }
 
-/**
- * Serialize WebSocket DATA frame to binary.
- */
+export function deserializeWSConnect(data: ArrayBuffer | Uint8Array): WSConnectFrame {
+  const bytes = asBytes(data)
+  const connectionId = readHeader(bytes, FrameType.WS_CONNECT)
+  const view = viewOf(bytes)
+
+  requireLength(bytes, 5, 2, 'url_len')
+  const urlLen = view.getUint16(5, false)
+  if (urlLen > MAX_URL_BYTES) {
+    throw malformed(`URL too large: ${urlLen} > ${MAX_URL_BYTES}`)
+  }
+  requireLength(bytes, 7, urlLen, 'url')
+  const url = decodeText(bytes.subarray(7, 7 + urlLen), 'url')
+  let offset = 7 + urlLen
+
+  requireLength(bytes, offset, 4, 'headers_len')
+  const headersLen = view.getUint32(offset, false)
+  offset += 4
+  if (headersLen > MAX_HEADERS_BYTES) {
+    throw malformed(`Headers too large: ${headersLen} > ${MAX_HEADERS_BYTES}`)
+  }
+  requireLength(bytes, offset, headersLen, 'headers')
+  const headers = decodeHeaders(bytes.subarray(offset, offset + headersLen))
+
+  return { connectionId, url, headers }
+}
+
 export function serializeWSData(frame: WSDataFrame): ArrayBuffer {
-  const payloadBytes = new Uint8Array(frame.payload)
-
-  // Calculate total size
-  const totalSize =
-    1 + // frame_type
-    4 + // connection_id
-    1 + // opcode
-    4 + // payload_len
-    payloadBytes.length // payload
-
-  // Create buffer
-  const buffer = new ArrayBuffer(totalSize)
-  const view = new DataView(buffer)
-  let offset = 0
-
-  // Write frame_type (uint8)
-  view.setUint8(offset, FrameType.WS_DATA)
-  offset += 1
-
-  // Write connection_id (uint32)
-  view.setUint32(offset, frame.connectionId, false)
-  offset += 4
-
-  // Write opcode (uint8)
-  view.setUint8(offset, frame.opcode)
-  offset += 1
-
-  // Write payload_len (uint32) and payload
-  view.setUint32(offset, payloadBytes.length, false)
-  offset += 4
-  new Uint8Array(buffer, offset, payloadBytes.length).set(payloadBytes)
-
-  return buffer
+  return concat([
+    u8(FrameType.WS_DATA),
+    u32(frame.connectionId),
+    u8(frame.opcode),
+    u8(frame.fin ? FLAG_FIN : 0),
+    u32(frame.payload.byteLength),
+    frame.payload,
+  ])
 }
 
-/**
- * Deserialize binary frame to WebSocket DATA.
- */
-export function deserializeWSData(buffer: ArrayBuffer): WSDataFrame {
-  const view = new DataView(buffer)
-  let offset = 0
+export function deserializeWSData(
+  data: ArrayBuffer | Uint8Array,
+  maxChunkBytes: number = MAX_CHUNK_BYTES
+): WSDataFrame {
+  const bytes = asBytes(data)
+  const connectionId = readHeader(bytes, FrameType.WS_DATA)
 
-  // Read frame_type (uint8) and validate
-  const frameType = view.getUint8(offset)
-  offset += 1
+  requireLength(bytes, 5, 6, 'data header')
+  const view = viewOf(bytes)
+  const opcode = view.getUint8(5) as WSOpcodeValue
+  const flags = view.getUint8(6)
+  const payloadLen = view.getUint32(7, false)
 
-  if (frameType !== FrameType.WS_DATA) {
-    throw new Error(`Expected WS_DATA frame (0x11), got 0x${frameType.toString(16)}`)
+  // Before the slice: the length is peer-chosen and uint32-wide.
+  if (payloadLen > maxChunkBytes) {
+    throw new LemProxyError(
+      'E_TOO_LARGE',
+      `WebSocket payload too large: ${payloadLen} > ${maxChunkBytes}`
+    )
   }
 
-  // Read connection_id (uint32)
-  const connectionId = view.getUint32(offset, false)
-  offset += 4
-
-  // Read opcode (uint8)
-  const opcode = view.getUint8(offset) as WSOpcodeValue
-  offset += 1
-
-  // Read payload_len (uint32) and payload
-  const payloadLen = view.getUint32(offset, false)
-  offset += 4
-  const payload = buffer.slice(offset, offset + payloadLen)
+  requireLength(bytes, 11, payloadLen, 'payload')
 
   return {
     connectionId,
     opcode,
-    payload,
+    payload: bytes.slice(11, 11 + payloadLen),
+    fin: (flags & FLAG_FIN) !== 0,
   }
 }
 
-/**
- * Serialize WebSocket CLOSE frame to binary.
- */
 export function serializeWSClose(frame: WSCloseFrame): ArrayBuffer {
-  // Encode reason to UTF-8
   const reasonBytes = textEncoder.encode(frame.reason)
-
-  // Calculate total size
-  const totalSize =
-    1 + // frame_type
-    4 + // connection_id
-    2 + // close_code
-    2 +
-    reasonBytes.length // reason_len + reason
-
-  // Create buffer
-  const buffer = new ArrayBuffer(totalSize)
-  const view = new DataView(buffer)
-  let offset = 0
-
-  // Write frame_type (uint8)
-  view.setUint8(offset, FrameType.WS_CLOSE)
-  offset += 1
-
-  // Write connection_id (uint32)
-  view.setUint32(offset, frame.connectionId, false)
-  offset += 4
-
-  // Write close_code (uint16)
-  view.setUint16(offset, frame.closeCode, false)
-  offset += 2
-
-  // Write reason_len (uint16) and reason
-  view.setUint16(offset, reasonBytes.length, false)
-  offset += 2
-  new Uint8Array(buffer, offset, reasonBytes.length).set(reasonBytes)
-
-  return buffer
+  return concat([
+    u8(FrameType.WS_CLOSE),
+    u32(frame.connectionId),
+    u16(frame.closeCode),
+    u16(reasonBytes.byteLength),
+    reasonBytes,
+  ])
 }
 
-/**
- * Deserialize binary frame to WebSocket CLOSE.
- */
-export function deserializeWSClose(buffer: ArrayBuffer): WSCloseFrame {
-  const view = new DataView(buffer)
-  let offset = 0
+export function deserializeWSClose(data: ArrayBuffer | Uint8Array): WSCloseFrame {
+  const bytes = asBytes(data)
+  const connectionId = readHeader(bytes, FrameType.WS_CLOSE)
 
-  // Read frame_type (uint8) and validate
-  const frameType = view.getUint8(offset)
-  offset += 1
+  requireLength(bytes, 5, 4, 'close header')
+  const view = viewOf(bytes)
+  const closeCode = view.getUint16(5, false)
+  const reasonLen = view.getUint16(7, false)
+  requireLength(bytes, 9, reasonLen, 'reason')
+  const reason = decodeText(bytes.subarray(9, 9 + reasonLen), 'reason')
 
-  if (frameType !== FrameType.WS_CLOSE) {
-    throw new Error(`Expected WS_CLOSE frame (0x12), got 0x${frameType.toString(16)}`)
-  }
+  return { connectionId, closeCode, reason }
+}
 
-  // Read connection_id (uint32)
-  const connectionId = view.getUint32(offset, false)
-  offset += 4
+export function serializeWSConnectAck(frame: WSConnectAckFrame): ArrayBuffer {
+  const protocolBytes = textEncoder.encode(frame.protocol)
+  return concat([
+    u8(FrameType.WS_CONNECT_ACK),
+    u32(frame.connectionId),
+    u16(protocolBytes.byteLength),
+    protocolBytes,
+  ])
+}
 
-  // Read close_code (uint16)
-  const closeCode = view.getUint16(offset, false)
-  offset += 2
+export function deserializeWSConnectAck(data: ArrayBuffer | Uint8Array): WSConnectAckFrame {
+  const bytes = asBytes(data)
+  const connectionId = readHeader(bytes, FrameType.WS_CONNECT_ACK)
 
-  // Read reason_len (uint16) and reason
-  const reasonLen = view.getUint16(offset, false)
-  offset += 2
-  const reasonBytes = new Uint8Array(buffer, offset, reasonLen)
-  const reason = textDecoder.decode(reasonBytes)
+  requireLength(bytes, 5, 2, 'protocol_len')
+  const protocolLen = viewOf(bytes).getUint16(5, false)
+  requireLength(bytes, 7, protocolLen, 'protocol')
+  const protocol = decodeText(bytes.subarray(7, 7 + protocolLen), 'protocol')
 
-  return {
-    connectionId,
-    closeCode,
-    reason,
-  }
+  return { connectionId, protocol }
+}
+
+export function serializeWSConnectError(frame: WSConnectErrorFrame): ArrayBuffer {
+  const reasonBytes = textEncoder.encode(frame.reason)
+  return concat([
+    u8(FrameType.WS_CONNECT_ERROR),
+    u32(frame.connectionId),
+    u16(frame.errorCode),
+    u16(reasonBytes.byteLength),
+    reasonBytes,
+  ])
+}
+
+export function deserializeWSConnectError(data: ArrayBuffer | Uint8Array): WSConnectErrorFrame {
+  const bytes = asBytes(data)
+  const connectionId = readHeader(bytes, FrameType.WS_CONNECT_ERROR)
+
+  requireLength(bytes, 5, 4, 'error header')
+  const view = viewOf(bytes)
+  const errorCode = view.getUint16(5, false)
+  const reasonLen = view.getUint16(7, false)
+  requireLength(bytes, 9, reasonLen, 'reason')
+  const reason = decodeText(bytes.subarray(9, 9 + reasonLen), 'reason')
+
+  return { connectionId, errorCode, reason }
 }

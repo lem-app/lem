@@ -131,7 +131,16 @@ def test_register_device(client: TestClient) -> None:
 
 
 def test_register_device_unauthorized(client: TestClient) -> None:
-    """Test device registration without auth fails."""
+    """Absent credentials are rejected with 401, not 403.
+
+    401 is the correct code for a *missing* Authorization header; 403 means
+    "authenticated but not permitted" (see
+    `test_device_owned_by_another_user_cannot_be_claimed`, a genuine 403).
+
+    FastAPI's `HTTPBearer` returned 403 here until 0.122.0, and this assertion
+    used to pin that wart. `pyproject.toml` requires `fastapi>=0.122.0` so the
+    correct code is guaranteed.
+    """
     response = client.post(
         "/devices/register",
         json={
@@ -141,7 +150,7 @@ def test_register_device_unauthorized(client: TestClient) -> None:
             "signature": "y",
         },
     )
-    assert response.status_code == 403  # No authorization header
+    assert response.status_code == 401
 
 
 def test_list_devices(client: TestClient) -> None:

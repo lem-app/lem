@@ -13,27 +13,44 @@
 # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 # Public License for more details.
 
-"""WebSocket proxy handler for DataChannel.
+"""WebSocket proxy handler for DataChannel (protocol v3).
 
 Receives WebSocket frames over DataChannel, establishes upstream WebSocket
 connections, and relays messages bidirectionally.
+
+Two v3 changes live here:
+
+* **The handshake is acknowledged.** ``WS_CONNECT_ACK`` is sent after
+  ``ws_connect()`` returns and *before* the relay task starts, so a fast first
+  server message cannot arrive ahead of the ack. v2 sent nothing at all, which
+  left the browser's ``ProxiedWebSocket`` in CONNECTING forever.
+* **Messages are fragmented** to the negotiated chunk size and reassembled on
+  receipt, bounded by ``MAX_WS_MESSAGE_BYTES``.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
+from multidict import CIMultiDict
 
+from .http_frame import MAX_CHUNK_BYTES
 from .router import RequestRouter
 from .ws_frame import (
+    MAX_WS_MESSAGE_BYTES,
     WSCloseFrame,
+    WSConnectAckFrame,
+    WSConnectErrorFrame,
     WSDataFrame,
     WSOpcode,
     deserialize_ws_close,
     deserialize_ws_connect,
     deserialize_ws_data,
     serialize_ws_close,
+    serialize_ws_connect_ack,
+    serialize_ws_connect_error,
     serialize_ws_data,
 )
 
@@ -42,6 +59,20 @@ logger = logging.getLogger(__name__)
 # Connection IDs are chosen by the peer, so an unbounded map lets one peer
 # exhaust local sockets and memory. Cap the number of live upstream sockets.
 MAX_WS_CONNECTIONS = 64
+
+# Close codes (spec section 7.2).
+WS_CODE_UPSTREAM_ERROR = 1011
+WS_CODE_CONNECTION_LIMIT = 4004
+WS_CODE_MESSAGE_TOO_LARGE = 4005
+
+
+@dataclass
+class PendingMessage:
+    """A WebSocket message being reassembled from fragments."""
+
+    opcode: int
+    parts: list[bytes] = field(default_factory=list)
+    size: int = 0
 
 
 class WSProxyHandler:
@@ -68,6 +99,20 @@ class WSProxyHandler:
         self.relay_tasks: dict[int, asyncio.Task[None]] = {}
         self.session: aiohttp.ClientSession | None = None
 
+        # Fragments received per connection, awaiting a FIN.
+        self.pending_messages: dict[int, PendingMessage] = {}
+
+        # Negotiated in HELLO; the default stands until then.
+        self.effective_max_chunk = MAX_CHUNK_BYTES
+
+    def negotiate_limits(self, peer_max_chunk_bytes: int) -> None:
+        """Apply the peer's advertised chunk limit from HELLO.
+
+        Args:
+            peer_max_chunk_bytes: Largest frame payload the peer will accept
+        """
+        self.effective_max_chunk = max(1, min(MAX_CHUNK_BYTES, peer_max_chunk_bytes))
+
     async def start(self) -> None:
         """Start the proxy handler (create HTTP session)."""
         self.session = aiohttp.ClientSession()
@@ -88,6 +133,7 @@ class WSProxyHandler:
 
         self.connections.clear()
         self.relay_tasks.clear()
+        self.pending_messages.clear()
 
         # Close HTTP session
         if self.session and not self.session.closed:
@@ -105,6 +151,8 @@ class WSProxyHandler:
         if self.session is None:
             raise RuntimeError("WebSocket session not started")
 
+        error_code = WS_CODE_UPSTREAM_ERROR
+
         try:
             # Deserialize frame
             frame = deserialize_ws_connect(data)
@@ -115,6 +163,7 @@ class WSProxyHandler:
 
             # Refuse to open more upstream sockets than we are willing to hold
             if conn_id not in self.connections and len(self.connections) >= MAX_WS_CONNECTIONS:
+                error_code = WS_CODE_CONNECTION_LIMIT
                 raise RuntimeError(
                     f"WebSocket connection limit reached ({MAX_WS_CONNECTIONS} open)"
                 )
@@ -140,12 +189,21 @@ class WSProxyHandler:
             # Establish WebSocket connection
             ws = await self.session.ws_connect(
                 ws_url,
-                headers=frame["headers"],
+                headers=CIMultiDict(frame["headers"]),
                 timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
             )
 
             # Store connection
             self.connections[conn_id] = ws
+
+            # Acknowledge BEFORE starting the relay task, so a fast first
+            # server message cannot arrive ahead of the ack and leave the
+            # browser handling data for a socket it still thinks is CONNECTING.
+            ack: WSConnectAckFrame = {
+                "connection_id": conn_id,
+                "protocol": ws.protocol or "",
+            }
+            await self.send_frame(serialize_ws_connect_ack(ack))
 
             # Start relay task (upstream → client)
             task = asyncio.create_task(self._relay_upstream_messages(conn_id))
@@ -153,23 +211,20 @@ class WSProxyHandler:
 
             logger.info(f"WebSocket {conn_id} connected successfully")
 
-            # Note: We could send a WS_CONNECT_ACK frame here,
-            # but for simplicity, client assumes success until WS_CLOSE or WS_DATA arrives
-
         except Exception as e:
             logger.error(f"Error handling WS_CONNECT: {e}")
-            # Send WS_CLOSE with error
+            # Tell the peer the handshake failed, so it fails fast instead of
+            # waiting out its connect timeout.
             try:
-                error_frame: WSCloseFrame = {
+                error_frame: WSConnectErrorFrame = {
                     "connection_id": frame["connection_id"],
-                    "close_code": 1006,  # Abnormal closure
+                    "error_code": error_code,
                     # Generic reason: the cause is in the log, not in the frame
                     "reason": "Connection failed",
                 }
-                close_data = serialize_ws_close(error_frame)
-                await self.send_frame(close_data)
+                await self.send_frame(serialize_ws_connect_error(error_frame))
             except Exception as send_error:
-                logger.error(f"Error sending error WS_CLOSE: {send_error}")
+                logger.error(f"Error sending WS_CONNECT_ERROR: {send_error}")
 
     async def handle_data(self, data: bytes) -> None:
         """Handle WS_DATA frame - forward to upstream WebSocket.
@@ -179,7 +234,7 @@ class WSProxyHandler:
         """
         try:
             # Deserialize frame
-            frame = deserialize_ws_data(data)
+            frame = deserialize_ws_data(data, self.effective_max_chunk)
             conn_id = frame["connection_id"]
 
             # Get connection
@@ -188,29 +243,148 @@ class WSProxyHandler:
                 logger.warning(f"WS_DATA for unknown connection: {conn_id}")
                 return
 
+            assembled = self._reassemble(conn_id, frame)
+            if assembled is None:
+                return
+            opcode, payload = assembled
+
             # Forward to upstream
-            if frame["opcode"] == WSOpcode.TEXT:
+            if opcode == WSOpcode.TEXT:
                 # Text message
-                text = frame["payload"].decode("utf-8")
+                text = payload.decode("utf-8")
                 await ws.send_str(text)
                 logger.debug(f"WebSocket {conn_id}: Sent text message ({len(text)} chars)")
-            elif frame["opcode"] == WSOpcode.BINARY:
+            elif opcode == WSOpcode.BINARY:
                 # Binary message
-                await ws.send_bytes(frame["payload"])
-                logger.debug(
-                    f"WebSocket {conn_id}: Sent binary message ({len(frame['payload'])} bytes)"
-                )
-            elif frame["opcode"] == WSOpcode.PING:
+                await ws.send_bytes(payload)
+                logger.debug(f"WebSocket {conn_id}: Sent binary message ({len(payload)} bytes)")
+            elif opcode == WSOpcode.PING:
                 # Ping
-                await ws.ping(frame["payload"])
+                await ws.ping(payload)
                 logger.debug(f"WebSocket {conn_id}: Sent ping")
-            elif frame["opcode"] == WSOpcode.PONG:
+            elif opcode == WSOpcode.PONG:
                 # Pong
-                await ws.pong(frame["payload"])
+                await ws.pong(payload)
                 logger.debug(f"WebSocket {conn_id}: Sent pong")
 
         except Exception as e:
             logger.error(f"Error handling WS_DATA: {e}")
+
+    def _reassemble(self, conn_id: int, frame: WSDataFrame) -> tuple[int, bytes] | None:
+        """Reassemble a possibly-fragmented WS_DATA frame.
+
+        Args:
+            conn_id: Connection the frame belongs to
+            frame: Decoded WS_DATA frame
+
+        Returns:
+            ``(opcode, payload)`` once a complete message is in hand, otherwise
+            None (more fragments expected, or the fragment was invalid)
+        """
+        opcode = frame["opcode"]
+        payload = frame["payload"]
+
+        if opcode == WSOpcode.CONTINUATION:
+            pending = self.pending_messages.get(conn_id)
+            if pending is None:
+                logger.warning(f"WebSocket {conn_id}: CONTINUATION with no message in progress")
+                return None
+
+            # Total across fragments is a separate bound from the per-frame one.
+            if pending.size + len(payload) > MAX_WS_MESSAGE_BYTES:
+                logger.warning(
+                    f"WebSocket {conn_id}: message exceeded MAX_WS_MESSAGE_BYTES "
+                    f"({pending.size + len(payload)} > {MAX_WS_MESSAGE_BYTES})"
+                )
+                del self.pending_messages[conn_id]
+                asyncio.create_task(
+                    self._close_connection(conn_id, WS_CODE_MESSAGE_TOO_LARGE, "Message too large")
+                )
+                return None
+
+            pending.parts.append(payload)
+            pending.size += len(payload)
+
+            if not frame["fin"]:
+                return None
+
+            del self.pending_messages[conn_id]
+            return pending.opcode, b"".join(pending.parts)
+
+        if not frame["fin"]:
+            # First fragment of a fragmented message. Control frames must never
+            # be fragmented (RFC 6455 5.5).
+            if opcode in (WSOpcode.CLOSE, WSOpcode.PING, WSOpcode.PONG):
+                logger.warning(f"WebSocket {conn_id}: fragmented control frame refused")
+                return None
+            if len(payload) > MAX_WS_MESSAGE_BYTES:
+                logger.warning(f"WebSocket {conn_id}: first fragment already over the cap")
+                return None
+            self.pending_messages[conn_id] = PendingMessage(
+                opcode=opcode, parts=[payload], size=len(payload)
+            )
+            return None
+
+        return opcode, payload
+
+    async def _close_connection(self, conn_id: int, code: int, reason: str) -> None:
+        """Close one upstream socket and tell the peer.
+
+        Args:
+            conn_id: Connection to close
+            code: Close code
+            reason: Generic reason
+        """
+        ws = self.connections.pop(conn_id, None)
+        task = self.relay_tasks.pop(conn_id, None)
+        self.pending_messages.pop(conn_id, None)
+        if task is not None:
+            task.cancel()
+        if ws is not None:
+            try:
+                await ws.close(code=code)
+            except Exception as exc:
+                logger.error(f"Error closing WebSocket {conn_id}: {exc}")
+        close_frame: WSCloseFrame = {
+            "connection_id": conn_id,
+            "close_code": code,
+            "reason": reason,
+        }
+        await self.send_frame(serialize_ws_close(close_frame))
+
+    async def _send_ws_message(self, conn_id: int, opcode: int, payload: bytes) -> None:
+        """Send one upstream message to the peer, fragmenting if needed.
+
+        Args:
+            conn_id: Connection the message belongs to
+            opcode: RFC 6455 opcode of the message
+            payload: Complete message payload
+        """
+        limit = self.effective_max_chunk
+
+        if len(payload) <= limit:
+            frame: WSDataFrame = {
+                "connection_id": conn_id,
+                "opcode": opcode,
+                "payload": payload,
+                "fin": True,
+            }
+            await self.send_frame(serialize_ws_data(frame))
+            return
+
+        offset = 0
+        first = True
+        while offset < len(payload):
+            piece = payload[offset : offset + limit]
+            offset += limit
+            fragment: WSDataFrame = {
+                "connection_id": conn_id,
+                "opcode": opcode if first else WSOpcode.CONTINUATION,
+                "payload": piece,
+                "fin": offset >= len(payload),
+            }
+            await self.send_frame(serialize_ws_data(fragment))
+            first = False
 
     async def handle_close(self, data: bytes) -> None:
         """Handle WS_CLOSE frame - close upstream WebSocket.
@@ -233,6 +407,7 @@ class WSProxyHandler:
                 # Close upstream connection
                 await ws.close(code=frame["close_code"], message=frame["reason"].encode("utf-8"))
                 del self.connections[conn_id]
+                self.pending_messages.pop(conn_id, None)
 
                 # Cancel relay task
                 task = self.relay_tasks.get(conn_id)
@@ -259,52 +434,29 @@ class WSProxyHandler:
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    # Text message
-                    payload = msg.data.encode("utf-8")
-                    data_frame: WSDataFrame = {
-                        "connection_id": conn_id,
-                        "opcode": WSOpcode.TEXT,
-                        "payload": payload,
-                    }
-                    frame_data = serialize_ws_data(data_frame)
-                    await self.send_frame(frame_data)
+                    # Text message. Fragmented if it exceeds the negotiated
+                    # chunk size, which is what makes a long model response
+                    # survive the DataChannel's message limit.
+                    await self._send_ws_message(conn_id, WSOpcode.TEXT, msg.data.encode("utf-8"))
                     logger.debug(
                         f"WebSocket {conn_id}: Relayed text message ({len(msg.data)} chars)"
                     )
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     # Binary message
-                    data_frame = {
-                        "connection_id": conn_id,
-                        "opcode": WSOpcode.BINARY,
-                        "payload": msg.data,
-                    }
-                    frame_data = serialize_ws_data(data_frame)
-                    await self.send_frame(frame_data)
+                    await self._send_ws_message(conn_id, WSOpcode.BINARY, msg.data)
                     logger.debug(
                         f"WebSocket {conn_id}: Relayed binary message ({len(msg.data)} bytes)"
                     )
 
                 elif msg.type == aiohttp.WSMsgType.PING:
-                    # Ping (relay as data)
-                    data_frame = {
-                        "connection_id": conn_id,
-                        "opcode": WSOpcode.PING,
-                        "payload": msg.data,
-                    }
-                    frame_data = serialize_ws_data(data_frame)
-                    await self.send_frame(frame_data)
+                    # Ping (relay as data; control frames are never fragmented)
+                    await self._send_ws_message(conn_id, WSOpcode.PING, msg.data)
                     logger.debug(f"WebSocket {conn_id}: Relayed ping")
 
                 elif msg.type == aiohttp.WSMsgType.PONG:
-                    # Pong (relay as data)
-                    data_frame = {
-                        "connection_id": conn_id,
-                        "opcode": WSOpcode.PONG,
-                        "payload": msg.data,
-                    }
-                    frame_data = serialize_ws_data(data_frame)
-                    await self.send_frame(frame_data)
+                    # Pong (relay as data; control frames are never fragmented)
+                    await self._send_ws_message(conn_id, WSOpcode.PONG, msg.data)
                     logger.debug(f"WebSocket {conn_id}: Relayed pong")
 
                 elif msg.type in (
@@ -359,3 +511,4 @@ class WSProxyHandler:
                 del self.connections[conn_id]
             if conn_id in self.relay_tasks:
                 del self.relay_tasks[conn_id]
+            self.pending_messages.pop(conn_id, None)

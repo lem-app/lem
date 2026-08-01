@@ -21,6 +21,7 @@
  */
 
 import type {
+  ChallengeMessage,
   ConnectionState,
   DataChannelState,
   ReceivedSignalingMessage,
@@ -30,6 +31,7 @@ import type {
   ConnectRequestMessage,
   ConnectAckReceivedMessage,
 } from '../api/types'
+import { SIGNAL_CONTEXT, getDeviceIdentity } from '../api/device-key'
 
 /**
  * WebRTC configuration options.
@@ -50,6 +52,13 @@ export interface WebRTCConfig {
    * state was already `failed`.
    */
   onConnectionFailed?: (error: Error) => void
+  /**
+   * Answers the signaling server's proof-of-possession challenge.
+   *
+   * Defaults to this browser's Ed25519 device key. Injectable so tests can
+   * drive the handshake without WebCrypto.
+   */
+  signChallenge?: (context: string, ...fields: string[]) => Promise<string>
 }
 
 /**
@@ -88,6 +97,7 @@ export class WebRTCConnectionManager {
   private onDataChannelMessage?: (message: string | ArrayBuffer) => void
   private onError?: (error: Error) => void
   private onConnectionFailed?: (error: Error) => void
+  private signChallenge: (context: string, ...fields: string[]) => Promise<string>
 
   // Reconnection
   private shouldReconnect = true
@@ -127,6 +137,9 @@ export class WebRTCConnectionManager {
     this.onDataChannelMessage = config.onDataChannelMessage
     this.onError = config.onError
     this.onConnectionFailed = config.onConnectionFailed
+    this.signChallenge =
+      config.signChallenge ??
+      (async (context, ...fields) => (await getDeviceIdentity()).sign(context, ...fields))
   }
 
   /**
@@ -469,6 +482,14 @@ export class WebRTCConnectionManager {
           }
           const message = JSON.parse(raw) as ReceivedSignalingMessage
 
+          // Proof of possession. The server answers `auth` with a challenge
+          // and will not send `connected` until this device signs it, so a
+          // stolen account token alone cannot open a device socket.
+          if (message.type === 'challenge') {
+            void this.answerChallenge(ws, message)
+            return
+          }
+
           // Check for "connected" message to extract ICE servers
           if (message.type === 'connected' && !resolved) {
             resolved = true
@@ -494,6 +515,28 @@ export class WebRTCConnectionManager {
         }
       }
     })
+  }
+
+  /**
+   * Sign the signaling server's challenge and send the auth-response.
+   *
+   * A failure here is left to close the socket from the server side rather
+   * than being papered over: an unsigned connection is not a connection.
+   *
+   * @param ws Socket the challenge arrived on.
+   * @param message The challenge frame.
+   */
+  private async answerChallenge(ws: WebSocket, message: ChallengeMessage): Promise<void> {
+    try {
+      const signature = await this.signChallenge(SIGNAL_CONTEXT, this.deviceId, message.challenge)
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'auth-response', signature }))
+      }
+    } catch (error) {
+      console.error('[Signaling] Could not answer the device key challenge:', error)
+      this.onError?.(error instanceof Error ? error : new Error(String(error)))
+      ws.close()
+    }
   }
 
   /**

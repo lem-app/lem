@@ -1,0 +1,358 @@
+{
+  "$comment": "Cross-language golden vectors for tunnel protocol v3. Both server/tests/tunnel/test_protocol_vectors.py and web/remote/src/lib/protocol-vectors.test.ts decode every vector and re-encode it to the identical bytes. This file is the contract: FrameType drifted between the two codecs once already (v1 to v2) and left the suite red for months. Regenerate deliberately, never to make a red test green.",
+  "protocol_version": 3,
+  "frame_types": {
+    "HELLO": 0,
+    "HTTP_REQUEST_HEAD": 1,
+    "HTTP_RESPONSE_V2_RESERVED": 2,
+    "HTTP_RESPONSE_HEAD": 3,
+    "HTTP_RESPONSE_CHUNK": 4,
+    "HTTP_CANCEL": 5,
+    "HTTP_REQUEST_CHUNK": 6,
+    "WS_CONNECT": 16,
+    "WS_DATA": 17,
+    "WS_CLOSE": 18,
+    "WS_CONNECT_ACK": 19,
+    "WS_CONNECT_ERROR": 20
+  },
+  "flags": {
+    "BODY_FOLLOWS": 1,
+    "FINAL": 1,
+    "FIN": 1
+  },
+  "limits": {
+    "MAX_BODY_BYTES": 33554432,
+    "MAX_HEADERS_BYTES": 262144,
+    "MAX_CHUNK_BYTES": 49152,
+    "MAX_URL_BYTES": 8192,
+    "MAX_INFLIGHT_REQUESTS": 128,
+    "MAX_WS_MESSAGE_BYTES": 8388608,
+    "POST_CANCEL_DRAIN_BYTES": 524288
+  },
+  "error_codes": {
+    "E_NO_SESSION": 1000,
+    "E_DEVICE_MISMATCH": 1001,
+    "E_SW_FORBIDDEN": 1002,
+    "E_BRIDGE_UNAVAILABLE": 1003,
+    "E_TUNNEL_DOWN": 1004,
+    "E_SESSION_CLOSED": 1005,
+    "E_TIMEOUT_HEAD": 1006,
+    "E_TIMEOUT_STREAM": 1007,
+    "E_TOO_LARGE": 1008,
+    "E_PROTO_VERSION": 1009,
+    "E_PROTO_V2_FRAME": 1010,
+    "E_PROTO_MALFORMED": 1011,
+    "E_UPSTREAM": 1012,
+    "E_UNKNOWN_SERVICE": 1013,
+    "E_INTERNAL": 1014
+  },
+  "http_status_for_error": {
+    "E_NO_SESSION": 421,
+    "E_DEVICE_MISMATCH": 409,
+    "E_SW_FORBIDDEN": 403,
+    "E_BRIDGE_UNAVAILABLE": 503,
+    "E_TUNNEL_DOWN": 503,
+    "E_SESSION_CLOSED": 410,
+    "E_TIMEOUT_HEAD": 504,
+    "E_TIMEOUT_STREAM": 504,
+    "E_TOO_LARGE": 502,
+    "E_PROTO_VERSION": 502,
+    "E_PROTO_V2_FRAME": 502,
+    "E_PROTO_MALFORMED": 502,
+    "E_UPSTREAM": 502,
+    "E_UNKNOWN_SERVICE": 502,
+    "E_INTERNAL": 500
+  },
+  "ws_close_codes": {
+    "PROTOCOL_VERSION_MISMATCH": 4001,
+    "SHIM_NO_BRIDGE": 4002,
+    "CONNECT_TIMEOUT": 4003,
+    "MAX_WS_CONNECTIONS": 4004,
+    "MAX_WS_MESSAGE_BYTES": 4005,
+    "POST_CANCEL_DRAIN": 4006
+  },
+  "vectors": [
+    {
+      "name": "hello_default",
+      "kind": "hello",
+      "frame": {
+        "protocol_version": 3,
+        "flags": 0,
+        "max_chunk_bytes": 49152,
+        "max_body_bytes": 33554432,
+        "impl": "lem-server/0.1.0"
+      },
+      "hex": "000300000000c0000200000000106c656d2d7365727665722f302e312e30"
+    },
+    {
+      "name": "hello_unicode_impl",
+      "kind": "hello",
+      "frame": {
+        "protocol_version": 3,
+        "flags": 0,
+        "max_chunk_bytes": 65536,
+        "max_body_bytes": 1024,
+        "impl": "lem-web/0.1.0 é✓"
+      },
+      "hex": "00030000000100000000040000136c656d2d7765622f302e312e3020c3a9e29c93"
+    },
+    {
+      "name": "hello_empty_impl",
+      "kind": "hello",
+      "frame": {
+        "protocol_version": 3,
+        "flags": 0,
+        "max_chunk_bytes": 1,
+        "max_body_bytes": 0,
+        "impl": ""
+      },
+      "hex": "0003000000000001000000000000"
+    },
+    {
+      "name": "request_head_get",
+      "kind": "request_head",
+      "frame": {
+        "request_id": 1,
+        "method": "GET",
+        "path": "/v1/health",
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ]
+        ],
+        "body_follows": false
+      },
+      "hex": "0100000001000003474554000a2f76312f6865616c74680000001f5b5b22416363657074222c226170706c69636174696f6e2f6a736f6e225d5d"
+    },
+    {
+      "name": "request_head_post_body",
+      "kind": "request_head",
+      "frame": {
+        "request_id": 42,
+        "method": "POST",
+        "path": "/api/chat?stream=true&q=caf%C3%A9",
+        "headers": [
+          [
+            "Content-Type",
+            "application/json"
+          ],
+          [
+            "Cookie",
+            "a=1"
+          ],
+          [
+            "Cookie",
+            "b=2"
+          ]
+        ],
+        "body_follows": true
+      },
+      "hex": "010000002a010004504f535400212f6170692f636861743f73747265616d3d7472756526713d636166254333254139000000475b5b22436f6e74656e742d54797065222c226170706c69636174696f6e2f6a736f6e225d2c5b22436f6f6b6965222c22613d31225d2c5b22436f6f6b6965222c22623d32225d5d"
+    },
+    {
+      "name": "request_head_unicode_path",
+      "kind": "request_head",
+      "frame": {
+        "request_id": 4294967295,
+        "method": "DELETE",
+        "path": "/café/✓",
+        "headers": [],
+        "body_follows": false
+      },
+      "hex": "01ffffffff00000644454c455445000a2f636166c3a92fe29c93000000025b5d"
+    },
+    {
+      "name": "response_head_200",
+      "kind": "response_head",
+      "frame": {
+        "request_id": 42,
+        "status_code": 200,
+        "headers": [
+          [
+            "Content-Type",
+            "text/html; charset=utf-8"
+          ],
+          [
+            "Set-Cookie",
+            "session=abc; HttpOnly"
+          ],
+          [
+            "Set-Cookie",
+            "theme=dark"
+          ]
+        ],
+        "body_follows": true
+      },
+      "hex": "030000002a00c801000000705b5b22436f6e74656e742d54797065222c22746578742f68746d6c3b20636861727365743d7574662d38225d2c5b225365742d436f6f6b6965222c2273657373696f6e3d6162633b20487474704f6e6c79225d2c5b225365742d436f6f6b6965222c227468656d653d6461726b225d5d"
+    },
+    {
+      "name": "response_head_unicode_headers",
+      "kind": "response_head",
+      "frame": {
+        "request_id": 5,
+        "status_code": 200,
+        "headers": [
+          [
+            "X-Title",
+            "café ✓"
+          ],
+          [
+            "X-Quote",
+            "say \"hi\"\\"
+          ]
+        ],
+        "body_follows": true
+      },
+      "hex": "030000000500c801000000345b5b22582d5469746c65222c22636166c3a920e29c93225d2c5b22582d51756f7465222c22736179205c2268695c225c5c225d5d"
+    },
+    {
+      "name": "response_head_304_no_body",
+      "kind": "response_head",
+      "frame": {
+        "request_id": 7,
+        "status_code": 304,
+        "headers": [
+          [
+            "ETag",
+            "\"abc\""
+          ]
+        ],
+        "body_follows": false
+      },
+      "hex": "0300000007013000000000145b5b2245546167222c225c226162635c22225d5d"
+    },
+    {
+      "name": "response_chunk_binary",
+      "kind": "chunk",
+      "frame": {
+        "frame_type": 4,
+        "request_id": 42,
+        "payload_hex": "89504e470d0a1a0a00fffe",
+        "final": false
+      },
+      "hex": "040000002a000000000b89504e470d0a1a0a00fffe"
+    },
+    {
+      "name": "response_chunk_final_empty",
+      "kind": "chunk",
+      "frame": {
+        "frame_type": 4,
+        "request_id": 42,
+        "payload_hex": "",
+        "final": true
+      },
+      "hex": "040000002a0100000000"
+    },
+    {
+      "name": "request_chunk_invalid_utf8",
+      "kind": "chunk",
+      "frame": {
+        "frame_type": 6,
+        "request_id": 3,
+        "payload_hex": "c3280080ff",
+        "final": true
+      },
+      "hex": "06000000030100000005c3280080ff"
+    },
+    {
+      "name": "request_chunk_all_byte_values",
+      "kind": "chunk",
+      "frame": {
+        "frame_type": 6,
+        "request_id": 1,
+        "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        "final": false
+      },
+      "hex": "06000000010000000100000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    },
+    {
+      "name": "cancel_too_large",
+      "kind": "cancel",
+      "frame": {
+        "request_id": 42,
+        "reason_code": 1008
+      },
+      "hex": "050000002a03f0"
+    },
+    {
+      "name": "ws_connect",
+      "kind": "ws_connect",
+      "frame": {
+        "connection_id": 1,
+        "url": "ws://127.0.0.1:33801/ws/socket.io/?EIO=4",
+        "headers": [
+          [
+            "Sec-WebSocket-Protocol",
+            "chat"
+          ],
+          [
+            "Origin",
+            "http://localhost"
+          ]
+        ]
+      },
+      "hex": "1000000001002877733a2f2f3132372e302e302e313a33333830312f77732f736f636b65742e696f2f3f45494f3d34000000415b5b225365632d576562536f636b65742d50726f746f636f6c222c2263686174225d2c5b224f726967696e222c22687474703a2f2f6c6f63616c686f7374225d5d"
+    },
+    {
+      "name": "ws_data_text_fin",
+      "kind": "ws_data",
+      "frame": {
+        "connection_id": 1,
+        "opcode": 1,
+        "payload_hex": "7b22746f6b656e223a2268656c227d",
+        "fin": true
+      },
+      "hex": "110000000101010000000f7b22746f6b656e223a2268656c227d"
+    },
+    {
+      "name": "ws_data_continuation_not_fin",
+      "kind": "ws_data",
+      "frame": {
+        "connection_id": 9,
+        "opcode": 0,
+        "payload_hex": "0001feff",
+        "fin": false
+      },
+      "hex": "11000000090000000000040001feff"
+    },
+    {
+      "name": "ws_close",
+      "kind": "ws_close",
+      "frame": {
+        "connection_id": 1,
+        "close_code": 1000,
+        "reason": "bye"
+      },
+      "hex": "120000000103e80003627965"
+    },
+    {
+      "name": "ws_connect_ack",
+      "kind": "ws_connect_ack",
+      "frame": {
+        "connection_id": 1,
+        "protocol": "chat"
+      },
+      "hex": "1300000001000463686174"
+    },
+    {
+      "name": "ws_connect_ack_no_protocol",
+      "kind": "ws_connect_ack",
+      "frame": {
+        "connection_id": 2,
+        "protocol": ""
+      },
+      "hex": "13000000020000"
+    },
+    {
+      "name": "ws_connect_error",
+      "kind": "ws_connect_error",
+      "frame": {
+        "connection_id": 3,
+        "error_code": 1011,
+        "reason": "Connection failed"
+      },
+      "hex": "140000000303f30011436f6e6e656374696f6e206661696c6564"
+    }
+  ]
+}

@@ -28,6 +28,32 @@ Two places now require the device to prove it holds the matching private key:
 Both use the same shape: the server issues a random challenge, the client
 signs a domain-separated message over it, and the server verifies the
 signature against the public key. Challenges are single use and expire.
+
+Signed payload layout
+---------------------
+This module defines the wire format. Two client implementations must reproduce
+these bytes exactly: ``server/app/crypto.py`` and
+``web/remote/src/api/device-key.ts``. Anything encoded differently by Python
+and JavaScript is a trap - ``json.dumps`` and ``JSON.stringify`` do not agree
+at their defaults - so the payload is a plain concatenation with no encoder in
+the loop::
+
+    context ":" field_0 ":" field_1 [":" field_2 ...]
+
+with every field UTF-8 encoded. For registration and signaling connect the
+fields are ``(device_id, challenge)``; a key rotation proof appends the
+replacement public key.
+
+Why this stays unambiguous: every field after ``device_id`` is base64 of a
+fixed 32 bytes - 44 characters, and base64 contains no ``:``. Two different
+field splits would have to be the same length overall, which forces the
+device ids to be the same length, which forces them to be equal. The
+separator is therefore load-bearing only in combination with those fixed
+lengths, so **do not add a variable-length trailing field** without switching
+to explicit length prefixes.
+
+``tests/test_signed_payload_vectors.py`` pins the exact bytes, and the two
+client suites assert the same vector.
 """
 
 import base64
@@ -42,6 +68,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 # for another, so the purpose string is part of the signed message.
 REGISTER_CONTEXT = b"lem-device-register-v1"
 SIGNAL_CONTEXT = b"lem-signaling-connect-v1"
+# Signed by the key a device is rotating *away from*, authorizing one specific
+# replacement key. Distinct from REGISTER_CONTEXT so a captured registration
+# proof can never be presented as authorization to replace a key.
+ROTATE_CONTEXT = b"lem-device-rotate-v1"
 
 # Raw ed25519 key and signature sizes.
 _PUBLIC_KEY_BYTES = 32
@@ -83,34 +113,38 @@ def decode_public_key(pubkey_b64: str) -> Ed25519PublicKey:
         raise InvalidPublicKeyError("Public key is not a valid ed25519 key") from exc
 
 
-def signed_message(context: bytes, device_id: str, challenge: str) -> bytes:
+def signed_message(context: bytes, *fields: str) -> bytes:
     """Build the exact byte string a client must sign.
 
+    See the module docstring for the layout. For the two-field cases this is
+    byte-identical to the original fixed-arity implementation, so the wire
+    format is unchanged; the extra fields exist for the rotation proof.
+
     Args:
-        context: Domain separation constant (REGISTER_CONTEXT or SIGNAL_CONTEXT).
-        device_id: Device the signature is being produced for.
-        challenge: Base64 challenge string exactly as issued by the server.
+        context: Domain separation constant (REGISTER_CONTEXT, SIGNAL_CONTEXT
+            or ROTATE_CONTEXT).
+        *fields: Ordered payload fields, encoded as UTF-8. For registration and
+            signaling connect these are ``(device_id, challenge)``; for a key
+            rotation proof they are ``(device_id, challenge, new_pubkey)``.
 
     Returns:
         The message bytes to sign or verify.
     """
-    return b":".join((context, device_id.encode("utf-8"), challenge.encode("ascii")))
+    return b":".join((context, *(field.encode("utf-8") for field in fields)))
 
 
-def verify_signature(
-    pubkey_b64: str, context: bytes, device_id: str, challenge: str, signature_b64: str
-) -> bool:
-    """Verify an ed25519 signature over a challenge.
+def verify_signature(pubkey_b64: str, signature_b64: str, message: bytes) -> bool:
+    """Verify an ed25519 signature over a signed-payload message.
 
     Args:
         pubkey_b64: Base64-encoded raw ed25519 public key.
-        context: Domain separation constant.
-        device_id: Device the signature claims to come from.
-        challenge: Base64 challenge string issued by the server.
         signature_b64: Base64-encoded 64-byte signature.
+        message: Message bytes, as built by :func:`signed_message`.
 
     Returns:
-        True if the signature is valid for this key, device and challenge.
+        True if the signature is valid for this key and message. False for any
+        malformed input, so callers never have to distinguish "bad signature"
+        from "unparseable signature" - both are refusals.
     """
     try:
         public_key = decode_public_key(pubkey_b64)
@@ -126,7 +160,7 @@ def verify_signature(
         return False
 
     try:
-        public_key.verify(signature, signed_message(context, device_id, challenge))
+        public_key.verify(signature, message)
     except InvalidSignature:
         return False
     return True

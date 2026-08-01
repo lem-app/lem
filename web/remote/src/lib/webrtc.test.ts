@@ -33,18 +33,30 @@ import type { ConnectionState } from '../api/types'
 
 const SIGNAL_URL = 'ws://signal.test/signal'
 
-function newManager(overrides: Partial<{ onStateChange: (s: ConnectionState) => void }> = {}) {
+function newManager(
+  overrides: Partial<{
+    onStateChange: (s: ConnectionState) => void
+    onError: (e: Error) => void
+    onConnectionFailed: (e: Error) => void
+    signChallenge: (context: string, ...fields: string[]) => Promise<string>
+  }> = {}
+) {
   return new WebRTCConnectionManager({
     signalUrl: SIGNAL_URL,
     token: 'test-token',
     deviceId: 'browser-1',
     targetDeviceId: 'device-1',
+    // Real WebCrypto signing is exercised in `api/device-key.test.ts`; here we
+    // only care that the handshake step happens at all.
+    signChallenge: (context, ...fields) => Promise.resolve(`sig(${context}|${fields.join('|')})`),
     ...overrides,
   })
 }
 
 /**
- * Run `connect()` up to the point where signaling is established.
+ * Run `connect()` through the full signaling handshake:
+ * `auth` -> `challenge` -> `auth-response` -> `connected`.
+ *
  * Returns the connect() promise so callers can await completion.
  */
 async function connectThroughSignaling(manager: WebRTCConnectionManager): Promise<void> {
@@ -53,6 +65,14 @@ async function connectThroughSignaling(manager: WebRTCConnectionManager): Promis
 
   const socket = latestSocket()
   socket.open()
+  socket.receiveText({
+    type: 'challenge',
+    device_id: 'browser-1',
+    challenge: 'Y2hhbGxlbmdl',
+    context: 'lem-signaling-connect-v1',
+  })
+  // Signing is async; let the auth-response be sent before `connected` lands.
+  await vi.advanceTimersByTimeAsync(0)
   socket.receiveText({ type: 'connected', device_id: 'browser-1', message: 'ok' })
 
   await connecting
@@ -82,7 +102,8 @@ describe('WebRTCConnectionManager signaling', () => {
 
     const messages = latestSocket().sentJson()
     expect(messages[0]).toMatchObject({ type: 'auth', token: 'test-token' })
-    expect(messages[1]).toMatchObject({ type: 'offer', target_device_id: 'device-1' })
+    expect(messages[1]).toMatchObject({ type: 'auth-response' })
+    expect(messages[2]).toMatchObject({ type: 'offer', target_device_id: 'device-1' })
 
     const pc = FakePeerConnection.instances[0]
     pc.connectionState = 'connected'
@@ -90,6 +111,60 @@ describe('WebRTCConnectionManager signaling', () => {
 
     expect(manager.getState()).toBe('connected')
     expect(states).toEqual(['connecting', 'connected'])
+  })
+
+  it('answers the proof-of-possession challenge before anything else', async () => {
+    // The browser used to send `auth` and wait for `connected`, which never
+    // came: the server answers `auth` with a challenge and closes the socket
+    // if it goes unanswered. Nothing signed the challenge.
+    const connecting = manager.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'challenge',
+      device_id: 'browser-1',
+      challenge: 'Y2hhbGxlbmdl',
+      context: 'lem-signaling-connect-v1',
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const response = socket.sentJson()[1]
+    expect(response).toEqual({
+      type: 'auth-response',
+      // Domain-separated, and bound to this device and this challenge.
+      signature: 'sig(lem-signaling-connect-v1|browser-1|Y2hhbGxlbmdl)',
+    })
+
+    socket.receiveText({ type: 'connected', device_id: 'browser-1', message: 'ok' })
+    await connecting
+  })
+
+  it('closes the socket when it cannot sign the challenge', async () => {
+    // Fail closed: no key, no connection. Never "proceed unauthenticated".
+    const errors: Error[] = []
+    manager = newManager({
+      signChallenge: () => Promise.reject(new Error('no device key')),
+      onError: (error) => errors.push(error),
+    })
+
+    void manager.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'challenge',
+      device_id: 'browser-1',
+      challenge: 'Y2hhbGxlbmdl',
+      context: 'lem-signaling-connect-v1',
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(socket.sentJson().some((m) => m.type === 'auth-response')).toBe(false)
+    expect(errors.map((e) => e.message)).toContain('no device key')
+    expect(socket.readyState).toBe(3)
   })
 
   it('applies a remote answer delivered over signaling', async () => {
@@ -184,13 +259,7 @@ describe('WebRTCConnectionManager failure handling', () => {
   // F-COR-3
   it('reports a connection failure once the 10s timeout expires', async () => {
     const failures: Error[] = []
-    const manager = new WebRTCConnectionManager({
-      signalUrl: SIGNAL_URL,
-      token: 't',
-      deviceId: 'browser-1',
-      targetDeviceId: 'device-1',
-      onConnectionFailed: (error) => failures.push(error),
-    })
+    const manager = newManager({ onConnectionFailed: (error) => failures.push(error) })
 
     await connectThroughSignaling(manager)
     expect(failures).toHaveLength(0)
@@ -207,13 +276,7 @@ describe('WebRTCConnectionManager failure handling', () => {
   // F-COR-3: every failure is reported, even when the state is already `failed`.
   it('reports repeat failures that setState would have de-duplicated', async () => {
     const failures: Error[] = []
-    const manager = new WebRTCConnectionManager({
-      signalUrl: SIGNAL_URL,
-      token: 't',
-      deviceId: 'browser-1',
-      targetDeviceId: 'device-1',
-      onConnectionFailed: (error) => failures.push(error),
-    })
+    const manager = newManager({ onConnectionFailed: (error) => failures.push(error) })
 
     await connectThroughSignaling(manager)
     await vi.advanceTimersByTimeAsync(10_000)

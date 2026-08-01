@@ -22,9 +22,10 @@
  * dashboard that looked signed in and failed every call.
  */
 
-import type { Token, UserLogin, UserRegister, Device } from './types'
+import type { Token, UserLogin, UserRegister, Device, DeviceChallenge } from './types'
 import { config } from '../lib/env'
 import { expireSession } from '../lib/session'
+import { REGISTER_CONTEXT, getDeviceIdentity, type DeviceKeyStore } from './device-key'
 
 /** Thrown when the signaling server rejects our credentials. */
 export class UnauthorizedError extends Error {
@@ -118,13 +119,52 @@ export async function register(userData: UserRegister): Promise<Token> {
 }
 
 /**
- * Register a device with the signaling server.
+ * Ask the signaling server for a single-use registration challenge.
+ *
+ * @param deviceId Device the challenge is for.
+ * @param token Account JWT.
+ * @returns The issued challenge.
  */
-export async function registerDevice(
+export async function requestDeviceChallenge(
   deviceId: string,
-  token: string,
-  pubkey = 'browser-key'
-): Promise<void> {
+  token: string
+): Promise<DeviceChallenge> {
+  const response = await request(
+    '/devices/challenge',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ device_id: deviceId }),
+    },
+    'Could not obtain a device challenge'
+  )
+
+  return (await response.json()) as DeviceChallenge
+}
+
+/**
+ * Register this browser's device key with the signaling server.
+ *
+ * The browser used to register the literal string `'browser-key'` and prove
+ * nothing. It now signs a server-issued challenge with the private half of the
+ * key it is registering, so the stored key means something.
+ *
+ * Note there is no 409 tolerance any more. Re-registering is a normal 200 when
+ * the key is unchanged, and a 401 when it is not - which means the signaling
+ * server has a different key on file for this id and the caller cannot prove
+ * possession of it. Swallowing that would be swallowing a hijack attempt.
+ *
+ * @param token Account JWT.
+ * @param store Key store to use; defaults to IndexedDB. Tests pass a fake.
+ * @returns The device id that was registered.
+ */
+export async function registerDevice(token: string, store?: DeviceKeyStore): Promise<string> {
+  const identity = await getDeviceIdentity(store)
+  const { challenge } = await requestDeviceChallenge(identity.deviceId, token)
+
   await request(
     '/devices/register',
     {
@@ -133,12 +173,17 @@ export async function registerDevice(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ device_id: deviceId, pubkey }),
+      body: JSON.stringify({
+        device_id: identity.deviceId,
+        pubkey: identity.publicKeyB64,
+        challenge,
+        signature: await identity.sign(REGISTER_CONTEXT, identity.deviceId, challenge),
+      }),
     },
-    'Device registration failed',
-    // 409 means the device is already registered, which is fine.
-    [409]
+    'Device registration failed'
   )
+
+  return identity.deviceId
 }
 
 /**

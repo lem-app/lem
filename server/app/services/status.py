@@ -331,13 +331,27 @@ def _status_from_container(container_status: str) -> ServiceStatus:
     return ServiceStatus.ERROR
 
 
-def _parse_host_port(ports_str: str, container_port: int | None = None) -> int | None:
+def _parse_host_port(
+    ports_str: str, container_port: int | None = None, *, strict: bool = False
+) -> int | None:
     """
     Parse the host port from Docker port mappings.
+
+    Two modes, because the two callers have very different failure costs:
+
+    - **strict**: only an exact `<host_port>-><container_port>/tcp` match counts.
+      A miss returns None, and an unknown `container_port` is itself a miss - you
+      cannot match exactly against an unknown target. Used by tunnel routing,
+      where a guessed port sends an authenticated request to whatever else
+      happens to be listening on the host.
+    - lenient (default): fall through to the first host port anywhere in the
+      string. Used by the local dashboard's own `endpoint`/`host_port` display,
+      where a wrong guess is a broken link on the user's own machine.
 
     Args:
         ports_str: Docker ports string like "0.0.0.0:33821->11434/tcp"
         container_port: Container port to find mapping for (optional)
+        strict: Refuse to guess when the container port does not match
 
     Returns:
         Host port or None
@@ -352,6 +366,9 @@ def _parse_host_port(ports_str: str, container_port: int | None = None) -> int |
         if match:
             return int(match.group(1))
 
+    if strict:
+        return None
+
     # Fallback: extract the first host port from the string
     # Pattern matches: "0.0.0.0:33891->33891/tcp" or "[::]:33891->33891/tcp"
     fallback_pattern = r"(?:0\.0\.0\.0:|:\]:|\[::\]:)(\d+)->"
@@ -362,11 +379,22 @@ def _parse_host_port(ports_str: str, container_port: int | None = None) -> int |
     return None
 
 
-def _endpoint_for(service_id: str, container: dict[str, str]) -> tuple[int | None, str | None]:
-    """Resolve (host_port, endpoint URL) for a container, if it publishes a port."""
+def _endpoint_for(
+    service_id: str, container: dict[str, str], *, strict: bool = False
+) -> tuple[int | None, str | None]:
+    """Resolve (host_port, endpoint URL) for a container, if it publishes a port.
+
+    Args:
+        service_id: Service ID the container belongs to
+        container: Container record from :func:`_get_containers`
+        strict: Pass through to :func:`_parse_host_port`; see its docstring
+
+    Returns:
+        (host port, endpoint URL), or (None, None) when no port resolves
+    """
     service_def = get_service_definition(service_id)
     container_port = service_def.container_port if service_def else None
-    host_port = _parse_host_port(container.get("ports", ""), container_port)
+    host_port = _parse_host_port(container.get("ports", ""), container_port, strict=strict)
 
     if host_port is None:
         return None, None
@@ -378,13 +406,19 @@ def get_service_url(service_id: str) -> str | None:
     """
     Resolve a running service's local URL, synchronously and without raising.
 
-    Used by callers that cannot await (e.g. tunnel request routing).
+    Used by callers that cannot await (e.g. tunnel request routing), and
+    therefore **strict**: when the container's published ports do not exactly
+    map the catalog's `container_port`, this returns None rather than the first
+    port it can find. The tunnel must not forward to an address it cannot
+    positively resolve, for the same reason it must not extend credentials to a
+    peer it cannot positively identify.
 
     Args:
         service_id: Service ID to look up
 
     Returns:
-        URL like "http://127.0.0.1:33801", or None if not running or Docker is down
+        URL like "http://127.0.0.1:33801", or None if not running, not exactly
+        resolvable, or Docker is down
     """
     try:
         containers = _get_containers()
@@ -396,7 +430,12 @@ def get_service_url(service_id: str) -> str | None:
     if container is None or container.get("status") != "running":
         return None
 
-    _, endpoint = _endpoint_for(service_id, container)
+    _, endpoint = _endpoint_for(service_id, container, strict=True)
+    if endpoint is None:
+        logger.warning(
+            f"Refusing to guess a port for {service_id}: published ports "
+            f"{container.get('ports', '')!r} do not map its catalog container port"
+        )
     return endpoint
 
 

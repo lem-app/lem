@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { RelayClient, RelayAuthError } from './relay-client'
+import { RelayClient, RelayAuthError, RelayRejectedError } from './relay-client'
 import { installFakeWebSocket, latestSocket, fakeSockets } from '../test/fakes'
 import type { ConnectionState } from '../api/types'
 
@@ -99,6 +99,136 @@ describe('RelayClient', () => {
 
     await expect(connecting).rejects.toThrow('Authentication failed')
     expect(client.isConnected()).toBe(false)
+  })
+
+  // The relay's error frame now carries `reason` and `retryable` (PR #45).
+  // Treating every error frame as terminal turned "the relay is busy" into
+  // "sign in again" and disabled relay reconnection for the session.
+  it('retries after a retryable capacity rejection instead of giving up', async () => {
+    const errors: Error[] = []
+    const client = newClient(undefined, (error) => errors.push(error))
+    const connecting = client.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'error',
+      message: 'Relay is at capacity',
+      reason: 'relay-at-capacity',
+      retryable: true,
+    })
+    // The relay closes with 1013 "try again later" right after the frame.
+    socket.serverClose(1013, 'Relay is at capacity')
+
+    await expect(connecting).rejects.toBeInstanceOf(RelayRejectedError)
+    await expect(connecting).rejects.not.toBeInstanceOf(RelayAuthError)
+
+    // The whole point: reconnection is still armed.
+    const socketsAtRejection = fakeSockets.length
+    await vi.advanceTimersByTimeAsync(2_500)
+    expect(fakeSockets.length).toBe(socketsAtRejection + 1)
+
+    client.disconnect()
+  })
+
+  it('does not tell the user to sign in again when the relay is merely busy', async () => {
+    const errors: Error[] = []
+    const client = newClient(undefined, (error) => errors.push(error))
+    const connecting = client.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'error',
+      message: '',
+      reason: 'account-session-limit',
+      retryable: true,
+    })
+
+    let captured: unknown
+    await connecting.catch((e: unknown) => {
+      captured = e
+    })
+    const error = captured as RelayRejectedError
+    expect(error).toBeInstanceOf(RelayRejectedError)
+    expect(error.reason).toBe('account-session-limit')
+    expect(error.retryable).toBe(true)
+    expect(error.message).not.toMatch(/sign in/i)
+    expect(error.message).toMatch(/concurrent relay sessions|relay sessions/i)
+
+    client.disconnect()
+  })
+
+  it('still stops reconnecting on a terminal auth rejection', async () => {
+    const client = newClient()
+    const connecting = client.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'error',
+      message: 'Authentication failed',
+      reason: 'auth-failed',
+      retryable: false,
+    })
+    socket.serverClose(1008, 'Authentication failed')
+
+    await expect(connecting).rejects.toBeInstanceOf(RelayAuthError)
+
+    const socketsAtFailure = fakeSockets.length
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fakeSockets.length).toBe(socketsAtFailure)
+    expect(client.getState()).toBe('failed')
+  })
+
+  it('stops reconnecting on a terminal non-auth rejection with its own message', async () => {
+    const client = newClient()
+    const connecting = client.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.receiveText({
+      type: 'error',
+      message: 'Update your Lem client',
+      reason: 'unsupported-client',
+      retryable: false,
+    })
+
+    let captured: unknown
+    await connecting.catch((e: unknown) => {
+      captured = e
+    })
+    const error = captured as RelayRejectedError
+    expect(error).toBeInstanceOf(RelayRejectedError)
+    expect(error).not.toBeInstanceOf(RelayAuthError)
+    expect(error.reason).toBe('unsupported-client')
+    expect(error.message).toBe('Update your Lem client')
+
+    const socketsAtFailure = fakeSockets.length
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fakeSockets.length).toBe(socketsAtFailure)
+  })
+
+  it('treats a 1013 close with no error frame as retryable', async () => {
+    const client = newClient()
+    const connecting = client.connect()
+    await Promise.resolve()
+
+    const socket = latestSocket()
+    socket.open()
+    socket.serverClose(1013, 'Relay is at capacity')
+
+    await expect(connecting).rejects.not.toBeInstanceOf(RelayAuthError)
+
+    const socketsAtClose = fakeSockets.length
+    await vi.advanceTimersByTimeAsync(2_500)
+    expect(fakeSockets.length).toBe(socketsAtClose + 1)
+
+    client.disconnect()
   })
 
   // Forward compatibility with an explicit ack, should the relay grow one.

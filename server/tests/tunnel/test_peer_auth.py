@@ -33,7 +33,7 @@ from fastapi import FastAPI, Response
 
 from app.db import AuthState
 from app.security import ALLOWED_ORIGINS, LocalApiSecurityMiddleware
-from app.tunnel.http_frame import deserialize_response, serialize_request
+from app.tunnel.http_frame import serialize_request_head
 from app.tunnel.http_proxy import GENERIC_PEER_UNAUTHORIZED, HTTPProxyHandler
 from app.tunnel.peer_auth import (
     ALLOW_UNVERIFIED_ENV_VAR,
@@ -46,6 +46,8 @@ from app.tunnel.peer_auth import (
 )
 from app.tunnel.router import RequestRouter
 from app.tunnel.webrtc_client import TunnelAgent
+
+from .proxy_harness import FrameCollector, drain
 
 REGISTERED_PEER = "browser-abc123"
 UNKNOWN_PEER = "attacker-device"
@@ -419,13 +421,16 @@ def _peer_frame(path: str) -> bytes:
     Returns:
         Serialized request frame
     """
-    return serialize_request(
+    return serialize_request_head(
         {
             "request_id": 4242,
             "method": "POST",
             "path": path,
-            "headers": {"X-Lem-Client": "spoofed", "Origin": "https://evil.example.com"},
-            "body": "",
+            "headers": [
+                ("X-Lem-Client", "spoofed"),
+                ("Origin", "https://evil.example.com"),
+            ],
+            "body_follows": False,
         }
     )
 
@@ -438,30 +443,40 @@ async def test_unauthorized_peer_gets_no_credentials_and_no_mutation(
     Against the pre-fix code this frame came back 200 with the service stopped.
     """
     monkeypatch.delenv(ALLOW_UNVERIFIED_ENV_VAR, raising=False)
-    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    collector = FrameCollector()
+    handler = HTTPProxyHandler(
+        local_server_url=protected_api,
+        router=RequestRouter(protected_api),
+        send_frame=collector.send,
+    )
     await handler.start()
     try:
-        response = deserialize_response(
-            await handler.handle_request(_peer_frame("/v1/services/ollama/stop"))
-        )
+        await handler.handle_request_head(_peer_frame("/v1/services/ollama/stop"))
+        await drain(handler, 4242)
     finally:
         await handler.stop()
 
-    assert response["status_code"] == 403
-    assert json.loads(response["body"]) == {"error": GENERIC_PEER_UNAUTHORIZED}
+    response = collector.response_for(4242)
+    assert response.status_code == 403
+    assert json.loads(response.body) == {"error": GENERIC_PEER_UNAUTHORIZED}
 
 
 async def test_verified_peer_still_reaches_the_protected_api(protected_api: str) -> None:
     """The counterpart: authorization is what makes remote access work."""
-    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    collector = FrameCollector()
+    handler = HTTPProxyHandler(
+        local_server_url=protected_api,
+        router=RequestRouter(protected_api),
+        send_frame=collector.send,
+    )
     handler.authorize_peer(REGISTERED_PEER)
     await handler.start()
     try:
-        response = deserialize_response(
-            await handler.handle_request(_peer_frame("/v1/services/ollama/stop"))
-        )
+        await handler.handle_request_head(_peer_frame("/v1/services/ollama/stop"))
+        await drain(handler, 4242)
     finally:
         await handler.stop()
 
-    assert response["status_code"] == 200
-    assert json.loads(response["body"]) == {"status": "ok"}
+    response = collector.response_for(4242)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ok"}

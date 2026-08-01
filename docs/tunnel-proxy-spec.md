@@ -179,6 +179,13 @@ The Service Worker deliberately holds **no** tunnel state. It cannot: a `RTCData
 cannot be transferred into a worker, and the SW can be killed and restarted at any moment. All
 tunnel ownership stays in the page.
 
+> **Correction: the SW does call `clients.matchAll()`, for one thing.** §3.4 step 2 says the SW
+> "never searches for its page with `clients.matchAll()`", and for *finding the bridge port* that
+> is right — the page pushes the port. But `LEM_BRIDGE_HELLO` (§3.5) is defined as a broadcast to
+> all clients on `activate`, and there is no other way to reach them. The rule is therefore
+> narrower than it was stated: the SW never uses `matchAll` to *obtain a port*, only to ask pages
+> to send it one.
+
 ### 3.4 Registration and session lifecycle
 
 1. On mount, the dashboard calls
@@ -189,9 +196,16 @@ tunnel ownership stays in the page.
    `bridgePort`. The SW never searches for its page with `clients.matchAll()`; the page pushes
    the port.
 3. Before rendering the iframe, the dashboard registers a **service session**:
-   `bridgePort.postMessage({ type: 'LEM_SESSION_OPEN', deviceId, serviceId })`, where `deviceId`
-   is the target device the tunnel is currently connected to. The SW acknowledges. Only then is
-   the iframe created, at `/app/<deviceId>/<serviceId>/`.
+   `bridgePort.postMessage({ type: 'LEM_SESSION_OPEN', deviceId, serviceId, ackId })`, where
+   `deviceId` is the target device the tunnel is currently connected to. The SW replies
+   `LEM_SESSION_ACK { ackId }`, and the dashboard **awaits that reply** before creating the
+   iframe at `/app/<deviceId>/<serviceId>/`.
+
+   The acknowledgement is load-bearing, not ceremony: a `postMessage` to a worker and a
+   navigation into that worker's scope are two independent queues with no ordering between them.
+   A frame created optimistically can have its very first request answered `410` by a worker that
+   has not processed `LEM_SESSION_OPEN` yet — intermittently, and more often on a slow machine,
+   which is the worst shape of bug to find later.
 4. On unmount, `LEM_SESSION_CLOSE` removes the session; the SW rejects further requests for it
    with 410 (§7.1).
    On a **device change**, the dashboard sends `LEM_ACTIVE_DEVICE { deviceId }` before opening
@@ -224,39 +238,68 @@ The SW must resolve all three to `(deviceId, serviceId, upstreamPath)`.
 onfetch(event):
   url = new URL(event.request.url)
 
-  # A. Not our origin -> not ours.
+  # A. Not our origin -> not ours. Decided synchronously; respondWith is never
+  #    called, so the browser performs it exactly as it would with no SW.
   if url.origin != self.location.origin:
       return                                  # fall through to network, see §3.8
 
   # B. Explicit prefix wins, always.
   m = /^\/app\/([A-Za-z0-9._-]{1,64})\/([A-Za-z0-9._-]{1,64})(\/.*)?$/.exec(url.pathname)
-  if m:
+  if m and m[1] not in ('.', '..') and m[2] not in ('.', '..'):
       deviceId  = m[1]
       serviceId = m[2]
       upstreamPath = (m[3] || '/') + url.search
-      # Device check happens BEFORE any tunnel work, and never re-routes.
-      if deviceId != self.activeDeviceId:
-          event.respondWith(problem(409, 'E_DEVICE_MISMATCH', deviceId))
-          return
       if event.request.mode == 'navigate':
           bindClient(event.resultingClientId, deviceId, serviceId)  # NOT event.clientId
       event.respondWith(proxy(deviceId, serviceId, upstreamPath, event.request))
       return
 
-  # C. No prefix. Resolve the owning client.
-  binding = resolveBindingForClient(event)          # -> {deviceId, serviceId} | null
+  # C. No prefix. Resolve the owning client, then proxy or fail closed.
+  event.respondWith(resolveAndProxy(event, url))
+
+resolveAndProxy(event, url):
+  binding = await resolveBindingForClient(event)    # -> {deviceId, serviceId} | null
   if binding is null:
-      return                                  # uncontrolled client -> network
-  if binding.deviceId != self.activeDeviceId:
-      event.respondWith(problem(409, 'E_DEVICE_MISMATCH', binding.deviceId))
-      return
-  event.respondWith(
-      proxy(binding.deviceId, binding.serviceId, url.pathname + url.search, event.request))
+      return problem(421, 'E_NO_SESSION', url.pathname)      # step 6, fail closed
+  return await proxy(binding.deviceId, binding.serviceId,
+                     url.pathname + url.search, event.request)
+
+proxy(deviceId, serviceId, upstreamPath, request):
+  bridge = await waitForBridge()               # BRIDGE_WAIT_MS; no frame is sent
+  if bridge is null:
+      return problem(503, 'E_BRIDGE_UNAVAILABLE')
+  # The device check: after the bridge, before anything reaches the page.
+  if deviceId != self.activeDeviceId:
+      return problem(409, 'E_DEVICE_MISMATCH', deviceId)
+  ...
 ```
 
 Both branches check the device **after** resolution and **before** proxying, and both fail the
 request rather than substituting the active device. A binding recovered from IndexedDB (step 4)
 can name a device the dashboard left hours ago; that is exactly the case the check exists for.
+
+> **Three corrections from building it.** An earlier revision of this pseudocode could not be
+> implemented as written, and following it literally produced two wrong behaviours.
+>
+> 1. **The device check cannot precede the bridge wait.** Branch B originally read "Device check
+>    happens BEFORE any tunnel work". A cold-started worker has `activeDeviceId === null` until
+>    the page re-sends `LEM_ACTIVE_DEVICE`, so that ordering answers `409` to every request after
+>    every worker recycle — contradicting the cold-start worked example three paragraphs below,
+>    which expects the request to succeed. The check belongs immediately after `waitForBridge()`
+>    and immediately before the `LEM_FETCH`: waiting for the page puts nothing on the wire, so
+>    "no frame is sent on a mismatch" still holds, and "wrong device" is no longer conflated with
+>    "not told yet".
+> 2. **Branch C's `if binding is null: return` was unimplementable and contradicted step 6.**
+>    `event.respondWith()` must be called synchronously during dispatch, and resolution steps 3
+>    and 4 are `await`ed, so the decision to intercept cannot depend on the result. It also
+>    contradicted step 6 and §3.8, both of which say an unresolvable same-origin path is `421`.
+>    The "uncontrolled client → network" case it was reaching for is already structural: `/` is
+>    outside scope `/app/`, so an uncontrolled client's requests never reach this handler at all.
+> 3. **The grammar admits `.` and `..`.** `[A-Za-z0-9._-]` includes the dot, so `/app/../../x`
+>    parses as `deviceId = '..'`. A browser normalises that away before issuing a request, but the
+>    worker also parses referrers and stored records, where nothing has normalised anything. Both
+>    segments must reject the two dot segments explicitly — as must the server's `X-Lem-Service`
+>    validation, which uses the same character class.
 
 `resolveBindingForClient` runs these steps **in order** and stops at the first hit. Every step
 yields a `{deviceId, serviceId}` pair, never a bare service id — the device is part of the
@@ -343,7 +386,8 @@ arrive.
 | `LEM_BRIDGE_INIT` | page → SW | `[MessagePort]` transferred |
 | `LEM_BRIDGE_HELLO` | SW → all clients | broadcast on `activate`, asks pages to re-init |
 | `LEM_ACTIVE_DEVICE` | page → SW | `{ deviceId }` — sent on connect and on every device change, before any `LEM_SESSION_OPEN` |
-| `LEM_SESSION_OPEN` | page → SW | `{ deviceId, serviceId }` |
+| `LEM_SESSION_OPEN` | page → SW | `{ deviceId, serviceId, ackId? }` |
+| `LEM_SESSION_ACK` | SW → page | `{ ackId }` — the page awaits this before creating the iframe (§3.4) |
 | `LEM_SESSION_CLOSE` | page → SW | `{ deviceId, serviceId }` |
 | `LEM_TUNNEL_UP` / `LEM_TUNNEL_DOWN` | page → SW | `{}` |
 | `LEM_FETCH` | SW → page | `{ reqId, deviceId, serviceId, method, path, headers: [[k,v]…], body: ArrayBuffer \| null }`, plus a transferred reply `MessagePort`. The page re-checks `deviceId` against its own live tunnel and answers `LEM_RESPONSE_ERROR{E_DEVICE_MISMATCH}` on a mismatch — the SW's check is not the only one, because the page is the side that actually owns the tunnel. |
@@ -541,7 +585,17 @@ classes survive and become the bridge implementation.
 | Request whose `<deviceId>` ≠ the active tunnel's device (§3.1) | `409` `E_DEVICE_MISMATCH`. **Never re-routed to the active device.** | A stale iframe, worker, or IndexedDB binding must not have its requests silently redirected to a different machine. Fail visibly; the user can reload. |
 | Any request while `LEM_TUNNEL_DOWN` | `503`. | Fail fast instead of hanging. |
 | `event.request.mode === 'navigate'` targeting `/app/…` **in the top-level frame** | Allowed, but the SW sets `Content-Security-Policy: frame-ancestors 'self'` and the dashboard treats a top-level `/app/` load as a hard-reload of the whole session. | Opening a service in a new tab is a legitimate affordance. See §8.4 for what it costs. |
-| Upstream `Location:` on a 3xx | Rewritten: same-origin-to-upstream absolute URLs and root-relative paths are re-prefixed to `/app/<deviceId>/<serviceId>/…` — carrying the **same** device segment as the request being answered, never the active one; anything else is passed through verbatim. | Without this, a login redirect to `/auth/callback` escapes the prefix on the *next* navigation. PR #25 already stops the *server* from following redirects (`allow_redirects: False`), which is what makes this rewrite possible. |
+| Upstream `Location:` on a 3xx | Rewritten: root-relative paths, relative references, and **absolute loopback URLs** are re-prefixed to `/app/<deviceId>/<serviceId>/…` — carrying the **same** device segment as the request being answered, never the active one; anything else is passed through verbatim. | Without this, a login redirect to `/auth/callback` escapes the prefix on the *next* navigation. PR #25 already stops the *server* from following redirects (`allow_redirects: False`), which is what makes this rewrite possible. |
+
+> **Correction: "same-origin-to-upstream absolute URLs" was not implementable as written.** The
+> Service Worker never learns the upstream's origin — the service id is resolved to a port on the
+> *far* machine, by the far machine. What it does know is that every upstream this design can
+> reach is a loopback address (`services/status.py::_endpoint_for` builds
+> `http://127.0.0.1:<port>`), so "absolute loopback URL" is the same set, stated in terms the
+> worker can evaluate. It is also the set that *must* be rewritten rather than passed through:
+> handing a remote browser `http://127.0.0.1:33801/auth/callback` verbatim points it at its own
+> loopback, which is defect #1 of [#6](https://github.com/lem-app/lem/issues/6) reappearing one
+> redirect later.
 
 Response headers the SW **strips before constructing the `Response`**:
 `Content-Security-Policy` and `Content-Security-Policy-Report-Only` from the upstream (they
@@ -1186,6 +1240,18 @@ token stream is forwarded token-group by token-group. That is G4. Note `iter_chu
 - Keep everything else verbatim, including `Content-Type`, `Cache-Control`, `Set-Cookie`,
   `Location`.
 
+> **Open discrepancy found in Phase 4: `Set-Cookie` is being stripped, not kept.** The landed
+> `filter_response_headers` blocks `set-cookie` and `set-cookie2` via
+> `RESPONSE_BLOCKED_HEADERS` (`server/app/tunnel/http_proxy.py`), which directly contradicts the
+> line above and the duplicate-`Set-Cookie` rationale in §3.5. The consequence is concrete: **no
+> framed app can log in over the tunnel**, because its session cookie never reaches the browser.
+> Phase 4 does not depend on cookies — its criterion is that the document and its subresources
+> load — so this was left alone rather than silently relaxing a control another change
+> deliberately added. It must be resolved before Phase 5's "Open WebUI's socket.io session
+> establishes and a chat message round-trips" can pass, and the resolution needs an explicit
+> decision: either the header crosses (and §3.5's pair encoding earns its keep), or the spec stops
+> claiming it does.
+
 **Backpressure.** Before each chunk, if the transport's buffered amount exceeds
 `SEND_HIGH_WATER = 1 MiB`, await the low-water signal:
 
@@ -1673,6 +1739,15 @@ launch flow, `X-Lem-Service` on the wire, and the router's strict resolution pat
 
 **Depends on PR #45** for the device keypair (§6.1 item 2) — the `<deviceId>` in the path is the
 device the dashboard has authenticated to signaling, not a value it invents.
+
+> **Correction: this is a weaker dependency than it reads.** The `<deviceId>` segment is the
+> *target* device — the machine being connected to, chosen in `DeviceSelector` and already held
+> as `targetDeviceId` — not the browser's own device identity. PR #45 item 2 is about the
+> *browser's* keypair and its registration; it changes how the browser authenticates, not what
+> the path segment contains. Phase 4 therefore lands without #45, and the segment's value is
+> unaffected when #45 arrives. What Phase 4 does add is a validation: a device or service id that
+> would not survive the round trip through the URL (`[A-Za-z0-9._-]{1,64}`, and not `.`/`..`) is
+> refused with a visible error rather than concatenated into a path.
 
 **Acceptance criteria**
 
