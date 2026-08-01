@@ -427,11 +427,12 @@ env = {"DOCKER_HOST": "unix:///var/run/docker.sock"}  # Linux only
 
 ## 🔗 Related Docs
 
-- **Implementation guide**: [`../docs/implementation_plan.md`](./docs/implementation_plan.md)
-- **API contracts**: [`../docs/api.md`](./docs/api.md)
-- **Architecture**: [`../docs/architecture.md`](./docs/architecture.md)
-- **Platform guide**: [`../docs/platform.md`](./docs/platform.md)
-- **Testing**: [`../docs/testing_checklist.md`](./docs/testing_checklist.md)
+- **Architecture**: [`docs/architecture.md`](./docs/architecture.md)
+- **API contracts**: [`docs/api.md`](./docs/api.md)
+- **Platform guide**: [`docs/platform.md`](./docs/platform.md)
+- **Testing**: [`docs/testing_checklist.md`](./docs/testing_checklist.md)
+- **Implementation guide**: [`docs/implementation_plan.md`](./docs/implementation_plan.md)
+- **Tunnel proxy spec**: [`docs/tunnel-proxy-spec.md`](./docs/tunnel-proxy-spec.md)
 
 ---
 
