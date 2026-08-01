@@ -17,12 +17,12 @@
 Data models for the Harbor service catalog.
 """
 
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class ServiceCategory(str, Enum):
+class ServiceCategory(StrEnum):
     """Category of a Harbor service."""
 
     BACKEND = "backend"  # LLM inference engines (Ollama, vLLM, LocalAI)
@@ -30,7 +30,7 @@ class ServiceCategory(str, Enum):
     SATELLITE = "satellite"  # Tools & utilities (Aider, Langfuse, SearXNG)
 
 
-class ServiceStatus(str, Enum):
+class ServiceStatus(StrEnum):
     """Runtime status of a service."""
 
     NOT_INSTALLED = "not_installed"

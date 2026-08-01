@@ -5,7 +5,12 @@ description = "Lem cloud signaling server for WebRTC"
 license = {text = "AGPL-3.0-or-later"}
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115.0",
+    # >=0.122.0: earlier versions' HTTPBearer answered a missing Authorization
+    # header with 403. 401 is the correct code for absent credentials, and the
+    # remote dashboard's session interceptor keys on 401 to return to the login
+    # screen (web/remote/src/api/auth.ts), so a 403 there would leave the UI
+    # wedged rather than logged out.
+    "fastapi>=0.122.0",
     "uvicorn[standard]>=0.52.0",
     "python-jose[cryptography]>=3.5.0",
     # bcrypt is used directly. passlib 1.7.4 is unmaintained and probes

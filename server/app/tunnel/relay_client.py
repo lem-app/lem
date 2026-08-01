@@ -92,8 +92,19 @@ class RelayRejection:
         )
 
 
-class RelayConnectionState(str, Enum):
-    """Relay connection states."""
+class RelayConnectionState(str, Enum):  # noqa: UP042
+    """Relay connection states.
+
+    Deliberately NOT `StrEnum`. Members are interpolated bare (no `.value`) into
+    operator-facing log lines -- `_set_state()` logs
+    `f"RelayClient state change: {old_state} → {state}"` (this file), and
+    `webrtc_client.py::_on_relay_state_change` logs
+    `f"Relay state change: {state}"`. With `(str, Enum)` those render as
+    `RelayConnectionState.CONNECTED`; under `StrEnum` they would silently become
+    `connected`. Pydantic/JSON output goes through `.value` and is identical
+    either way, so the test suite cannot catch the difference -- only the logs
+    change. Convert only alongside an intentional update to those log lines.
+    """
 
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
