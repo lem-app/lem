@@ -27,7 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
 
 from ..core.config import settings
-from ..core.crypto import SIGNAL_CONTEXT, new_challenge, verify_signature
+from ..core.crypto import SIGNAL_CONTEXT, new_challenge, signed_message, verify_signature
 from ..core.errors import RETRYABLE_REASONS, ErrorReason
 from ..core.ratelimit import signal_connect_limiter
 from ..core.security import (
@@ -400,7 +400,7 @@ async def authenticate_connection(websocket: WebSocket) -> tuple[int, str] | Non
 
     signature = response.get("signature")
     if not isinstance(signature, str) or not verify_signature(
-        pubkey, SIGNAL_CONTEXT, auth_device_id, challenge, signature
+        pubkey, signature, signed_message(SIGNAL_CONTEXT, auth_device_id, challenge)
     ):
         logger.warning(f"Device key proof failed for {auth_device_id} (user {user_id})")
         await close_with_error(
