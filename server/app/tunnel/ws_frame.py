@@ -13,37 +13,50 @@
 # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 # Public License for more details.
 
-"""WebSocket-over-DataChannel frame serialization/deserialization.
+"""WebSocket-over-DataChannel frame serialization for tunnel protocol v3.
 
-Binary frame format for WebSocket CONNECT:
-- 1 byte: frame_type (0x10)
-- 4 bytes: connection_id (uint32)
-- 2 bytes: url_len (uint16)
-- url_len bytes: WebSocket URL (UTF-8)
-- 4 bytes: headers_len (uint32)
-- headers_len bytes: JSON headers
+Two changes from v2 (spec sections 5.3 and 5.4):
 
-Binary frame format for WebSocket DATA:
-- 1 byte: frame_type (0x11)
-- 4 bytes: connection_id (uint32)
-- 1 byte: opcode (0=continuation, 1=text, 2=binary, 8=close, 9=ping, 10=pong)
-- 4 bytes: payload_len (uint32)
-- payload_len bytes: WebSocket payload (raw bytes)
+* **The handshake is acknowledged.** v2 opened the upstream socket and told the
+  browser nothing, so ``ProxiedWebSocket`` sat in CONNECTING forever, ``onopen``
+  never fired, and every ``send()`` threw. ``WS_CONNECT_ACK`` (0x13) and
+  ``WS_CONNECT_ERROR`` (0x14) close that hole.
+* **WS_DATA carries a FIN flag**, so a message larger than the negotiated chunk
+  size can be fragmented and reassembled.
 
-Binary frame format for WebSocket CLOSE:
-- 1 byte: frame_type (0x12)
-- 4 bytes: connection_id (uint32)
-- 2 bytes: close_code (uint16)
-- 2 bytes: reason_len (uint16)
-- reason_len bytes: close reason (UTF-8)
+Layouts, all integers big-endian, connection_id always at bytes 1..4::
+
+    WS_CONNECT       0x10  type(1) connection_id(4) url_len(2) url
+                           headers_len(4) headers (JSON array of pairs)
+    WS_DATA          0x11  type(1) connection_id(4) opcode(1) flags(1)
+                           payload_len(4) payload
+    WS_CLOSE         0x12  type(1) connection_id(4) close_code(2)
+                           reason_len(2) reason
+    WS_CONNECT_ACK   0x13  type(1) connection_id(4) protocol_len(2) protocol
+    WS_CONNECT_ERROR 0x14  type(1) connection_id(4) error_code(2)
+                           reason_len(2) reason
 """
 
-import json
 import struct
 from enum import IntEnum
 from typing import TypedDict
 
-from .http_frame import FrameType
+from .errors import TunnelErrorCode, TunnelProtocolError
+from .http_frame import (
+    MAX_CHUNK_BYTES,
+    MAX_HEADERS_BYTES,
+    MAX_URL_BYTES,
+    FrameType,
+    HeaderList,
+    decode_headers,
+    encode_headers,
+)
+
+# Total bytes accepted across the fragments of one WebSocket message.
+MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# WS_DATA flag bits.
+FLAG_FIN = 0x01
 
 
 class WSOpcode(IntEnum):
@@ -62,7 +75,7 @@ class WSConnectFrame(TypedDict):
 
     connection_id: int
     url: str
-    headers: dict[str, str]
+    headers: HeaderList
 
 
 class WSDataFrame(TypedDict):
@@ -71,6 +84,7 @@ class WSDataFrame(TypedDict):
     connection_id: int
     opcode: int
     payload: bytes
+    fin: bool
 
 
 class WSCloseFrame(TypedDict):
@@ -81,37 +95,121 @@ class WSCloseFrame(TypedDict):
     reason: str
 
 
+class WSConnectAckFrame(TypedDict):
+    """Acknowledgement that the upstream socket is open."""
+
+    connection_id: int
+    protocol: str
+
+
+class WSConnectErrorFrame(TypedDict):
+    """Refusal of a WebSocket handshake."""
+
+    connection_id: int
+    error_code: int
+    reason: str
+
+
+def _malformed(message: str) -> TunnelProtocolError:
+    """Build a malformed-frame error.
+
+    Args:
+        message: Local-only detail
+
+    Returns:
+        Error carrying E_PROTO_MALFORMED
+    """
+    return TunnelProtocolError(TunnelErrorCode.E_PROTO_MALFORMED, message)
+
+
+def _require(data: bytes, offset: int, size: int, field: str) -> None:
+    """Assert the frame is long enough to read a field.
+
+    Args:
+        data: Raw frame bytes
+        offset: Read position
+        size: Bytes needed
+        field: Field name for the error message
+
+    Raises:
+        TunnelProtocolError: If the frame is too short
+    """
+    if len(data) < offset + size:
+        raise _malformed(f"Insufficient data for {field}")
+
+
+def _read_header(data: bytes, expected: FrameType) -> int:
+    """Validate the frame type and read the connection_id.
+
+    Args:
+        data: Raw frame bytes
+        expected: Frame type the caller is decoding
+
+    Returns:
+        The connection_id
+
+    Raises:
+        TunnelProtocolError: If the type is wrong or the id is 0
+    """
+    _require(data, 0, 1, "frame_type")
+    if data[0] != expected:
+        raise _malformed(f"Expected frame 0x{expected:02x}, got 0x{data[0]:02x}")
+
+    _require(data, 1, 4, "connection_id")
+    (connection_id,) = struct.unpack(">I", data[1:5])
+    if connection_id == 0:
+        raise _malformed("connection_id 0 is reserved")
+    return int(connection_id)
+
+
+def _read_text(data: bytes, offset: int, length: int, field: str) -> str:
+    """Read a UTF-8 field.
+
+    Args:
+        data: Raw frame bytes
+        offset: Read position
+        length: Byte length
+        field: Field name for the error message
+
+    Returns:
+        Decoded string
+
+    Raises:
+        TunnelProtocolError: If the frame is truncated or the bytes are not UTF-8
+    """
+    _require(data, offset, length, field)
+    try:
+        return data[offset : offset + length].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _malformed(f"{field} is not valid UTF-8") from exc
+
+
 def serialize_ws_connect(frame: WSConnectFrame) -> bytes:
-    """Serialize WebSocket CONNECT frame to binary.
+    """Serialize a WS_CONNECT frame.
 
     Args:
         frame: CONNECT frame to serialize
 
     Returns:
-        Binary frame as bytes
+        Binary frame
     """
-    # Encode strings to UTF-8
     url_bytes = frame["url"].encode("utf-8")
-    headers_bytes = json.dumps(frame["headers"]).encode("utf-8")
+    headers_bytes = encode_headers(frame["headers"])
 
-    # Pack binary frame
-    # Format: >B = big-endian unsigned byte (1 byte)
-    #         >I = big-endian unsigned int (4 bytes)
-    #         >H = big-endian unsigned short (2 bytes)
-    parts = [
-        struct.pack(">B", FrameType.WS_CONNECT),  # frame_type (uint8)
-        struct.pack(">I", frame["connection_id"]),  # connection_id (uint32)
-        struct.pack(">H", len(url_bytes)),  # url_len (uint16)
-        url_bytes,  # url
-        struct.pack(">I", len(headers_bytes)),  # headers_len (uint32)
-        headers_bytes,  # headers
-    ]
-
-    return b"".join(parts)
+    return b"".join(
+        [
+            struct.pack(">B", FrameType.WS_CONNECT),
+            struct.pack(">I", frame["connection_id"]),
+            struct.pack(">H", len(url_bytes)),
+            url_bytes,
+            struct.pack(">I", len(headers_bytes)),
+            headers_bytes,
+        ]
+    )
 
 
 def deserialize_ws_connect(data: bytes) -> WSConnectFrame:
-    """Deserialize binary frame to WebSocket CONNECT.
+    """Deserialize a WS_CONNECT frame.
 
     Args:
         data: Binary frame
@@ -120,155 +218,110 @@ def deserialize_ws_connect(data: bytes) -> WSConnectFrame:
         CONNECT frame
 
     Raises:
-        ValueError: If frame is malformed
+        TunnelProtocolError: If the frame is malformed or a length exceeds a cap
     """
-    offset = 0
+    connection_id = _read_header(data, FrameType.WS_CONNECT)
 
-    # Read frame_type (uint8) and validate
-    if len(data) < offset + 1:
-        raise ValueError("Insufficient data for frame_type")
-    (frame_type,) = struct.unpack(">B", data[offset : offset + 1])
-    offset += 1
+    _require(data, 5, 2, "url_len")
+    (url_len,) = struct.unpack(">H", data[5:7])
+    if url_len > MAX_URL_BYTES:
+        raise _malformed(f"URL too large: {url_len} > {MAX_URL_BYTES}")
+    url = _read_text(data, 7, url_len, "url")
+    offset = 7 + url_len
 
-    if frame_type != FrameType.WS_CONNECT:
-        raise ValueError(f"Expected WS_CONNECT frame (0x10), got 0x{frame_type:02x}")
-
-    # Read connection_id (uint32)
-    if len(data) < offset + 4:
-        raise ValueError("Insufficient data for connection_id")
-    (connection_id,) = struct.unpack(">I", data[offset : offset + 4])
-    offset += 4
-
-    # Read url_len (uint16) and url
-    if len(data) < offset + 2:
-        raise ValueError("Insufficient data for url_len")
-    (url_len,) = struct.unpack(">H", data[offset : offset + 2])
-    offset += 2
-
-    if len(data) < offset + url_len:
-        raise ValueError("Insufficient data for url")
-    url = data[offset : offset + url_len].decode("utf-8")
-    offset += url_len
-
-    # Read headers_len (uint32) and headers
-    if len(data) < offset + 4:
-        raise ValueError("Insufficient data for headers_len")
+    _require(data, offset, 4, "headers_len")
     (headers_len,) = struct.unpack(">I", data[offset : offset + 4])
     offset += 4
+    if headers_len > MAX_HEADERS_BYTES:
+        raise _malformed(f"Headers too large: {headers_len} > {MAX_HEADERS_BYTES}")
+    _require(data, offset, headers_len, "headers")
+    headers = decode_headers(data[offset : offset + headers_len])
 
-    if len(data) < offset + headers_len:
-        raise ValueError("Insufficient data for headers")
-    headers_json = data[offset : offset + headers_len].decode("utf-8")
-    headers: dict[str, str] = json.loads(headers_json)
-
-    return {
-        "connection_id": connection_id,
-        "url": url,
-        "headers": headers,
-    }
+    return {"connection_id": connection_id, "url": url, "headers": headers}
 
 
 def serialize_ws_data(frame: WSDataFrame) -> bytes:
-    """Serialize WebSocket DATA frame to binary.
+    """Serialize a WS_DATA frame.
 
     Args:
         frame: DATA frame to serialize
 
     Returns:
-        Binary frame as bytes
+        Binary frame
     """
-    payload_bytes = frame["payload"]
+    payload = frame["payload"]
+    return b"".join(
+        [
+            struct.pack(">B", FrameType.WS_DATA),
+            struct.pack(">I", frame["connection_id"]),
+            struct.pack(">B", frame["opcode"]),
+            struct.pack(">B", FLAG_FIN if frame["fin"] else 0),
+            struct.pack(">I", len(payload)),
+            payload,
+        ]
+    )
 
-    # Pack binary frame
-    parts = [
-        struct.pack(">B", FrameType.WS_DATA),  # frame_type (uint8)
-        struct.pack(">I", frame["connection_id"]),  # connection_id (uint32)
-        struct.pack(">B", frame["opcode"]),  # opcode (uint8)
-        struct.pack(">I", len(payload_bytes)),  # payload_len (uint32)
-        payload_bytes,  # payload
-    ]
 
-    return b"".join(parts)
-
-
-def deserialize_ws_data(data: bytes) -> WSDataFrame:
-    """Deserialize binary frame to WebSocket DATA.
+def deserialize_ws_data(data: bytes, max_chunk_bytes: int = MAX_CHUNK_BYTES) -> WSDataFrame:
+    """Deserialize a WS_DATA frame.
 
     Args:
         data: Binary frame
+        max_chunk_bytes: Effective per-frame cap for this channel
 
     Returns:
         DATA frame
 
     Raises:
-        ValueError: If frame is malformed
+        TunnelProtocolError: If the frame is malformed or the payload is oversized
     """
-    offset = 0
+    connection_id = _read_header(data, FrameType.WS_DATA)
 
-    # Read frame_type (uint8) and validate
-    if len(data) < offset + 1:
-        raise ValueError("Insufficient data for frame_type")
-    (frame_type,) = struct.unpack(">B", data[offset : offset + 1])
-    offset += 1
+    _require(data, 5, 6, "data header")
+    opcode = data[5]
+    flags = data[6]
+    (payload_len,) = struct.unpack(">I", data[7:11])
 
-    if frame_type != FrameType.WS_DATA:
-        raise ValueError(f"Expected WS_DATA frame (0x11), got 0x{frame_type:02x}")
+    # Before the slice: the length is peer-chosen and uint32-wide.
+    if payload_len > max_chunk_bytes:
+        raise TunnelProtocolError(
+            TunnelErrorCode.E_TOO_LARGE,
+            f"WebSocket payload too large: {payload_len} > {max_chunk_bytes}",
+        )
 
-    # Read connection_id (uint32)
-    if len(data) < offset + 4:
-        raise ValueError("Insufficient data for connection_id")
-    (connection_id,) = struct.unpack(">I", data[offset : offset + 4])
-    offset += 4
-
-    # Read opcode (uint8)
-    if len(data) < offset + 1:
-        raise ValueError("Insufficient data for opcode")
-    (opcode,) = struct.unpack(">B", data[offset : offset + 1])
-    offset += 1
-
-    # Read payload_len (uint32) and payload
-    if len(data) < offset + 4:
-        raise ValueError("Insufficient data for payload_len")
-    (payload_len,) = struct.unpack(">I", data[offset : offset + 4])
-    offset += 4
-
-    if len(data) < offset + payload_len:
-        raise ValueError("Insufficient data for payload")
-    payload = data[offset : offset + payload_len]
+    _require(data, 11, payload_len, "payload")
 
     return {
         "connection_id": connection_id,
-        "opcode": opcode,
-        "payload": payload,
+        "opcode": int(opcode),
+        "payload": data[11 : 11 + payload_len],
+        "fin": bool(flags & FLAG_FIN),
     }
 
 
 def serialize_ws_close(frame: WSCloseFrame) -> bytes:
-    """Serialize WebSocket CLOSE frame to binary.
+    """Serialize a WS_CLOSE frame.
 
     Args:
         frame: CLOSE frame to serialize
 
     Returns:
-        Binary frame as bytes
+        Binary frame
     """
-    # Encode reason to UTF-8
     reason_bytes = frame["reason"].encode("utf-8")
-
-    # Pack binary frame
-    parts = [
-        struct.pack(">B", FrameType.WS_CLOSE),  # frame_type (uint8)
-        struct.pack(">I", frame["connection_id"]),  # connection_id (uint32)
-        struct.pack(">H", frame["close_code"]),  # close_code (uint16)
-        struct.pack(">H", len(reason_bytes)),  # reason_len (uint16)
-        reason_bytes,  # reason
-    ]
-
-    return b"".join(parts)
+    return b"".join(
+        [
+            struct.pack(">B", FrameType.WS_CLOSE),
+            struct.pack(">I", frame["connection_id"]),
+            struct.pack(">H", frame["close_code"]),
+            struct.pack(">H", len(reason_bytes)),
+            reason_bytes,
+        ]
+    )
 
 
 def deserialize_ws_close(data: bytes) -> WSCloseFrame:
-    """Deserialize binary frame to WebSocket CLOSE.
+    """Deserialize a WS_CLOSE frame.
 
     Args:
         data: Binary frame
@@ -277,43 +330,103 @@ def deserialize_ws_close(data: bytes) -> WSCloseFrame:
         CLOSE frame
 
     Raises:
-        ValueError: If frame is malformed
+        TunnelProtocolError: If the frame is malformed
     """
-    offset = 0
+    connection_id = _read_header(data, FrameType.WS_CLOSE)
 
-    # Read frame_type (uint8) and validate
-    if len(data) < offset + 1:
-        raise ValueError("Insufficient data for frame_type")
-    (frame_type,) = struct.unpack(">B", data[offset : offset + 1])
-    offset += 1
-
-    if frame_type != FrameType.WS_CLOSE:
-        raise ValueError(f"Expected WS_CLOSE frame (0x12), got 0x{frame_type:02x}")
-
-    # Read connection_id (uint32)
-    if len(data) < offset + 4:
-        raise ValueError("Insufficient data for connection_id")
-    (connection_id,) = struct.unpack(">I", data[offset : offset + 4])
-    offset += 4
-
-    # Read close_code (uint16)
-    if len(data) < offset + 2:
-        raise ValueError("Insufficient data for close_code")
-    (close_code,) = struct.unpack(">H", data[offset : offset + 2])
-    offset += 2
-
-    # Read reason_len (uint16) and reason
-    if len(data) < offset + 2:
-        raise ValueError("Insufficient data for reason_len")
-    (reason_len,) = struct.unpack(">H", data[offset : offset + 2])
-    offset += 2
-
-    if len(data) < offset + reason_len:
-        raise ValueError("Insufficient data for reason")
-    reason = data[offset : offset + reason_len].decode("utf-8")
+    _require(data, 5, 4, "close header")
+    (close_code, reason_len) = struct.unpack(">HH", data[5:9])
+    reason = _read_text(data, 9, reason_len, "reason")
 
     return {
         "connection_id": connection_id,
-        "close_code": close_code,
+        "close_code": int(close_code),
+        "reason": reason,
+    }
+
+
+def serialize_ws_connect_ack(frame: WSConnectAckFrame) -> bytes:
+    """Serialize a WS_CONNECT_ACK frame.
+
+    Args:
+        frame: ACK frame to serialize
+
+    Returns:
+        Binary frame
+    """
+    protocol_bytes = frame["protocol"].encode("utf-8")
+    return b"".join(
+        [
+            struct.pack(">B", FrameType.WS_CONNECT_ACK),
+            struct.pack(">I", frame["connection_id"]),
+            struct.pack(">H", len(protocol_bytes)),
+            protocol_bytes,
+        ]
+    )
+
+
+def deserialize_ws_connect_ack(data: bytes) -> WSConnectAckFrame:
+    """Deserialize a WS_CONNECT_ACK frame.
+
+    Args:
+        data: Binary frame
+
+    Returns:
+        ACK frame
+
+    Raises:
+        TunnelProtocolError: If the frame is malformed
+    """
+    connection_id = _read_header(data, FrameType.WS_CONNECT_ACK)
+
+    _require(data, 5, 2, "protocol_len")
+    (protocol_len,) = struct.unpack(">H", data[5:7])
+    protocol = _read_text(data, 7, protocol_len, "protocol")
+
+    return {"connection_id": connection_id, "protocol": protocol}
+
+
+def serialize_ws_connect_error(frame: WSConnectErrorFrame) -> bytes:
+    """Serialize a WS_CONNECT_ERROR frame.
+
+    Args:
+        frame: ERROR frame to serialize
+
+    Returns:
+        Binary frame
+    """
+    reason_bytes = frame["reason"].encode("utf-8")
+    return b"".join(
+        [
+            struct.pack(">B", FrameType.WS_CONNECT_ERROR),
+            struct.pack(">I", frame["connection_id"]),
+            struct.pack(">H", frame["error_code"]),
+            struct.pack(">H", len(reason_bytes)),
+            reason_bytes,
+        ]
+    )
+
+
+def deserialize_ws_connect_error(data: bytes) -> WSConnectErrorFrame:
+    """Deserialize a WS_CONNECT_ERROR frame.
+
+    Args:
+        data: Binary frame
+
+    Returns:
+        ERROR frame
+
+    Raises:
+        TunnelProtocolError: If the frame is malformed
+    """
+    connection_id = _read_header(data, FrameType.WS_CONNECT_ERROR)
+
+    _require(data, 5, 4, "error header")
+    (error_code, reason_len) = struct.unpack(">HH", data[5:9])
+    reason = _read_text(data, 9, reason_len, "reason")
+
+    return {
+        "connection_id": connection_id,
+        "error_code": int(error_code),
         "reason": reason,
     }

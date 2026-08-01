@@ -13,10 +13,13 @@
 # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
 # Public License for more details.
 
-"""HTTP proxy handler for WebRTC DataChannel.
+"""Streaming HTTP proxy handler for the tunnel (protocol v3).
 
-Receives HTTP request frames over DataChannel, forwards them to the local
-Lem server or client UIs based on routing rules, and sends responses back over DataChannel.
+Receives request frames over the DataChannel or relay socket, forwards them to
+the local Lem server or a client UI, and *emits* response frames as the upstream
+produces bytes. v2 returned one blob per request, which meant nothing could
+stream and any response over the DataChannel's ~64 KiB message limit killed the
+channel.
 
 Everything in a request frame is chosen by the remote peer, so the path is
 validated and joined (never concatenated) onto the routed base URL, and the
@@ -28,10 +31,24 @@ The handler also presents the local server's own credentials upstream, which is
 only sound for a peer that has been authorized. It therefore refuses to proxy
 anything until :meth:`HTTPProxyHandler.authorize_peer` has been called with a
 peer that passed ``app.tunnel.peer_auth``.
+
+Body size is bounded by three independent layers (spec section 5.5.1), because
+v3 splits a body across an open-ended series of individually-legal chunks:
+
+1. ``http_frame.deserialize_*`` caps ``headers_len`` and ``path_len``.
+2. ``http_frame.deserialize_chunk`` caps one frame's ``payload_len``.
+3. :class:`RequestIntake` accumulates ``received`` across every chunk of one
+   ``request_id`` and is checked **before** each append. A per-frame check
+   cannot bound a multi-frame total; without this layer a peer sends unlimited
+   48 KiB chunks under one id and nothing rejects it.
 """
 
+import asyncio
 import json
 import logging
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -39,13 +56,27 @@ from yarl import URL
 
 from app.security import CLIENT_HEADER, get_api_token
 
-from .http_frame import HTTPRequestFrame, HTTPResponseFrame, deserialize_request, serialize_response
+from .errors import TunnelErrorCode, TunnelProtocolError
+from .http_frame import (
+    MAX_BODY_BYTES,
+    MAX_CHUNK_BYTES,
+    MAX_INFLIGHT_REQUESTS,
+    POST_CANCEL_DRAIN_BYTES,
+    HeaderList,
+    deserialize_cancel,
+    deserialize_chunk,
+    deserialize_request_head,
+    peek_request_id,
+    serialize_cancel,
+    serialize_response_chunk,
+    serialize_response_head,
+)
 from .peer_auth import UNVERIFIED_PEER_LABEL, unverified_peers_allowed
 from .router import RequestRouter, create_router_with_client_discovery
 
 logger = logging.getLogger(__name__)
 
-# Headers that describe a single hop and must not be forwarded (RFC 7230 §6.1),
+# Headers that describe a single hop and must not be forwarded (RFC 7230 6.1),
 # plus headers that would let a peer retarget or desynchronize the upstream
 # request (Host), and headers aiohttp must recompute for the body it sends.
 HOP_BY_HOP_HEADERS = frozenset(
@@ -95,6 +126,7 @@ MAX_PATH_LENGTH = 8192
 GENERIC_PROXY_ERROR = "Proxy error"
 GENERIC_GATEWAY_ERROR = "Bad gateway"
 GENERIC_PEER_UNAUTHORIZED = "Peer not authorized"
+GENERIC_TOO_LARGE = "Payload too large"
 
 
 def validate_path(path: str) -> str:
@@ -150,42 +182,44 @@ def build_target_url(base_url: str, path: str) -> URL:
     return url
 
 
-def filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
+def filter_request_headers(headers: Iterable[tuple[str, str]]) -> HeaderList:
     """Drop hop-by-hop and proxy-controlled headers from a peer's request.
 
     Args:
-        headers: Peer-supplied headers
+        headers: Peer-supplied header pairs, in order
 
     Returns:
-        Headers safe to forward upstream
+        Header pairs safe to forward upstream, order and duplicates preserved
     """
-    return {
-        name: value
-        for name, value in headers.items()
+    return [
+        (name, value)
+        for name, value in headers
         if name.lower() not in HOP_BY_HOP_HEADERS and name.lower() not in PROXY_CONTROLLED_HEADERS
-    }
+    ]
 
 
-def filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
+def filter_response_headers(headers: Iterable[tuple[str, str]]) -> HeaderList:
     """Drop hop-by-hop and upstream-state headers before relaying to the peer.
 
     The mirror of :func:`filter_request_headers`: without it the peer receives
     whatever the upstream sent, including cookies and internal debug headers.
 
+    Takes pairs rather than a mapping, and is fed from aiohttp's ``CIMultiDict``
+    via ``.items()``. ``dict(response.headers)`` - what v2 did - collapses every
+    repeated header to its last value.
+
     Args:
-        headers: Upstream response headers
+        headers: Upstream response header pairs, in order
 
     Returns:
-        Headers safe to relay back over the tunnel
+        Header pairs safe to relay back over the tunnel
     """
-    return {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in RESPONSE_BLOCKED_HEADERS
-    }
+    return [
+        (name, value) for name, value in headers if name.lower() not in RESPONSE_BLOCKED_HEADERS
+    ]
 
 
-def error_body(message: str) -> str:
+def error_body(message: str) -> bytes:
     """Build a JSON error body.
 
     Uses json.dumps so a message containing a quote or backslash cannot break
@@ -195,31 +229,69 @@ def error_body(message: str) -> str:
         message: Client-facing message
 
     Returns:
-        JSON document as a string
+        JSON document as UTF-8 bytes
     """
-    return json.dumps({"error": message})
+    return json.dumps({"error": message}).encode("utf-8")
+
+
+@dataclass
+class RequestIntake:
+    """Partially-received request, one per in-flight ``request_id``.
+
+    ``received`` is the accumulator of spec section 5.5.1: the running total of
+    payload bytes across every chunk of this request. It is checked *before*
+    each append, so the frame that breaches the cap is never retained and peak
+    memory for one id is ``MAX_BODY_BYTES + MAX_CHUNK_BYTES``.
+    """
+
+    method: str
+    path: str
+    headers: HeaderList
+    chunks: list[bytes] = field(default_factory=list)
+    received: int = 0
 
 
 class HTTPProxyHandler:
-    """HTTP proxy handler for DataChannel messages.
+    """Streaming HTTP proxy handler for tunnel frames.
 
-    Forwards HTTP requests to local server or client UIs based on routing rules.
+    Forwards HTTP requests to the local server or client UIs based on routing
+    rules, and emits ``HTTP_RESPONSE_HEAD`` + ``HTTP_RESPONSE_CHUNK`` frames as
+    the upstream produces bytes.
     """
 
     def __init__(
         self,
         local_server_url: str = "http://localhost:5142",
         router: RequestRouter | None = None,
+        send_frame: Callable[[bytes], Awaitable[None]] | None = None,
+        close_channel: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize HTTP proxy handler.
 
         Args:
             local_server_url: Base URL of local Lem server (used if router not provided)
             router: Optional custom router for advanced routing logic
+            send_frame: Async callable that puts one frame on the transport
+            close_channel: Async callable that closes the channel with a code
+                and reason, for peer-behaviour violations
         """
         self.local_server_url = local_server_url.rstrip("/")
         self.router = router or create_router_with_client_discovery(local_server_url)
         self.session: aiohttp.ClientSession | None = None
+        self.send_frame = send_frame
+        self.close_channel = close_channel
+
+        # Negotiated limits. Defaults stand until HELLO says otherwise; a peer
+        # enforces its own caps regardless of what the other side advertised.
+        self.effective_max_chunk = MAX_CHUNK_BYTES
+        self.peer_max_body_bytes = MAX_BODY_BYTES
+
+        # In-flight state, all bounded by MAX_INFLIGHT_REQUESTS.
+        self.intakes: dict[int, RequestIntake] = {}
+        self.tasks: dict[int, asyncio.Task[None]] = {}
+        # request_id -> bytes seen since teardown. Ordered so the oldest entry
+        # is the one evicted when the map is full.
+        self.tombstoned: OrderedDict[int, int] = OrderedDict()
 
         # No peer is trusted until one is authorized. The escape hatch is the
         # only way this starts out non-None.
@@ -250,82 +322,220 @@ class HTTPProxyHandler:
             logger.info(f"Tunnel proxy no longer authorized for peer {self.authorized_peer}")
         self.authorized_peer = UNVERIFIED_PEER_LABEL if unverified_peers_allowed() else None
 
+    def set_send_frame(self, send_frame: Callable[[bytes], Awaitable[None]]) -> None:
+        """Point the handler at a transport.
+
+        Args:
+            send_frame: Async callable that puts one frame on the transport
+        """
+        self.send_frame = send_frame
+
+    def negotiate_limits(self, peer_max_chunk_bytes: int, peer_max_body_bytes: int) -> None:
+        """Apply the peer's advertised limits from HELLO.
+
+        Both are clamped with ``min``: a peer may only lower what this side
+        accepts, never raise it.
+
+        Args:
+            peer_max_chunk_bytes: Largest chunk the peer will accept
+            peer_max_body_bytes: Largest total body the peer will accept
+        """
+        self.effective_max_chunk = max(1, min(MAX_CHUNK_BYTES, peer_max_chunk_bytes))
+        self.peer_max_body_bytes = min(MAX_BODY_BYTES, peer_max_body_bytes)
+        logger.info(
+            f"Negotiated tunnel limits: chunk={self.effective_max_chunk} "
+            f"body={self.peer_max_body_bytes}"
+        )
+
     async def start(self) -> None:
         """Start the proxy handler (create HTTP session)."""
         self.session = aiohttp.ClientSession()
         logger.info(f"HTTP proxy handler started (target: {self.local_server_url})")
 
     async def stop(self) -> None:
-        """Stop the proxy handler (close HTTP session)."""
+        """Stop the proxy handler (cancel work, close HTTP session)."""
+        for task in list(self.tasks.values()):
+            task.cancel()
+        self.tasks.clear()
+        self.intakes.clear()
+        self.tombstoned.clear()
+
         if self.session and not self.session.closed:
             await self.session.close()
             self.session = None
         logger.info("HTTP proxy handler stopped")
 
-    async def handle_request(self, data: bytes) -> bytes:
-        """Handle incoming HTTP request frame.
+    # -- frame ingress ------------------------------------------------------
+
+    async def handle_request_head(self, data: bytes) -> None:
+        """Handle an HTTP_REQUEST_HEAD frame.
 
         Args:
-            data: Binary request frame
-
-        Returns:
-            Binary response frame
-
-        Raises:
-            RuntimeError: If session is not started
+            data: Binary frame
         """
         if self.session is None:
             raise RuntimeError("HTTP session not started")
 
         try:
-            # Deserialize request
-            request_frame = deserialize_request(data)
-            logger.info(
-                f"Received request {request_frame['request_id']}: "
-                f"{request_frame['method']} {request_frame['path']}"
+            frame = deserialize_request_head(data)
+        except TunnelProtocolError as exc:
+            await self._fail_undecodable(data, exc)
+            return
+
+        request_id = frame["request_id"]
+
+        if request_id in self.intakes or request_id in self.tasks:
+            logger.warning(f"Duplicate HTTP_REQUEST_HEAD for request {request_id}")
+            await self._fail_request(
+                request_id, 502, GENERIC_PROXY_ERROR, TunnelErrorCode.E_PROTO_MALFORMED
             )
+            return
 
-            # Forward to local server
-            response_frame = await self._forward_request(request_frame)
-
-            # Serialize response
-            response_data = serialize_response(response_frame)
-            logger.info(
-                f"Sent response {response_frame['request_id']}: {response_frame['status_code']}"
+        # Peer-chosen ids: an unbounded map is an unbounded memory commitment.
+        if len(self.intakes) + len(self.tasks) >= MAX_INFLIGHT_REQUESTS:
+            logger.error(
+                f"Peer exceeded MAX_INFLIGHT_REQUESTS ({MAX_INFLIGHT_REQUESTS}); closing channel"
             )
+            await self._fail_request(
+                request_id, 502, GENERIC_TOO_LARGE, TunnelErrorCode.E_TOO_LARGE
+            )
+            await self._close_channel(4006, "too many in-flight requests")
+            return
 
-            return response_data
+        logger.info(f"Received request {request_id}: {frame['method']} {frame['path']}")
 
-        except Exception as e:
-            logger.error(f"Error handling request: {e}")
-            # Return error response (details stay in the log, not in the frame)
-            error_frame: HTTPResponseFrame = {
-                "request_id": 0,  # Will be overwritten if we can parse request_id
-                "status_code": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": error_body(GENERIC_PROXY_ERROR),
-            }
+        intake = RequestIntake(
+            method=frame["method"],
+            path=frame["path"],
+            headers=frame["headers"],
+        )
 
-            # Try to extract request_id for proper correlation
-            try:
-                import struct
+        if not frame["body_follows"]:
+            await self._dispatch(request_id, intake)
+            return
 
-                if len(data) >= 4:
-                    (request_id,) = struct.unpack(">I", data[:4])
-                    error_frame["request_id"] = request_id
-            except Exception:
-                pass
+        self.intakes[request_id] = intake
 
-            return serialize_response(error_frame)
-
-    async def _forward_request(self, request_frame: HTTPRequestFrame) -> HTTPResponseFrame:
-        """Forward HTTP request to appropriate target (local server or client).
+    async def handle_request_chunk(self, data: bytes) -> None:
+        """Handle an HTTP_REQUEST_CHUNK frame.
 
         Args:
-            request_frame: Deserialized request
+            data: Binary frame
+        """
+        try:
+            frame = deserialize_chunk(data, self.effective_max_chunk)
+        except TunnelProtocolError as exc:
+            await self._fail_undecodable(data, exc)
+            return
 
-        Returns:
-            Response frame
+        request_id = frame["request_id"]
+        payload = frame["payload"]
+
+        # 0. A chunk for an id we already tore down: count it, never buffer it.
+        if request_id in self.tombstoned:
+            self.tombstoned[request_id] += len(payload)
+            self.tombstoned.move_to_end(request_id)
+            if self.tombstoned[request_id] > POST_CANCEL_DRAIN_BYTES:
+                logger.error(
+                    f"Peer kept streaming {self.tombstoned[request_id]} bytes on cancelled "
+                    f"request {request_id}; closing channel"
+                )
+                del self.tombstoned[request_id]
+                await self._close_channel(4006, "peer ignored cancellation")
+                return
+            if frame["final"]:
+                del self.tombstoned[request_id]
+            return
+
+        intake = self.intakes.get(request_id)
+        if intake is None:
+            # A CHUNK with no preceding HEAD is malformed, not merely unknown.
+            logger.warning(f"HTTP_REQUEST_CHUNK for unknown request {request_id}")
+            await self._fail_request(
+                request_id, 502, GENERIC_PROXY_ERROR, TunnelErrorCode.E_PROTO_MALFORMED
+            )
+            return
+
+        # 1. THE CHECK. Before the append, on the running total, not this frame.
+        if intake.received + len(payload) > self.peer_max_body_bytes:
+            await self._reject_oversize(request_id, intake, len(payload))
+            return
+
+        # 2. Only now is it safe to retain the bytes.
+        intake.received += len(payload)
+        intake.chunks.append(payload)
+
+        if frame["final"]:
+            del self.intakes[request_id]
+            await self._dispatch(request_id, intake)
+
+    async def handle_cancel(self, data: bytes) -> None:
+        """Handle an HTTP_CANCEL frame from the peer.
+
+        Args:
+            data: Binary frame
+        """
+        try:
+            frame = deserialize_cancel(data)
+        except TunnelProtocolError as exc:
+            logger.warning(f"Undecodable HTTP_CANCEL: {exc}")
+            return
+
+        request_id = frame["request_id"]
+        logger.info(f"Peer cancelled request {request_id} (reason {frame['reason_code']})")
+
+        self.intakes.pop(request_id, None)
+        task = self.tasks.pop(request_id, None)
+        if task is not None:
+            task.cancel()
+        self._tombstone(request_id)
+
+    # -- dispatch and egress ------------------------------------------------
+
+    async def _dispatch(self, request_id: int, intake: RequestIntake) -> None:
+        """Start forwarding a fully-received request.
+
+        Args:
+            request_id: Exchange id
+            intake: Received request
+        """
+        task = asyncio.create_task(self._stream_response(request_id, intake))
+        self.tasks[request_id] = task
+
+    async def _stream_response(self, request_id: int, intake: RequestIntake) -> None:
+        """Forward one request upstream and stream the response back.
+
+        Args:
+            request_id: Exchange id
+            intake: Fully-received request
+        """
+        try:
+            await self._forward_request(request_id, intake)
+        except asyncio.CancelledError:
+            logger.info(f"Request {request_id} cancelled")
+            raise
+        except aiohttp.ClientError as exc:
+            logger.error(f"HTTP client error: {exc}")
+            await self._fail_request(
+                request_id, 502, GENERIC_GATEWAY_ERROR, TunnelErrorCode.E_UPSTREAM
+            )
+        except Exception as exc:
+            logger.error(f"Unexpected error forwarding request: {exc}")
+            await self._fail_request(
+                request_id, 500, GENERIC_PROXY_ERROR, TunnelErrorCode.E_INTERNAL
+            )
+        finally:
+            self.tasks.pop(request_id, None)
+
+    async def _forward_request(self, request_id: int, intake: RequestIntake) -> None:
+        """Forward a request upstream, emitting response frames as bytes arrive.
+
+        Args:
+            request_id: Exchange id
+            intake: Fully-received request
+
+        Raises:
+            RuntimeError: If the HTTP session is not started
         """
         if self.session is None:
             raise RuntimeError("HTTP session not started")
@@ -335,41 +545,31 @@ class HTTPProxyHandler:
         # must not get to use it at all.
         if self.authorized_peer is None:
             logger.warning(
-                f"Refused tunnel request from an unauthorized peer: "
-                f"{request_frame['method']} {request_frame['path']!r}"
+                f"Refused tunnel request from an unauthorized peer: {intake.method} {intake.path!r}"
             )
-            return {
-                "request_id": request_frame["request_id"],
-                "status_code": 403,
-                "headers": {"Content-Type": "application/json"},
-                "body": error_body(GENERIC_PEER_UNAUTHORIZED),
-            }
+            await self._fail_request(request_id, 403, GENERIC_PEER_UNAUTHORIZED)
+            return
 
         # Use router to determine target
-        target_url = self.router.route(request_frame["path"])
+        target_url = self.router.route(intake.path)
 
         # Build full URL from a validated path (never string concatenation)
         try:
-            url = build_target_url(target_url, request_frame["path"])
-        except ValueError as e:
-            logger.warning(f"Rejected proxy request path {request_frame['path']!r}: {e}")
-            return {
-                "request_id": request_frame["request_id"],
-                "status_code": 400,
-                "headers": {"Content-Type": "application/json"},
-                "body": error_body("Invalid request path"),
-            }
+            url = build_target_url(target_url, intake.path)
+        except ValueError as exc:
+            logger.warning(f"Rejected proxy request path {intake.path!r}: {exc}")
+            await self._fail_request(request_id, 400, "Invalid request path")
+            return
 
-        headers = filter_request_headers(request_frame["headers"])
+        headers = filter_request_headers(intake.headers)
         # The peer got past the authorization gate above, so the tunnel may
         # present the local server's own credentials on its behalf.
         if str(url.origin()) == str(URL(self.local_server_url).origin()):
-            headers[CLIENT_HEADER] = "lem-tunnel"
+            headers.append((CLIENT_HEADER, "lem-tunnel"))
             token = get_api_token()
             if token is not None:
-                headers["Authorization"] = f"Bearer {token}"
+                headers.append(("Authorization", f"Bearer {token}"))
 
-        # Prepare request parameters
         kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": aiohttp.ClientTimeout(total=30),
@@ -378,45 +578,158 @@ class HTTPProxyHandler:
             "allow_redirects": False,
         }
 
-        # Add body if present
-        if request_frame["body"]:
-            kwargs["data"] = request_frame["body"]
+        body = b"".join(intake.chunks)
+        if body:
+            kwargs["data"] = body
 
-        try:
-            # Make request to local server
-            async with self.session.request(request_frame["method"], url, **kwargs) as response:
-                # Read response body
-                body = await response.text()
+        cap = min(MAX_BODY_BYTES, self.peer_max_body_bytes)
 
-                # Convert headers to dict, dropping what must not cross back
-                headers = filter_response_headers(dict(response.headers))
+        async with self.session.request(intake.method, url, **kwargs) as response:
+            # The clean case: an over-cap response is refused before a byte of
+            # it is streamed.
+            declared = response.content_length
+            if declared is not None and declared > cap:
+                logger.warning(
+                    f"Upstream declared {declared} bytes for request {request_id} "
+                    f"({intake.method} {intake.path}), over the {cap} byte cap"
+                )
+                await self._fail_request(
+                    request_id, 502, GENERIC_TOO_LARGE, TunnelErrorCode.E_TOO_LARGE
+                )
+                return
 
-                # Create response frame
-                response_frame: HTTPResponseFrame = {
-                    "request_id": request_frame["request_id"],
-                    "status_code": response.status,
-                    "headers": headers,
-                    "body": body,
+            await self._send(
+                serialize_response_head(
+                    {
+                        "request_id": request_id,
+                        "status_code": response.status,
+                        "headers": filter_response_headers(response.headers.items()),
+                        "body_follows": True,
+                    }
+                )
+            )
+
+            sent = 0
+            async for chunk in response.content.iter_chunked(self.effective_max_chunk):
+                sent += len(chunk)
+                if sent > cap:
+                    # Status 200 is already committed; the only honest ending is
+                    # a failure. No FINAL chunk - that would tell the peer the
+                    # body was complete, which is silent truncation.
+                    response.close()
+                    await self._send(serialize_cancel(request_id, TunnelErrorCode.E_TOO_LARGE))
+                    logger.warning(
+                        f"Upstream streamed past the {cap} byte cap for request {request_id} "
+                        f"({intake.method} {intake.path}); cancelled at {sent} bytes"
+                    )
+                    return
+                await self._send(serialize_response_chunk(request_id, chunk, final=False))
+
+            await self._send(serialize_response_chunk(request_id, b"", final=True))
+            logger.info(f"Sent response {request_id}: {response.status} ({sent} bytes)")
+
+    # -- failure paths ------------------------------------------------------
+
+    async def _fail_request(
+        self,
+        request_id: int,
+        status_code: int,
+        message: str,
+        reason_code: TunnelErrorCode | None = None,
+    ) -> None:
+        """Answer one exchange with a generic error body.
+
+        Args:
+            request_id: Exchange id
+            status_code: HTTP status to report
+            message: Generic client-facing message
+            reason_code: Optional cancel reason to follow the response with
+        """
+        await self._send(
+            serialize_response_head(
+                {
+                    "request_id": request_id,
+                    "status_code": status_code,
+                    "headers": [("Content-Type", "application/json")],
+                    "body_follows": True,
                 }
+            )
+        )
+        await self._send(serialize_response_chunk(request_id, error_body(message), final=True))
+        if reason_code is not None:
+            # Response frames first, so a peer that stops reading on CANCEL
+            # still gets a diagnosable answer.
+            await self._send(serialize_cancel(request_id, reason_code))
 
-                return response_frame
+    async def _fail_undecodable(self, data: bytes, exc: TunnelProtocolError) -> None:
+        """Answer a frame that failed to decode.
 
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP client error: {e}")
-            # Return 502 Bad Gateway (details stay in the log)
-            return {
-                "request_id": request_frame["request_id"],
-                "status_code": 502,
-                "headers": {"Content-Type": "application/json"},
-                "body": error_body(GENERIC_GATEWAY_ERROR),
-            }
+        Args:
+            data: The raw frame
+            exc: The decode failure
+        """
+        request_id = peek_request_id(data)
+        logger.warning(f"Rejected malformed frame: {exc}")
+        if request_id is None or request_id == 0:
+            # Undiagnosable: an error addressed to id 0 would be dropped by the
+            # peer anyway, and inventing an id is worse than saying nothing.
+            return
+        await self._fail_request(request_id, exc.http_status, GENERIC_PROXY_ERROR, exc.code)
 
-        except Exception as e:
-            logger.error(f"Unexpected error forwarding request: {e}")
-            # Return 500 Internal Server Error (details stay in the log)
-            return {
-                "request_id": request_frame["request_id"],
-                "status_code": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": error_body(GENERIC_PROXY_ERROR),
-            }
+    async def _reject_oversize(self, request_id: int, intake: RequestIntake, incoming: int) -> None:
+        """Refuse a request whose accumulated body breached the cap.
+
+        No upstream request is issued: the local service never sees a byte of an
+        over-cap body, which is the second reason this control matters.
+
+        Args:
+            request_id: Exchange id
+            intake: The partial request, dropped here
+            incoming: Size of the frame that breached the cap
+        """
+        logger.warning(
+            f"Request {request_id} ({intake.method} {intake.path}) exceeded "
+            f"MAX_BODY_BYTES: {intake.received} received + {incoming} incoming > "
+            f"{self.peer_max_body_bytes} (peer: {self.authorized_peer})"
+        )
+        # Reclaim at rejection time, not at garbage-collection time.
+        self.intakes.pop(request_id, None)
+        await self._fail_request(request_id, 502, GENERIC_TOO_LARGE, TunnelErrorCode.E_TOO_LARGE)
+        self._tombstone(request_id)
+
+    def _tombstone(self, request_id: int) -> None:
+        """Mark an id as torn down so later chunks are dropped, not buffered.
+
+        Args:
+            request_id: Exchange id
+        """
+        self.tombstoned[request_id] = 0
+        self.tombstoned.move_to_end(request_id)
+        while len(self.tombstoned) > MAX_INFLIGHT_REQUESTS:
+            # An evicted id simply behaves as a malformed chunk afterwards.
+            self.tombstoned.popitem(last=False)
+
+    # -- transport ----------------------------------------------------------
+
+    async def _send(self, data: bytes) -> None:
+        """Put one frame on the transport.
+
+        Args:
+            data: Binary frame
+        """
+        if self.send_frame is None:
+            logger.warning("Cannot send frame: no transport attached to the HTTP proxy")
+            return
+        await self.send_frame(data)
+
+    async def _close_channel(self, code: int, reason: str) -> None:
+        """Close the whole channel after a peer-behaviour violation.
+
+        Args:
+            code: WebSocket-space close code
+            reason: Generic reason
+        """
+        if self.close_channel is None:
+            logger.error(f"Channel close requested ({code} {reason}) but no closer is attached")
+            return
+        await self.close_channel(code, reason)
