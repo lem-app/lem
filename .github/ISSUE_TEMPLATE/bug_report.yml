@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+
+name: Bug report
+description: Something is broken or behaving unexpectedly
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Please do not report security vulnerabilities here.** Email
+        blake@lem.gg instead — see [CONTRIBUTING.md](https://github.com/lem-app/lem/blob/main/CONTRIBUTING.md#-security-issues).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched [existing issues](https://github.com/lem-app/lem/issues?q=is%3Aissue) and this is not a duplicate
+          required: true
+        - label: This is not a security vulnerability (those go to blake@lem.gg)
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of Lem is affected? Pick the closest match.
+      options:
+        - "server/ — local FastAPI server"
+        - "cloud/signaling/ — WebRTC signaling"
+        - "cloud/relay/ — WebSocket relay"
+        - "web/local/ — local dashboard"
+        - "web/remote/ — remote dashboard"
+        - "Remote access / connectivity (WebRTC, relay, tunnel)"
+        - "Docker / Harbor service management"
+        - "Install, setup, or deployment"
+        - "Documentation"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: |
+        Clicking "Start" on Open WebUI spins forever and the service never
+        reaches the running state.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Be as specific as you can — exact commands help enormously.
+      placeholder: |
+        1. Run `uv run uvicorn app.main:app --port 5142` in server/
+        2. Open http://localhost:5174
+        3. Click "Start" on the Open WebUI card
+        4. Observe the spinner never resolves
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+        - Windows (WSL2)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Lem version / commit
+      description: Release tag, or `git rev-parse --short HEAD` if running from source.
+      placeholder: "v0.1.0 or 28baea7"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment details
+      description: |
+        Versions of the relevant tooling. Paste the output of whichever apply:
+        `python3 --version`, `uv --version`, `node --version`, `pnpm --version`,
+        `docker --version`.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Server output, browser console errors, or `docker logs` for the failing
+        container. This is automatically formatted as code — no backticks needed.
+
+        Please redact tokens, JWTs, and device keys before pasting.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, workarounds you found, or hunches about the cause.
+    validations:
+      required: false

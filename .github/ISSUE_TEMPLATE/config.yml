@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+#
+# Routes anything that is not a bug or feature request away from the issue
+# tracker. `blank_issues_enabled: false` keeps drive-by issues from bypassing
+# the templates above.
+
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/lem-app/lem/blob/main/CONTRIBUTING.md#-security-issues
+    about: Do not open a public issue. Email blake@lem.gg — we respond within 48 hours.
+
+  - name: Question or general discussion
+    url: https://github.com/lem-app/lem/discussions
+    about: Setup help, ideas, and anything that is not yet a concrete bug or request.
+
+  - name: Discord
+    url: https://discord.gg/xY4XXKJDZZ
+    about: Chat with the community and the maintainers.
+
+  - name: Contributing guide
+    url: https://github.com/lem-app/lem/blob/main/CONTRIBUTING.md
+    about: Dev setup, coding standards, and the DCO sign-off requirement.
