@@ -14,14 +14,13 @@
 // Public License for more details.
 
 /**
- * WebSocket proxy over WebRTC DataChannel.
+ * WebSocket proxy over the tunnel transport.
  *
  * Provides a WebSocket-like API that proxies connections through the
- * DataChannel to the local server.
+ * active transport (WebRTC DataChannel or relay WebSocket) to the local server.
  */
 
-import type { WebRTCConnectionManager } from './webrtc'
-import type { RelayClient } from './relay-client'
+import type { Transport } from './proxy-fetch'
 import {
   serializeWSConnect,
   serializeWSData,
@@ -49,7 +48,7 @@ export type ProxiedWSStateValue = (typeof ProxiedWSState)[keyof typeof ProxiedWS
 /**
  * Proxied WebSocket connection.
  *
- * Mimics the WebSocket API but tunnels over DataChannel.
+ * Mimics the WebSocket API but tunnels over the active transport.
  */
 export class ProxiedWebSocket implements EventTarget {
   // WebSocket API compatibility
@@ -62,8 +61,8 @@ export class ProxiedWebSocket implements EventTarget {
   private connectionId: number
   private _readyState: ProxiedWSStateValue = ProxiedWSState.CONNECTING
   private _url: string
-  private _protocol: string = ''
-  private _extensions: string = ''
+  private _protocol = ''
+  private _extensions = ''
   private _binaryType: BinaryType = 'blob'
 
   // Event handlers (WebSocket API)
@@ -73,19 +72,30 @@ export class ProxiedWebSocket implements EventTarget {
   public onclose: ((ev: CloseEvent) => void) | null = null
 
   // EventTarget implementation
-  private eventListeners: Map<string, Set<EventListenerOrEventListenerObject>> = new Map()
+  private eventListeners = new Map<string, Set<EventListenerOrEventListenerObject>>()
 
-  // WebRTC connection
-  private webrtc: WebRTCConnectionManager
+  // Tunnel transport
+  private transport: Transport
+
+  /**
+   * Tail of the outbound send chain, or null when nothing is in flight.
+   *
+   * Blob payloads have to be read asynchronously. Firing `.arrayBuffer().then()`
+   * and forgetting about it (the previous behaviour) both floated a rejection
+   * and let a later string `send()` overtake an earlier Blob one. Chaining keeps
+   * frames in call order; the chain is skipped entirely for the common case
+   * where nothing is pending and the payload is already an ArrayBuffer.
+   */
+  private sendQueue: Promise<void> | null = null
 
   constructor(
     url: string,
     protocols: string | string[] | undefined,
-    webrtc: WebRTCConnectionManager,
+    transport: Transport,
     connectionId: number
   ) {
     this._url = url
-    this.webrtc = webrtc
+    this.transport = transport
     this.connectionId = connectionId
 
     // Normalize protocols
@@ -95,8 +105,14 @@ export class ProxiedWebSocket implements EventTarget {
       this._protocol = protocols[0] // Use first protocol
     }
 
-    // Send WS_CONNECT frame
-    this.sendConnectFrame()
+    // Send WS_CONNECT frame *after* the current task, so a caller doing
+    //   const ws = new WebSocket(url); ws.onerror = handler
+    // still sees a synchronous failure. Dispatching from the constructor meant
+    // the handler was assigned too late to ever fire - the real WebSocket never
+    // does that.
+    queueMicrotask(() => {
+      this.sendConnectFrame()
+    })
   }
 
   // WebSocket API properties
@@ -130,6 +146,13 @@ export class ProxiedWebSocket implements EventTarget {
   }
 
   /**
+   * Swap the underlying transport (used when falling back to the relay).
+   */
+  setTransport(transport: Transport): void {
+    this.transport = transport
+  }
+
+  /**
    * Send WS_CONNECT frame to establish connection.
    */
   private sendConnectFrame(): void {
@@ -143,12 +166,12 @@ export class ProxiedWebSocket implements EventTarget {
         },
       })
 
-      if (this.webrtc.getDataChannelState() !== 'open') {
-        this.handleError(new Error('DataChannel not open'))
+      if (!this.transport.isOpen()) {
+        this.handleError(new Error('Tunnel transport not open'))
         return
       }
 
-      this.webrtc.sendData(frame)
+      this.transport.sendData(frame)
       console.log(`[WSProxy] Sent WS_CONNECT for connection ${this.connectionId}: ${this._url}`)
     } catch (error) {
       this.handleError(error instanceof Error ? error : new Error(String(error)))
@@ -163,26 +186,62 @@ export class ProxiedWebSocket implements EventTarget {
       throw new Error('WebSocket is not open')
     }
 
-    // Convert data to ArrayBuffer
     if (typeof data === 'string') {
-      // Text frame
-      const encoder = new TextEncoder()
-      const payload = encoder.encode(data)
-      this.sendDataFrame(WSOpcode.TEXT, payload.buffer)
+      const payload = new TextEncoder().encode(data)
+      this.sendSync(
+        WSOpcode.TEXT,
+        payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
+      )
     } else if (data instanceof Blob) {
-      // Read Blob as ArrayBuffer
-      data.arrayBuffer().then((buffer) => {
-        this.sendDataFrame(WSOpcode.BINARY, buffer)
-      })
-    } else if (data instanceof ArrayBuffer) {
-      // Binary frame
-      this.sendDataFrame(WSOpcode.BINARY, data)
+      this.sendAsync(WSOpcode.BINARY, data.arrayBuffer())
+    } else if (ArrayBuffer.isView(data)) {
+      // Copy out of the view's window; the buffer may be a SharedArrayBuffer or
+      // hold unrelated bytes on either side.
+      this.sendSync(
+        WSOpcode.BINARY,
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer
+      )
     } else {
-      // ArrayBufferView (TypedArray, DataView)
-      const view = data as ArrayBufferView
-      const buffer = view.buffer as ArrayBuffer
-      this.sendDataFrame(WSOpcode.BINARY, buffer.slice(view.byteOffset, view.byteOffset + view.byteLength))
+      this.sendSync(WSOpcode.BINARY, data as ArrayBuffer)
     }
+  }
+
+  /**
+   * Send a payload that is already in hand. Goes out immediately unless an
+   * async payload is still queued ahead of it.
+   */
+  private sendSync(opcode: WSOpcodeValue, payload: ArrayBuffer): void {
+    if (this.sendQueue === null) {
+      this.sendDataFrame(opcode, payload)
+      return
+    }
+    this.chainSend(opcode, Promise.resolve(payload))
+  }
+
+  /** Send a payload that still has to be read (Blob). */
+  private sendAsync(opcode: WSOpcodeValue, payload: Promise<ArrayBuffer>): void {
+    this.chainSend(opcode, payload)
+  }
+
+  /**
+   * Append to the outbound chain so frames leave in call order.
+   */
+  private chainSend(opcode: WSOpcodeValue, payload: Promise<ArrayBuffer>): void {
+    const previous = this.sendQueue ?? Promise.resolve()
+    const next: Promise<void> = previous
+      .then(async () => {
+        this.sendDataFrame(opcode, await payload)
+      })
+      .catch((error: unknown) => {
+        this.handleError(error instanceof Error ? error : new Error(String(error)))
+      })
+      .then(() => {
+        if (this.sendQueue === next) {
+          this.sendQueue = null
+        }
+      })
+
+    this.sendQueue = next
   }
 
   /**
@@ -196,7 +255,7 @@ export class ProxiedWebSocket implements EventTarget {
         payload,
       })
 
-      this.webrtc.sendData(frame)
+      this.transport.sendData(frame)
       console.log(`[WSProxy] Sent WS_DATA for connection ${this.connectionId} (opcode: ${opcode})`)
     } catch (error) {
       this.handleError(error instanceof Error ? error : new Error(String(error)))
@@ -206,7 +265,7 @@ export class ProxiedWebSocket implements EventTarget {
   /**
    * Close WebSocket connection.
    */
-  close(code: number = 1000, reason: string = ''): void {
+  close(code = 1000, reason = ''): void {
     if (this._readyState === ProxiedWSState.CLOSING || this._readyState === ProxiedWSState.CLOSED) {
       return
     }
@@ -220,7 +279,7 @@ export class ProxiedWebSocket implements EventTarget {
         reason,
       })
 
-      this.webrtc.sendData(frame)
+      this.transport.sendData(frame)
       console.log(`[WSProxy] Sent WS_CLOSE for connection ${this.connectionId} (code: ${code})`)
 
       // Transition to CLOSED immediately (server will acknowledge)
@@ -235,7 +294,9 @@ export class ProxiedWebSocket implements EventTarget {
    */
   handleData(frame: WSDataFrame): void {
     if (frame.connectionId !== this.connectionId) {
-      console.warn(`[WSProxy] Received data for wrong connection: ${frame.connectionId} (expected: ${this.connectionId})`)
+      console.warn(
+        `[WSProxy] Received data for wrong connection: ${frame.connectionId} (expected: ${this.connectionId})`
+      )
       return
     }
 
@@ -244,15 +305,11 @@ export class ProxiedWebSocket implements EventTarget {
 
     if (frame.opcode === WSOpcode.TEXT) {
       // Text message
-      const decoder = new TextDecoder()
-      data = decoder.decode(frame.payload)
+      data = new TextDecoder().decode(frame.payload)
+    } else if (this._binaryType === 'blob') {
+      data = new Blob([frame.payload])
     } else {
-      // Binary message
-      if (this._binaryType === 'blob') {
-        data = new Blob([frame.payload])
-      } else {
-        data = frame.payload
-      }
+      data = frame.payload
     }
 
     const event = new MessageEvent('message', {
@@ -269,7 +326,9 @@ export class ProxiedWebSocket implements EventTarget {
    */
   handleClose(frame: WSCloseFrame): void {
     if (frame.connectionId !== this.connectionId) {
-      console.warn(`[WSProxy] Received close for wrong connection: ${frame.connectionId} (expected: ${this.connectionId})`)
+      console.warn(
+        `[WSProxy] Received close for wrong connection: ${frame.connectionId} (expected: ${this.connectionId})`
+      )
       return
     }
 
@@ -324,11 +383,13 @@ export class ProxiedWebSocket implements EventTarget {
   ): void {
     if (!listener) return
 
-    if (!this.eventListeners.has(type)) {
-      this.eventListeners.set(type, new Set())
+    let listeners = this.eventListeners.get(type)
+    if (!listeners) {
+      listeners = new Set()
+      this.eventListeners.set(type, listeners)
     }
 
-    this.eventListeners.get(type)!.add(listener)
+    listeners.add(listener)
   }
 
   removeEventListener(
@@ -338,10 +399,7 @@ export class ProxiedWebSocket implements EventTarget {
   ): void {
     if (!listener) return
 
-    const listeners = this.eventListeners.get(type)
-    if (listeners) {
-      listeners.delete(listener)
-    }
+    this.eventListeners.get(type)?.delete(listener)
   }
 
   dispatchEvent(event: Event): boolean {
@@ -365,27 +423,28 @@ export class ProxiedWebSocket implements EventTarget {
  * Manages multiple proxied WebSocket connections and routes messages.
  */
 export class WSProxyManager {
-  private webrtc: WebRTCConnectionManager
-  private connections: Map<number, ProxiedWebSocket> = new Map()
+  private transport: Transport
+  private connections = new Map<number, ProxiedWebSocket>()
   private nextConnectionId = 1
 
-  constructor(webrtc: WebRTCConnectionManager) {
-    this.webrtc = webrtc
+  constructor(transport: Transport) {
+    this.transport = transport
   }
 
   /**
-   * Update the connection manager (for relay fallback).
-   * This updates the manager for all future connections AND existing connections.
+   * Point this manager (and every live connection) at a different transport.
+   *
+   * Used when the WebRTC leg fails and we switch to the relay. This used to
+   * force a `RelayClient` into a `WebRTCConnectionManager`-typed field and write
+   * another object's private property behind two `@ts-expect-error`s; the
+   * `Transport` interface exists precisely so it doesn't have to.
    */
-  updateConnectionManager(manager: WebRTCConnectionManager | RelayClient): void {
-    // @ts-expect-error - RelayClient is compatible with WebRTCConnectionManager for proxy purposes
-    this.webrtc = manager
-    // Update existing connections
+  updateTransport(transport: Transport): void {
+    this.transport = transport
     this.connections.forEach((connection) => {
-      // @ts-expect-error - updating private property for relay fallback
-      connection.webrtc = manager
+      connection.setTransport(transport)
     })
-    console.log('[WSProxyManager] Updated connection manager for relay fallback')
+    console.log('[WSProxyManager] Updated transport')
   }
 
   /**
@@ -393,7 +452,7 @@ export class WSProxyManager {
    */
   createConnection(url: string, protocols?: string | string[]): ProxiedWebSocket {
     const connectionId = this.nextConnectionId++
-    const ws = new ProxiedWebSocket(url, protocols, this.webrtc, connectionId)
+    const ws = new ProxiedWebSocket(url, protocols, this.transport, connectionId)
     this.connections.set(connectionId, ws)
 
     console.log(`[WSProxyManager] Created connection ${connectionId} for ${url}`)
@@ -431,7 +490,9 @@ export class WSProxyManager {
         connection.handleClose(frame)
         this.connections.delete(frame.connectionId)
       } else {
-        console.warn(`[WSProxyManager] Received close for unknown connection: ${frame.connectionId}`)
+        console.warn(
+          `[WSProxyManager] Received close for unknown connection: ${frame.connectionId}`
+        )
       }
     } catch (error) {
       console.error('[WSProxyManager] Error handling WS_CLOSE frame:', error)
@@ -442,10 +503,7 @@ export class WSProxyManager {
    * Handle connection opened (WS_CONNECT response - currently auto-opens).
    */
   handleConnectionOpened(connectionId: number): void {
-    const connection = this.connections.get(connectionId)
-    if (connection) {
-      connection.handleOpen()
-    }
+    this.connections.get(connectionId)?.handleOpen()
   }
 
   /**
