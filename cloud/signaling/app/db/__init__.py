@@ -15,6 +15,24 @@
 
 """Database module."""
 
-from .database import USE_POSTGRES, get_db, init_db
+from .database import (
+    USE_POSTGRES,
+    DBConnection,
+    DBRow,
+    PostgresConnection,
+    as_postgres,
+    as_sqlite,
+    get_db,
+    init_db,
+)
 
-__all__ = ["get_db", "init_db", "USE_POSTGRES"]
+__all__ = [
+    "USE_POSTGRES",
+    "DBConnection",
+    "DBRow",
+    "PostgresConnection",
+    "as_postgres",
+    "as_sqlite",
+    "get_db",
+    "init_db",
+]

@@ -71,7 +71,7 @@ git rebase --continue
 
 ```bash
 git clone https://github.com/YOUR-USERNAME/lem.git
-cd lem/lem-app
+cd lem
 ```
 
 2. **Set up Python environment (local server)**

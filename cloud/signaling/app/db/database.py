@@ -20,8 +20,8 @@ Set DATABASE_URL environment variable to use PostgreSQL.
 """
 
 import os
-from collections.abc import AsyncIterator
-from typing import Any
+from collections.abc import AsyncIterator, Iterable
+from typing import Any, Protocol
 
 import aiosqlite
 
@@ -29,8 +29,74 @@ import aiosqlite
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgresql")
 
+# SQLite database file, used when DATABASE_URL is not a PostgreSQL URL.
+# Read at call time so tests can point it at a temporary directory.
+DATABASE_FILE = os.environ.get("SQLITE_DB_FILE", "signaling.db")
+
 # PostgreSQL connection pool (lazy initialized)
 _pg_pool: Any = None
+
+
+class DBRow(Protocol):
+    """A database row supporting column access by name.
+
+    Implemented by both ``sqlite3.Row`` and ``asyncpg.Record``.
+    """
+
+    def __getitem__(self, key: str, /) -> Any: ...
+
+
+class PostgresConnection(Protocol):
+    """The subset of ``asyncpg.Connection`` this application uses.
+
+    asyncpg ships no type information, so the API surface is declared here
+    instead of leaking ``Any`` into the endpoints.
+    """
+
+    async def fetchrow(self, query: str, /, *args: Any) -> DBRow | None: ...
+
+    async def fetch(self, query: str, /, *args: Any) -> Iterable[DBRow]: ...
+
+    async def execute(self, query: str, /, *args: Any) -> str: ...
+
+
+# A connection from either backend. Endpoints branch on USE_POSTGRES and
+# narrow with as_postgres()/as_sqlite() below.
+DBConnection = aiosqlite.Connection | PostgresConnection
+
+
+def as_sqlite(db: DBConnection) -> aiosqlite.Connection:
+    """Narrow a connection to the SQLite backend.
+
+    Args:
+        db: Connection yielded by get_db().
+
+    Returns:
+        The connection as an aiosqlite connection.
+
+    Raises:
+        TypeError: If the active backend is not SQLite.
+    """
+    if not isinstance(db, aiosqlite.Connection):
+        raise TypeError("Expected a SQLite connection")
+    return db
+
+
+def as_postgres(db: DBConnection) -> PostgresConnection:
+    """Narrow a connection to the PostgreSQL backend.
+
+    Args:
+        db: Connection yielded by get_db().
+
+    Returns:
+        The connection as a PostgreSQL connection.
+
+    Raises:
+        TypeError: If the active backend is not PostgreSQL.
+    """
+    if isinstance(db, aiosqlite.Connection):
+        raise TypeError("Expected a PostgreSQL connection")
+    return db
 
 
 def _parse_postgres_url(url: str) -> dict[str, Any]:
@@ -76,7 +142,7 @@ async def _get_pg_pool() -> Any:
     return _pg_pool
 
 
-async def get_db() -> AsyncIterator[Any]:
+async def get_db() -> AsyncIterator[DBConnection]:
     """Get database connection.
 
     Yields:
@@ -85,9 +151,10 @@ async def get_db() -> AsyncIterator[Any]:
     if USE_POSTGRES:
         pool = await _get_pg_pool()
         async with pool.acquire() as conn:
-            yield conn
+            pg_conn: PostgresConnection = conn
+            yield pg_conn
     else:
-        async with aiosqlite.connect("signaling.db") as db:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             yield db
 
@@ -102,14 +169,14 @@ async def init_db() -> None:
         await _init_postgres()
         logger.info("PostgreSQL tables created successfully")
     else:
-        logger.info("Initializing SQLite database: signaling.db")
+        logger.info(f"Initializing SQLite database: {DATABASE_FILE}")
         await _init_sqlite()
         logger.info("SQLite tables created successfully")
 
 
 async def _init_sqlite() -> None:
     """Initialize SQLite database."""
-    async with aiosqlite.connect("signaling.db") as db:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
         # Users table
         await db.execute(
             """

@@ -20,6 +20,7 @@ import json
 import pytest
 
 from app.tunnel.http_frame import (
+    FrameType,
     HTTPRequestFrame,
     HTTPResponseFrame,
     deserialize_request,
@@ -193,16 +194,20 @@ class TestBinaryFormatValidation:
 
         data = serialize_request(request)
 
+        # Check frame_type (1 byte)
+        frame_type = struct.unpack(">B", data[:1])[0]
+        assert frame_type == FrameType.HTTP_REQUEST
+
         # Check request_id (4 bytes, big-endian)
-        request_id = struct.unpack(">I", data[:4])[0]
+        request_id = struct.unpack(">I", data[1:5])[0]
         assert request_id == 1
 
         # Check method_len (2 bytes, big-endian)
-        method_len = struct.unpack(">H", data[4:6])[0]
+        method_len = struct.unpack(">H", data[5:7])[0]
         assert method_len == 3  # "GET" = 3 bytes
 
         # Check method string
-        method = data[6 : 6 + method_len].decode("utf-8")
+        method = data[7 : 7 + method_len].decode("utf-8")
         assert method == "GET"
 
     def test_correct_binary_layout_for_response(self) -> None:
@@ -218,13 +223,31 @@ class TestBinaryFormatValidation:
 
         data = serialize_response(response)
 
+        # Check frame_type (1 byte)
+        frame_type = struct.unpack(">B", data[:1])[0]
+        assert frame_type == FrameType.HTTP_RESPONSE
+
         # Check request_id (4 bytes, big-endian)
-        request_id = struct.unpack(">I", data[:4])[0]
+        request_id = struct.unpack(">I", data[1:5])[0]
         assert request_id == 42
 
         # Check status_code (2 bytes, big-endian)
-        status_code = struct.unpack(">H", data[4:6])[0]
+        status_code = struct.unpack(">H", data[5:7])[0]
         assert status_code == 200
+
+    def test_rejects_wrong_frame_type(self) -> None:
+        """Test that a response frame is rejected by the request deserializer."""
+        response: HTTPResponseFrame = {
+            "request_id": 1,
+            "status_code": 200,
+            "headers": {},
+            "body": "",
+        }
+
+        data = serialize_response(response)
+
+        with pytest.raises(ValueError, match="Expected HTTP_REQUEST frame"):
+            deserialize_request(data)
 
 
 class TestEdgeCases:
@@ -281,20 +304,36 @@ class TestErrorHandling:
 
     def test_deserialize_request_with_insufficient_data(self) -> None:
         """Test that deserialization fails with insufficient data."""
+        import struct
+
+        # Valid frame_type followed by a truncated request_id
+        data = struct.pack(">B", FrameType.HTTP_REQUEST) + b"\x00\x00"
+
         with pytest.raises(ValueError, match="Insufficient data"):
-            deserialize_request(b"\x00\x00")
+            deserialize_request(data)
 
     def test_deserialize_response_with_insufficient_data(self) -> None:
         """Test that deserialization fails with insufficient data."""
+        import struct
+
+        # Valid frame_type followed by a truncated request_id
+        data = struct.pack(">B", FrameType.HTTP_RESPONSE) + b"\x00\x00"
+
         with pytest.raises(ValueError, match="Insufficient data"):
-            deserialize_response(b"\x00\x00")
+            deserialize_response(data)
+
+    def test_deserialize_empty_frame(self) -> None:
+        """Test that deserialization fails when the frame_type byte is missing."""
+        with pytest.raises(ValueError, match="Insufficient data for frame_type"):
+            deserialize_request(b"")
 
     def test_deserialize_request_with_truncated_method(self) -> None:
         """Test that deserialization fails with truncated method."""
         import struct
 
         # Create frame with method_len = 10 but only 3 bytes following
-        data = struct.pack(">I", 1)  # request_id
+        data = struct.pack(">B", FrameType.HTTP_REQUEST)  # frame_type
+        data += struct.pack(">I", 1)  # request_id
         data += struct.pack(">H", 10)  # method_len = 10
         data += b"GET"  # only 3 bytes
 

@@ -15,20 +15,17 @@
 
 """Authentication endpoints."""
 
-import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..core.security import create_access_token, get_password_hash, verify_password
-from ..db import USE_POSTGRES, get_db
+from ..db import USE_POSTGRES, DBConnection, DBRow, as_postgres, as_sqlite, get_db
 from ..models import Token, UserCreate, UserLogin
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def register(
-    user_data: UserCreate, db: aiosqlite.Connection = Depends(get_db)
-) -> Token:
+async def register(user_data: UserCreate, db: DBConnection = Depends(get_db)) -> Token:
     """Register a new user.
 
     Args:
@@ -41,9 +38,11 @@ async def register(
     Raises:
         HTTPException: If user already exists.
     """
+    user_id: int | None
     if USE_POSTGRES:
         # PostgreSQL syntax
-        existing_user = await db.fetchrow(
+        pg = as_postgres(db)
+        existing_user = await pg.fetchrow(
             "SELECT id FROM users WHERE email = $1", user_data.email
         )
         if existing_user:
@@ -54,15 +53,21 @@ async def register(
 
         # Create new user with RETURNING
         hashed_password = get_password_hash(user_data.password)
-        row = await db.fetchrow(
+        row = await pg.fetchrow(
             "INSERT INTO users (email, hashed_password) VALUES ($1, $2) RETURNING id",
             user_data.email,
             hashed_password,
         )
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user",
+            )
         user_id = row["id"]
     else:
         # SQLite syntax
-        async with db.execute(
+        sqlite = as_sqlite(db)
+        async with sqlite.execute(
             "SELECT id FROM users WHERE email = ?", (user_data.email,)
         ) as cursor:
             existing_user = await cursor.fetchone()
@@ -74,13 +79,13 @@ async def register(
 
         # Create new user
         hashed_password = get_password_hash(user_data.password)
-        async with db.execute(
+        async with sqlite.execute(
             "INSERT INTO users (email, hashed_password) VALUES (?, ?)",
             (user_data.email, hashed_password),
         ) as cursor:
             user_id = cursor.lastrowid
 
-        await db.commit()
+        await sqlite.commit()
 
     # Create access token
     access_token = create_access_token(data={"sub": user_data.email, "user_id": user_id})
@@ -89,7 +94,7 @@ async def register(
 
 
 @router.post("/login", response_model=Token)
-async def login(credentials: UserLogin, db: aiosqlite.Connection = Depends(get_db)) -> Token:
+async def login(credentials: UserLogin, db: DBConnection = Depends(get_db)) -> Token:
     """Login and get access token.
 
     Args:
@@ -102,15 +107,16 @@ async def login(credentials: UserLogin, db: aiosqlite.Connection = Depends(get_d
     Raises:
         HTTPException: If credentials are invalid.
     """
+    user: DBRow | None
     if USE_POSTGRES:
         # PostgreSQL syntax
-        user = await db.fetchrow(
+        user = await as_postgres(db).fetchrow(
             "SELECT id, email, hashed_password FROM users WHERE email = $1",
             credentials.email,
         )
     else:
         # SQLite syntax
-        async with db.execute(
+        async with as_sqlite(db).execute(
             "SELECT id, email, hashed_password FROM users WHERE email = ?",
             (credentials.email,),
         ) as cursor:

@@ -36,12 +36,12 @@ git clone https://github.com/lem-app/lem.git
 cd lem
 
 # Start the local server
-cd lem-app/server
+cd server
 uv sync
 uv run uvicorn app.main:app --host 0.0.0.0 --port 5142
 
-# In another terminal, start the web dashboard
-cd lem/lem-app/web/local
+# In another terminal, from the repository root, start the web dashboard
+cd web/local
 pnpm install
 pnpm run dev
 ```
@@ -118,7 +118,7 @@ Need a different license for embedded use or commercial distribution? Contact us
 ### Project Structure
 
 ```
-lem-app/
+lem/
 ├── server/           # Local FastAPI server (Python)
 ├── cloud/
 │   ├── signaling/    # WebRTC signaling server (Python)
@@ -139,21 +139,28 @@ lem-app/
 ### Running Tests
 
 ```bash
-# From lem/lem-app directory:
+# From the repository root:
 
-# Python tests
+# Python tests (uv sync installs the dev group, including pytest)
 cd server
+uv sync
 uv run pytest --cov=app
+
+# Cloud service tests
+cd cloud/signaling
+uv sync
+uv run pytest
 
 # TypeScript tests
 cd web/remote
+pnpm install
 pnpm test
 ```
 
 ### Code Quality
 
 ```bash
-# From lem/lem-app directory:
+# From the repository root:
 
 # Python linting and formatting
 cd server

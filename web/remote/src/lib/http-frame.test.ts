@@ -21,6 +21,7 @@
 
 import { describe, it, expect } from 'vitest'
 import {
+  FrameType,
   serializeRequest,
   deserializeRequest,
   serializeResponse,
@@ -196,15 +197,18 @@ describe('HTTP Frame Serialization', () => {
       const buffer = serializeRequest(request)
       const view = new DataView(buffer)
 
+      // Check frame_type (1 byte)
+      expect(view.getUint8(0)).toBe(FrameType.HTTP_REQUEST)
+
       // Check request_id (4 bytes)
-      expect(view.getUint32(0, false)).toBe(1)
+      expect(view.getUint32(1, false)).toBe(1)
 
       // Check method_len (2 bytes)
-      const methodLen = view.getUint16(4, false)
+      const methodLen = view.getUint16(5, false)
       expect(methodLen).toBe(3) // "GET" = 3 bytes
 
       // Check method string
-      const methodBytes = new Uint8Array(buffer, 6, methodLen)
+      const methodBytes = new Uint8Array(buffer, 7, methodLen)
       const method = new TextDecoder().decode(methodBytes)
       expect(method).toBe('GET')
     })
@@ -220,11 +224,27 @@ describe('HTTP Frame Serialization', () => {
       const buffer = serializeResponse(response)
       const view = new DataView(buffer)
 
+      // Check frame_type (1 byte)
+      expect(view.getUint8(0)).toBe(FrameType.HTTP_RESPONSE)
+
       // Check request_id (4 bytes)
-      expect(view.getUint32(0, false)).toBe(42)
+      expect(view.getUint32(1, false)).toBe(42)
 
       // Check status_code (2 bytes)
-      expect(view.getUint16(4, false)).toBe(200)
+      expect(view.getUint16(5, false)).toBe(200)
+    })
+
+    it('should reject a frame with the wrong frame type', () => {
+      const response: HTTPResponseFrame = {
+        requestId: 1,
+        statusCode: 200,
+        headers: {},
+        body: '',
+      }
+
+      const buffer = serializeResponse(response)
+
+      expect(() => deserializeRequest(buffer)).toThrow(/Expected HTTP_REQUEST frame/)
     })
   })
 
