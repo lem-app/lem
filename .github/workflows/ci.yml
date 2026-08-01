@@ -178,11 +178,15 @@ jobs:
         include:
           - name: web-local
             dir: web/local
-            # web/local has no test script and no vitest dependency today.
-            # Not inventing one here -- the vitest step is skipped below.
             # Underscore, not hyphen: `matrix.has-tests` would be evaluated as
             # the subtraction `matrix.has - tests` by the expression parser.
-            has_tests: false
+            #
+            # Was false when this file was written, on the grounds that
+            # web/local had neither vitest nor a test script. Both exist now
+            # (src/test/setup.ts, `pnpm test`), and the credential-prompt suite
+            # added for issue #48 is a security gate -- leaving this false meant
+            # a whole app's tests silently never ran in CI.
+            has_tests: true
           - name: web-remote
             dir: web/remote
             has_tests: true
@@ -249,9 +253,46 @@ jobs:
         run: pnpm run build
 
       - name: Tests (vitest)
-        # Skipped for web-local, which has no tests yet. See matrix comment.
         if: ${{ !cancelled() && matrix.has_tests }}
         run: pnpm exec vitest run
+
+  # --------------------------------------------------------------------------
+  # No credential may reach a web bundle.
+  #
+  # Vite inlines `import.meta.env.VITE_*` as plaintext string literals, so a
+  # build-time token lands verbatim in dist/assets/*.js. That shipped once (see
+  # issue #48) and was caught only because a reviewer built the bundle by hand.
+  # This is that review, automated. Its own job rather than a step in the `web`
+  # matrix: the check spans both apps plus the repo's env templates, and it is
+  # the kind of gate that should be nameable in branch protection on its own.
+  # --------------------------------------------------------------------------
+  bundle-secrets:
+    name: bundle-secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: web/local/package.json
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: web/local/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: web/local
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the built bundle carries no credential
+        run: ./scripts/check-bundle-secrets.sh
 
   # --------------------------------------------------------------------------
   # Every tracked source file must carry the SPDX header CLAUDE.md mandates.

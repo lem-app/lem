@@ -112,6 +112,19 @@ curl -H "X-Lem-Client: curl" \
      http://127.0.0.1:5142/v1/services
 ```
 
+### After issue [#48](https://github.com/lem-app/lem/issues/48) (`feat/lan-dashboard-auth`)
+
+Either credential is accepted as the bearer on `/v1/*`: the root token above, or
+a **session token** traded for it. Browsers use the second, so the permanent
+secret never has to reach one. See §6.6.
+
+`LEM_REQUIRE_TOKEN=true` forces the bearer requirement on even for a *verified
+loopback* bind. That covers the one exposure the process cannot observe — a
+reverse proxy, published container port or `vite --host` in front of the socket
+republishes the API off-host while `getsockname()` still, correctly, reports
+`127.0.0.1`. It can only add the requirement; nothing switches the token off on
+a network-reachable bind.
+
 The tunnel presents the local server's own credentials rather than the remote peer's when
 proxying to the local API (`server/app/tunnel/http_proxy.py` on that branch), so remote access
 continues to work.
@@ -397,6 +410,49 @@ or `{"authenticated": false, "tunnel_status": "offline"}`. Always 200.
 
 ---
 
+## 11b. Local server — browser sessions
+
+`server/app/api/v1/session.py`, mounted at `/v1`. Unrelated to §11 despite the
+shared prefix: §11 signs in to the *cloud*, this authenticates the machine's
+operator to their *own* local API. Store: `server/app/sessions.py`.
+
+### `POST /v1/auth/session`
+
+Trades the root API token for a short-lived session token.
+
+```bash
+curl -X POST http://127.0.0.1:5142/v1/auth/session \
+     -H "X-Lem-Client: curl" \
+     -H "Authorization: Bearer $(cat ~/.lem/api_token)"
+```
+
+```json
+{ "token": "…", "expires_at": "2026-08-02T09:14:00+00:00" }
+```
+
+201 · 401 (missing or wrong root token) · 403 (no `X-Lem-Client`, or a
+disallowed `Origin`) · 503 (the server cannot load its own token).
+
+**Only the root token is accepted.** The security middleware will happily let a
+session token reach this route — it is a valid credential for `/v1/*` — so the
+handler checks the root token itself. Without that, a stolen session could mint
+an unbroken chain of successors and the TTL would protect nothing. The check
+also applies on a loopback bind, where the middleware demands no credential at
+all.
+
+Sessions live in the server process's memory and nowhere else: **a restart
+invalidates every one of them.** TTL is a fixed 12 hours with no refresh
+endpoint and no sliding window. Expired entries are deleted on the next mint or
+verification rather than merely refused.
+
+### `DELETE /v1/auth/session`
+
+Revokes the session token presented in the `Authorization` header. 204 with an
+empty body, whether or not the token was known — deliberately, so it cannot be
+used to probe for live sessions.
+
+---
+
 ## 12. Cloud signaling (`cloud/signaling/`, default `:8000`)
 
 > **This section documents `main`. PR [#45](https://github.com/lem-app/lem/pull/45)
@@ -520,6 +576,9 @@ session and can read or inject the peers' traffic —
 |---|---|---|---|
 | `LEM_SIGNAL_URL` | local server | unset | Overrides the stored signaling URL; a mismatch with stored auth raises at tunnel start (`tunnel/manager.py:92-99`). |
 | `LEM_HOST` | local server | `127.0.0.1` | *(PR #25)* bind address; non-loopback turns on the bearer token. |
+| `LEM_PORT` | local server | `5142` | *(PR #25)* listen port; an unparseable value falls back to the default with a warning. |
+| `LEM_ALLOWED_ORIGINS` | local server | unset | *(PR #25)* comma-separated extra browser origins for the CSRF/CORS allowlist. `*` is refused. |
+| `LEM_REQUIRE_TOKEN` | local server | `false` | *(issue #48)* `1`/`true`/`yes`/`on` requires the bearer token on `/v1/*` even for a verified loopback bind. For proxies, published container ports and `vite --host`, which the socket check cannot see. Only ever adds the requirement. |
 | `DOCKER_HOST` | local server | platform default | See [`platform.md`](./platform.md). |
 | `SECRET_KEY` | signaling, relay | `dev-secret-key-change-in-production` | JWT signing key; must match between the two services. |
 | `ENV` | signaling, relay | unset | `production` makes the default secret fatal. |

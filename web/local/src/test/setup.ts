@@ -25,6 +25,19 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup } from '@testing-library/react'
 import { afterEach } from 'vitest'
 
+// jsdom does not implement ResizeObserver, and several Radix primitives (the
+// ones shadcn/ui is built on) construct one in a layout effect - so a component
+// using them throws on mount with "ResizeObserver is not defined" rather than
+// failing an assertion. A no-op is the right stub: nothing under test asserts
+// on measured sizes, and jsdom has no layout to measure anyway.
+if (!('ResizeObserver' in globalThis)) {
+  globalThis.ResizeObserver = class {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+}
+
 afterEach(() => {
   cleanup()
 })

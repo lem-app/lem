@@ -22,7 +22,6 @@ import type {
   StatusResponse,
   ModelPullRequest,
   ModelPullResponse,
-  ProblemDetails,
   RegisterRequest,
   LoginRequest,
   AuthResponse,
@@ -33,79 +32,90 @@ import type {
   JobResponse,
 } from './types'
 
-// Use relative URLs - Vite dev server proxies /v1/* to the backend
-// For production builds, set VITE_API_URL to the full backend URL
-const API_BASE_URL = import.meta.env.VITE_API_URL || ''
+// The bearer token is NOT compiled in. The dashboard has no credential until
+// the operator supplies one at runtime; see api/session.ts for why a build-time
+// `VITE_*` variable is not an option and what replaces it.
+import { API_BASE_URL, ApiError, CLIENT_HEADER, CLIENT_NAME, toApiError } from './http'
+import { clearSessionTokenIfCurrent, readSessionToken, requestCredential } from './session'
 
-// The server requires this custom header on every state-changing request.
-// A browser cannot attach a custom header to a cross-origin request without a
-// CORS preflight, so it proves the request came from a real Lem client rather
-// than from a malicious page doing fetch(..., { mode: "no-cors" }).
-const CLIENT_HEADER = 'X-Lem-Client'
-const CLIENT_NAME = 'lem-dashboard'
+/**
+ * Issue one request, attaching the given credential if there is one.
+ *
+ * @param path - API path beginning with /v1
+ * @param options - fetch options from the caller
+ * @param token - Session token to present, or null to send none
+ * @returns The parsed response body
+ * @throws ApiError on any non-2xx response or network failure
+ */
+async function sendRequest<T>(
+  path: string,
+  options: RequestInit | undefined,
+  token: string | null
+): Promise<T> {
+  const auth: Record<string, string> = token === null ? {} : { Authorization: `Bearer ${token}` }
 
-// This dashboard sends no bearer token, on purpose.
-//
-// The local API requires one on every /v1/* request unless it verified a
-// loopback-only bind, and a browser cannot read ~/.lem/api_token. The obvious
-// shortcut - a build-time `import.meta.env.VITE_*` - does not work here: Vite
-// inlines those as plaintext literals into dist/assets/*.js, so the token would
-// ship to everyone who can load the page. That is the same LAN population the
-// token exists to keep out of Docker.
-//
-// So the supported dashboard path is a loopback-bound server. Reaching the
-// dashboard over the LAN needs a real credential-delivery design (operator
-// enters the token at runtime, held in session state, prompted on 401) and is
-// tracked on https://github.com/lem-app/lem/issues/48.
-
-class ApiError extends Error {
-  status: number
-  problemDetails?: ProblemDetails
-
-  constructor(message: string, status: number, problemDetails?: ProblemDetails) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
-    this.problemDetails = problemDetails
-  }
-}
-
-async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
-  const url = `${API_BASE_URL}${path}`
-
+  let response: Response
   try {
-    const response = await fetch(url, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
         [CLIENT_HEADER]: CLIENT_NAME,
+        ...auth,
         ...options?.headers,
       },
     })
-
-    if (!response.ok) {
-      // Try to parse Problem+JSON error
-      let problemDetails: ProblemDetails | undefined
-      try {
-        problemDetails = (await response.json()) as ProblemDetails
-      } catch {
-        // If not JSON, just use status text
-      }
-
-      throw new ApiError(
-        problemDetails?.detail || response.statusText,
-        response.status,
-        problemDetails
-      )
-    }
-
-    return (await response.json()) as T
   } catch (error) {
-    if (error instanceof ApiError) {
+    // Network or other pre-response failure.
+    throw new ApiError(error instanceof Error ? error.message : 'Unknown error', 0)
+  }
+
+  if (!response.ok) {
+    throw await toApiError(response)
+  }
+
+  return (await response.json()) as T
+}
+
+/**
+ * Call the local API, prompting for a credential if the server demands one.
+ *
+ * A 401 is not a dead end here: it raises the credential prompt (once, however
+ * many requests are in flight) and the original request is then retried, so the
+ * operator lands back where they were rather than on an empty dashboard.
+ *
+ * @param path - API path beginning with /v1
+ * @param options - fetch options
+ * @returns The parsed response body
+ * @throws ApiError if the request fails for any other reason, or if the
+ *   operator declines to supply a credential
+ */
+async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
+  const tokenUsed = readSessionToken()
+
+  try {
+    return await sendRequest<T>(path, options, tokenUsed)
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 401) {
       throw error
     }
-    // Network or other errors
-    throw new ApiError(error instanceof Error ? error.message : 'Unknown error', 0)
+
+    // A 401 on a request that already carried a session token means that
+    // session is gone - expired, revoked, or invalidated by a server restart
+    // (sessions live in the server's memory only). Drop it before prompting so
+    // the retry cannot present the same dead credential again.
+    if (tokenUsed !== null) {
+      clearSessionTokenIfCurrent(tokenUsed)
+    }
+
+    const token = await requestCredential(tokenUsed)
+    if (token === null) {
+      throw error
+    }
+
+    // Exactly one retry. If a freshly minted credential is refused too, that is
+    // a real 401 and the caller has to see it rather than loop on the prompt.
+    return await sendRequest<T>(path, options, token)
   }
 }
 
@@ -207,4 +217,6 @@ export async function getJob(jobId: string): Promise<Job> {
   return fetchApi<Job>(`/v1/jobs/${jobId}`)
 }
 
+// Re-exported so existing imports of `ApiError` from this module keep working
+// now that the class lives in ./http (shared with the credential exchange).
 export { ApiError }

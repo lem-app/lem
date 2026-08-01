@@ -105,24 +105,19 @@ curl -H "X-Lem-Client: curl" \
   `LEM_ALLOWED_ORIGINS` (comma-separated; `*` refused).
 - **Secrets at rest**: `~/.lem` is mode 0700 and `lem.db` (plus its WAL/SHM
   sidecars) and `api_token` are mode 0600.
-
-Two things this deliberately does **not** do yet:
-
-- **The dashboard over the LAN does not work.** `web/local` sends no bearer
-  token, so against a non-loopback bind it gets 401 on every request. A browser
-  cannot read `~/.lem/api_token`, and baking it into the build with a `VITE_*`
-  variable is not a fix - Vite inlines those as plaintext literals into
-  `dist/assets/*.js`, handing the token to everyone who can load the page.
-  Run the dashboard on the same machine as the server; `LEM_HOST=0.0.0.0` is
-  for non-browser clients that can present the token themselves. Proper
-  credential delivery is tracked in
-  [#48](https://github.com/lem-app/lem/issues/48).
-- **A proxy in front of a loopback bind still exposes it.** The posture is read
-  off the socket this process bound; it cannot see a hop it is not part of. A
-  reverse proxy, published container port, or `pnpm run dev:lan` in front of a
-  verified-loopback server makes it reachable off-host while the server
-  correctly reports "loopback only" and requires no token. Bind with
-  `LEM_HOST=0.0.0.0` (so the token is enforced) or authenticate at the proxy.
+- **Session tokens for browsers**: the dashboard never holds the root token.
+  It prompts on 401, the operator pastes `~/.lem/api_token` once, and it is
+  traded at `POST /v1/auth/session` for a 12-hour token held in the server's
+  memory only. Nothing is compiled into the bundle - a build-time `VITE_*`
+  variable would be inlined as a plaintext literal into `dist/assets/*.js`,
+  handing the credential to everyone who can load the page.
+  `scripts/check-bundle-secrets.sh` enforces that in CI.
+- **`LEM_REQUIRE_TOKEN=true`** forces the bearer requirement on even for a
+  verified loopback bind. Use it whenever something in front of the socket
+  republishes the API: a reverse proxy, a published container port, an SSH
+  tunnel, or `pnpm run dev:lan`. The server reads its posture off the socket it
+  bound and cannot see a hop it is not part of, so this is the one thing it
+  needs told.
 
 ### Remote access peers
 
