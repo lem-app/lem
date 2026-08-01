@@ -86,6 +86,12 @@ readonly -a EXCLUDE_FILE_GLOBS=(
 #     one, so this is an oversight rather than an intentional exemption.
 #     Fix: prepend the standard 14-line TypeScript header, then delete this
 #     entry. See https://github.com/lem-app/lem/blob/main/CLAUDE.md
+#
+#     OWNED ELSEWHERE: the `fix/frontend-correctness` branch is adding this
+#     header as part of its own change. When that lands, this entry becomes
+#     stale and MUST be deleted -- the script will print a
+#     "notice: ... remove it from ALLOWLIST" line on stderr (exit 0, never
+#     blocking) on every run until someone does.
 readonly -a ALLOWLIST=(
   'web/local/src/components/ui/progress.tsx'
 )

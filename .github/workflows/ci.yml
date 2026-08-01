@@ -55,12 +55,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `cov_fail_under` is a RATCHET, not a target. Each number is the
+          # service's measured coverage at the time it was set, rounded down a
+          # point or two to absorb run-to-run noise.
+          #
+          #   *** THIS NUMBER MAY ONLY EVER GO UP. ***
+          #
+          # If your PR raises a service's coverage, raise its floor here to
+          # match. Never lower a floor to make a red build green -- that is
+          # exactly the silent regression this gate exists to catch. See
+          # CONTRIBUTING.md ("Coverage ratchet") for the rationale.
+          #
+          # CLAUDE.md's >80% target is the destination; these are today's
+          # position. Measured on 2026-08-01 against main @ 5dafa1f:
+          #   server           19.32%  -> floor 17  (gap to 80: ~61 pts)
+          #   cloud-signaling  67.05%  -> floor 65  (gap to 80: ~13 pts)
+          #   cloud-relay       0.00%  -> floor  0  (no tests exist yet)
           - name: server
             dir: server
+            cov_fail_under: 17
           - name: cloud-signaling
             dir: cloud/signaling
+            cov_fail_under: 65
           - name: cloud-relay
             dir: cloud/relay
+            cov_fail_under: 0
     defaults:
       run:
         working-directory: ${{ matrix.dir }}
@@ -80,30 +99,56 @@ jobs:
 
       - name: Install dependencies
         # --locked fails if uv.lock is stale instead of silently re-resolving.
-        # --all-extras is required: the dev tooling (pytest, pytest-asyncio,
-        # mypy, ...) lives in [project.optional-dependencies].dev, which a
-        # plain `uv sync` does NOT install -- it only picks up the default
-        # [dependency-groups]. Without this, pytest is simply missing.
+        #
+        # --all-extras is belt-and-braces, not load-bearing: as of #24 all three
+        # services keep their dev tooling (pytest, pytest-asyncio, mypy, ruff)
+        # in [dependency-groups].dev, which a plain `uv sync` installs by
+        # default under PEP 735. None of the three declares
+        # [project.optional-dependencies] at all today, so this flag currently
+        # resolves to a no-op. It is kept so that adding a real extra later
+        # gets it installed in CI without anyone remembering to edit this line.
         run: uv sync --locked --all-extras
 
+      # `if: '!cancelled()'` on every gate below: the gates are independent of
+      # each other once the venv exists, so a run should report ALL of them,
+      # not stop at the first red one. Deliberately NOT applied to the install
+      # step above -- if install fails, running the gates anyway just yields a
+      # wall of "command not found" that buries the real error. This does not
+      # change job pass/fail: the job still fails if any step fails.
       - name: Format (ruff format --check)
+        if: '!cancelled()'
         run: uv run ruff format --check app/
 
       - name: Lint (ruff check)
+        if: '!cancelled()'
         run: uv run ruff check app/ tests/
 
       - name: Type check (mypy)
+        if: '!cancelled()'
         run: uv run mypy app/
 
       - name: Tests (pytest + coverage)
-        # `uv run --with pytest-cov`: only server/ declares pytest-cov in its
-        # dev extras. cloud/signaling and cloud/relay do not, so --cov would
+        if: '!cancelled()'
+        # `uv run --with pytest-cov==7.0.0`: only server/ declares pytest-cov in
+        # its dev group. cloud/signaling and cloud/relay do not, so --cov would
         # abort with "unrecognized arguments". Supplying it as an ephemeral
         # overlay keeps coverage working for all three without this CI-only PR
-        # having to edit their pyproject.toml.
+        # having to edit their pyproject.toml. Version-pinned to match the one
+        # in server/uv.lock so all three services measure coverage with the
+        # same tool -- an unpinned `--with pytest-cov` silently floats to
+        # whatever released most recently, which is the one unpinned link in an
+        # otherwise fully locked toolchain.
+        #
+        # --cov-fail-under enforces the per-service ratchet defined in the
+        # matrix above. Without it this step reported coverage but gated
+        # nothing: a contributor could delete every test in a module and the
+        # job would stay green as long as the survivors passed.
         run: |
           set +e
-          uv run --with pytest-cov pytest --cov=app --cov-report=term-missing
+          uv run --with 'pytest-cov==7.0.0' pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ matrix.cov_fail_under }}
           exit_code=$?
           set -e
           # pytest exit code 5 means "no tests were collected". cloud/relay has
@@ -163,21 +208,46 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Type check (tsc --noEmit)
-        run: pnpm exec tsc --noEmit
+      # See the python job for why `if: '!cancelled()'` starts here and not on
+      # the install step above.
+      #
+      # `tsc --build`, NOT a bare `tsc --noEmit`. Both web/local/tsconfig.json
+      # and web/remote/tsconfig.json are solution-style files ("files": [] plus
+      # "references", no "include"), so in non-build mode tsc assembles a
+      # program with ZERO root files, type-checks nothing, and exits 0. That is
+      # issue #20. Verified with --listFiles: 0 files for the bare form vs 137
+      # (web/local) and 115 (web/remote) via the referenced projects, and
+      # confirmed by injecting `const x: string = 123` into src/main.tsx --
+      # the bare form exited 0 and missed it, `--build` exits 2 and reports
+      # TS2322. `--build` walks the "references" graph, so both tsconfig.app
+      # and tsconfig.node are checked.
+      #
+      # Not routed through `pnpm run type-check` (the single-source-of-truth
+      # option) because that script does not exist in web/local/package.json
+      # at all, and web/remote's is itself the broken `tsc --noEmit` form --
+      # so today the script is not a source of truth worth pointing at, and
+      # this CI-only PR does not edit package.json. Once the branch fixing
+      # those scripts to `tsc -b --noEmit` lands, collapse this to
+      # `pnpm run type-check` in both apps.
+      - name: Type check (tsc --build --noEmit)
+        if: '!cancelled()'
+        run: pnpm exec tsc --build --noEmit
 
       - name: Lint (eslint)
+        if: '!cancelled()'
         run: pnpm exec eslint .
 
       - name: Format (prettier --check)
+        if: '!cancelled()'
         run: pnpm exec prettier --check .
 
       - name: Build
+        if: '!cancelled()'
         run: pnpm run build
 
       - name: Tests (vitest)
         # Skipped for web-local, which has no tests yet. See matrix comment.
-        if: matrix.has_tests
+        if: ${{ !cancelled() && matrix.has_tests }}
         run: pnpm exec vitest run
 
   # --------------------------------------------------------------------------
@@ -225,10 +295,21 @@ jobs:
           # Merge commits are skipped: they are generated by GitHub / `git
           # merge`, not authored by the contributor, so they carry no sign-off.
           # `.parents | length > 1` identifies them.
+          #
+          # The author name/email are fetched alongside the message because the
+          # sign-off must BELONG TO the author. A previous version of this step
+          # only regex-matched the shape of the line, so
+          # `Signed-off-by: Totally Fake Person <nobody@evil.example>` passed on
+          # anyone else's commit -- syntax validation wearing a DCO costume.
+          # CONTRIBUTING.md requires the name and email to match the committer's
+          # git configuration; this now actually enforces that.
           commits="$(
             gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
               --jq '.[] | select((.parents | length) < 2)
-                        | [.sha, (.commit.message | @base64)] | @tsv'
+                        | [.sha,
+                           (.commit.author.name  | @base64),
+                           (.commit.author.email | @base64),
+                           (.commit.message      | @base64)] | @tsv'
           )"
 
           if [ -z "$commits" ]; then
@@ -236,16 +317,55 @@ jobs:
             exit 0
           fi
 
+          # Normalise an identity for comparison: strip surrounding whitespace,
+          # fold ASCII case. Git forbids newlines in an author name/email, so a
+          # single line in is always a single line out -- no annotation
+          # injection surface via a crafted name.
+          norm() {
+            printf '%s' "$1" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              | tr '[:upper:]' '[:lower:]'
+          }
+
           failed=0
-          while IFS=$'\t' read -r sha message_b64; do
+          while IFS=$'\t' read -r sha name_b64 email_b64 message_b64; do
             [ -n "$sha" ] || continue
+            author_name="$(printf '%s' "$name_b64" | base64 -d)"
+            author_email="$(printf '%s' "$email_b64" | base64 -d)"
             message="$(printf '%s' "$message_b64" | base64 -d)"
             subject="$(printf '%s\n' "$message" | head -n 1)"
-            if printf '%s\n' "$message" | grep -qiE '^Signed-off-by: .+ <.+@.+>[[:space:]]*$'; then
+
+            expected_display="${author_name} <${author_email}>"
+            expected="$(norm "$expected_display")"
+
+            # Every Signed-off-by line in the message, not just the last.
+            # A commit may legitimately carry several (e.g. a relayed patch);
+            # one of them has to be the author's.
+            signoffs="$(printf '%s\n' "$message" | grep -iE '^[[:space:]]*Signed-off-by:' || true)"
+
+            if [ -z "$signoffs" ]; then
+              printf '  FAIL  %s  %s\n' "${sha:0:8}" "$subject"
+              echo "::error title=Missing DCO sign-off::Commit ${sha} has no Signed-off-by line. Expected: Signed-off-by: ${expected_display}"
+              failed=1
+              continue
+            fi
+
+            matched=0
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              # Everything after the first colon is the claimed identity.
+              if [ "$(norm "${line#*:}")" = "$expected" ]; then
+                matched=1
+                break
+              fi
+            done <<< "$signoffs"
+
+            if [ "$matched" -eq 1 ]; then
               printf '  ok    %s  %s\n' "${sha:0:8}" "$subject"
             else
               printf '  FAIL  %s  %s\n' "${sha:0:8}" "$subject"
-              echo "::error title=Missing DCO sign-off::Commit ${sha} has no Signed-off-by line"
+              found="$(printf '%s\n' "$signoffs" | sed -e 's/^[[:space:]]*//' | paste -sd';' -)"
+              echo "::error title=DCO sign-off does not match author::Commit ${sha} is signed off, but not by its author. Expected \"Signed-off-by: ${expected_display}\"; found \"${found}\""
               failed=1
             fi
           done <<< "$commits"
@@ -253,10 +373,13 @@ jobs:
           if [ "$failed" -ne 0 ]; then
             cat <<'EOF'
 
-          One or more commits are missing a Signed-off-by line.
+          One or more commits are missing a Signed-off-by line, or carry one
+          that does not match the commit's own author.
 
           Lem uses the Developer Certificate of Origin (https://developercertificate.org/).
-          Sign off new commits with:
+          The sign-off must match the commit author's name and email exactly
+          (case and surrounding whitespace are ignored). `git commit -s` derives
+          it from your git config, so it matches automatically:
 
               git commit -s -m "your message"
 
@@ -265,9 +388,13 @@ jobs:
               git commit --amend --signoff          # last commit only
               git rebase --signoff origin/main      # every commit on the branch
 
+          If the mismatch is in the author identity rather than the sign-off,
+          check `git config user.name` / `git config user.email` and amend with
+          `git commit --amend --reset-author -s`.
+
           Then force-push the branch. See CONTRIBUTING.md for details.
           EOF
             exit 1
           fi
 
-          echo "All commits are signed off."
+          echo "All commits are signed off by their authors."
