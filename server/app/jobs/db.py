@@ -23,43 +23,84 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from app.db import get_db
 from app.jobs.models import Job, JobStatus, JobType
 
 logger = logging.getLogger(__name__)
 
+_ACTIVE_STATUSES = (JobStatus.PENDING.value, JobStatus.RUNNING.value)
 
-def init_jobs_table() -> None:
+
+class ActiveJobExistsError(Exception):
+    """Raised when a service already has a pending or running job."""
+
+
+def init_jobs_schema() -> None:
     """
-    Initialize the jobs table in the database.
+    Add the constraint that a service can have at most one active job.
 
-    This is called during app startup via init_db().
+    The jobs table itself is created by app.db.init_db(). This partial unique
+    index is what makes "one job per service" a database guarantee instead of
+    a check-then-insert race: two concurrent installs used to both pass
+    get_active_job_for_service() and both enqueue.
+
+    Callers must resolve any pre-existing duplicates first (see
+    fail_orphaned_jobs), otherwise index creation fails on legacy data.
     """
     with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                type TEXT NOT NULL,
-                service_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                progress INTEGER DEFAULT 0,
-                message TEXT DEFAULT '',
-                error TEXT,
-                extra_json TEXT DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        try:
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active_per_service
+                ON jobs(service_id)
+                WHERE status IN ('pending', 'running')
+                """
             )
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            # Legacy rows still violate the constraint; keep serving without it.
+            logger.error(f"Could not enforce one-active-job-per-service: {e}")
+
+
+def fail_orphaned_jobs() -> int:
+    """
+    Mark jobs left non-terminal by a previous process as failed.
+
+    A crash during an install leaves the row in 'running' forever, and
+    get_active_job_for_service() then rejects every future install or removal
+    of that service with 409 for the lifetime of the database. Nothing is
+    resuming these rows after a restart, so they are failures.
+
+    Returns:
+        Number of jobs marked failed
+    """
+    now = datetime.now(UTC)
+
+    with get_db() as conn:
+        cursor = conn.execute(
             """
+            UPDATE jobs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE status IN (?, ?)
+            """,
+            (
+                JobStatus.FAILED.value,
+                "Interrupted: the Lem server restarted while this job was in progress",
+                now.isoformat(),
+                *_ACTIVE_STATUSES,
+            ),
         )
-        # Create indexes for common queries
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_service_id ON jobs(service_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at)")
+        recovered = cursor.rowcount
         conn.commit()
+
+    if recovered > 0:
+        logger.warning(f"Marked {recovered} orphaned job(s) as failed after restart")
+
+    return recovered
 
 
 def _row_to_job(row: dict[str, str | int | None]) -> Job:
@@ -91,38 +132,44 @@ def create_job(
     Create a new job in the database.
 
     Args:
-        job_type: Type of job (install, remove, pull_model)
+        job_type: Type of job (install, remove)
         service_id: Service ID the job operates on
         extra: Additional job-specific data
 
     Returns:
         The created Job object
+
+    Raises:
+        ActiveJobExistsError: If the service already has a pending/running job
     """
     job_id = str(uuid.uuid4())
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     extra_json = json.dumps(extra or {})
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs
-                (id, type, service_id, status, progress, message,
-                 extra_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                job_type.value,
-                service_id,
-                JobStatus.PENDING.value,
-                0,
-                "Queued",
-                extra_json,
-                now.isoformat(),
-                now.isoformat(),
-            ),
-        )
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs
+                    (id, type, service_id, status, progress, message,
+                     extra_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    job_type.value,
+                    service_id,
+                    JobStatus.PENDING.value,
+                    0,
+                    "Queued",
+                    extra_json,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise ActiveJobExistsError(f"Service '{service_id}' already has an active job") from e
 
     logger.info(f"Created job {job_id}: {job_type.value} for {service_id}")
 
@@ -236,7 +283,7 @@ def get_active_job_for_service(service_id: str) -> Job | None:
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (service_id, JobStatus.PENDING.value, JobStatus.RUNNING.value),
+            (service_id, *_ACTIVE_STATUSES),
         )
         row = cursor.fetchone()
 
@@ -259,7 +306,7 @@ def update_job_status(
         status: New status
         error: Error message (for failed status)
     """
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
 
     with get_db() as conn:
         if error:
@@ -296,7 +343,7 @@ def update_job_progress(
         progress: Progress percentage (0-100)
         message: Status message
     """
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
 
     with get_db() as conn:
         conn.execute(
@@ -321,7 +368,7 @@ def delete_old_jobs(days: int = 7) -> int:
     Returns:
         Number of jobs deleted
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(UTC) - timedelta(days=days)
 
     with get_db() as conn:
         cursor = conn.execute(

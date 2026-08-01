@@ -31,7 +31,7 @@ import json
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Database path: ~/.lem/lem.db
@@ -236,7 +236,7 @@ def register_device(
             conn.execute("DELETE FROM device")
 
             # Insert new device
-            created_at = datetime.utcnow()
+            created_at = datetime.now(UTC)
             conn.execute(
                 "INSERT INTO device (id, pubkey, privkey, created_at) VALUES (?, ?, ?, ?)",
                 (device_id, pubkey, privkey, created_at.isoformat()),

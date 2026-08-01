@@ -33,11 +33,16 @@ class JobStatus(str, Enum):
 
 
 class JobType(str, Enum):
-    """Type of background job."""
+    """
+    Type of background job.
+
+    Every member must have a handler registered in
+    app.services.lifecycle.register_job_handlers(); a job whose type has no
+    handler is failed immediately by the worker.
+    """
 
     INSTALL = "install"  # Install (pull) a service
     REMOVE = "remove"  # Remove a service (container + image)
-    PULL_MODEL = "pull_model"  # Pull a model for a runner
 
 
 class Job(BaseModel):
@@ -61,7 +66,7 @@ class Job(BaseModel):
     # Optional extra data for specific job types
     extra: dict[str, str] = Field(
         default_factory=dict,
-        description="Additional job-specific data (e.g., model_ref for pull_model)",
+        description="Additional job-specific data",
     )
 
     def is_active(self) -> bool:

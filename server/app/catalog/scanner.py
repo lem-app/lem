@@ -30,11 +30,33 @@ from typing import Any
 import yaml
 
 from app.catalog.models import ScannedService
+from app.config.platform import HARBOR_DIR
 
 logger = logging.getLogger(__name__)
 
-# Harbor installation directory
-HARBOR_DIR = Path.home() / ".lem" / "harbor"
+# Harbor keeps its resolved variables here (KEY="value" per line)
+HARBOR_ENV_FILE = HARBOR_DIR / ".env"
+
+# ${VAR} or ${VAR:-default} as used in Harbor compose files
+_COMPOSE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _harbor_fingerprint() -> tuple[float, float]:
+    """
+    Cheap change token for the Harbor directory.
+
+    Adding, removing or renaming a compose file changes the directory mtime,
+    and `harbor update` rewrites .env, so this invalidates the scan caches
+    without the process needing a restart.
+    """
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return _mtime(HARBOR_DIR), _mtime(HARBOR_ENV_FILE)
 
 
 def _extract_container_port(ports: list[str] | None) -> int | None:
@@ -72,23 +94,82 @@ def _extract_container_port(ports: list[str] | None) -> int | None:
     return None
 
 
-def _extract_image(image_str: str | None) -> str:
+@lru_cache(maxsize=2)
+def _load_harbor_env(fingerprint: tuple[float, float]) -> dict[str, str]:
+    """
+    Parse Harbor's .env file so compose variables can be resolved.
+
+    Args:
+        fingerprint: Cache key from _harbor_fingerprint()
+
+    Returns:
+        Mapping of variable name to value (empty if the file is unreadable)
+    """
+    if not HARBOR_ENV_FILE.exists():
+        return {}
+
+    env: dict[str, str] = {}
+    try:
+        content = HARBOR_ENV_FILE.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        logger.warning(f"Could not read {HARBOR_ENV_FILE}: {e}")
+        return {}
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip("\"'")
+
+    return env
+
+
+def _extract_image(image_str: str | None, env: dict[str, str]) -> str:
     """
     Extract a clean image reference from a compose image field.
 
+    Compose files reference variables ("ollama/ollama:${HARBOR_OLLAMA_VERSION}")
+    which Harbor resolves from its .env file. Resolving them here is what makes
+    exact image matching possible; unresolvable variables are left in place so
+    callers can tell "unknown" from "known".
+
     Args:
-        image_str: Image string, possibly with env vars like "${HARBOR_OLLAMA_VERSION}"
+        image_str: Image string, possibly with env vars
+        env: Harbor environment for variable substitution
 
     Returns:
-        Cleaned image string
+        Resolved image string ("" if the compose file builds the image)
     """
     if not image_str:
         return ""
-    return str(image_str)
+
+    def _substitute(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        value = env.get(name)
+        if value:
+            return value
+        if default:
+            return default
+        return match.group(0)
+
+    return _COMPOSE_VAR_RE.sub(_substitute, str(image_str))
 
 
-@lru_cache(maxsize=1)
 def scan_harbor_services() -> dict[str, ScannedService]:
+    """
+    Scan Harbor compose files to discover available services.
+
+    Cached until the Harbor directory changes; see _harbor_fingerprint().
+
+    Returns:
+        Dict mapping service_id to ScannedService
+    """
+    return _scan_harbor_services(_harbor_fingerprint())
+
+
+@lru_cache(maxsize=2)
+def _scan_harbor_services(fingerprint: tuple[float, float]) -> dict[str, ScannedService]:
     """
     Scan Harbor compose files to discover available services.
 
@@ -110,6 +191,7 @@ def scan_harbor_services() -> dict[str, ScannedService]:
         return {}
 
     services: dict[str, ScannedService] = {}
+    harbor_env = _load_harbor_env(fingerprint)
 
     # Pattern: compose.{service}.yml but NOT compose.x.{service}.{dep}.yml
     for compose_file in HARBOR_DIR.glob("compose.*.yml"):
@@ -153,7 +235,7 @@ def scan_harbor_services() -> dict[str, ScannedService]:
             services[service_id] = ScannedService(
                 id=service_id,
                 container_port=_extract_container_port(svc_config.get("ports")),
-                image=_extract_image(svc_config.get("image")),
+                image=_extract_image(svc_config.get("image"), harbor_env),
             )
 
         except yaml.YAMLError as e:
@@ -166,6 +248,21 @@ def scan_harbor_services() -> dict[str, ScannedService]:
 
 
 def scan_dependencies() -> dict[str, list[str]]:
+    """
+    Scan Harbor extension files to discover service dependencies.
+
+    Cached until the Harbor directory changes; see _harbor_fingerprint(). This
+    used to glob a 446-entry directory on every call, and get_all_services()
+    calls it once per service, so a single GET /v1/services did 89 full scans.
+
+    Returns:
+        Dict mapping service_id to list of dependency service_ids
+    """
+    return _scan_dependencies(_harbor_fingerprint())
+
+
+@lru_cache(maxsize=2)
+def _scan_dependencies(fingerprint: tuple[float, float]) -> dict[str, list[str]]:
     """
     Scan Harbor extension files to discover service dependencies.
 
@@ -203,5 +300,13 @@ def scan_dependencies() -> dict[str, list[str]]:
 
 
 def clear_cache() -> None:
-    """Clear the scanner cache. Useful after Harbor updates."""
-    scan_harbor_services.cache_clear()
+    """
+    Clear every scanner cache.
+
+    The caches invalidate themselves when the Harbor directory changes, so this
+    is only needed when a compose file is edited in place (which leaves the
+    directory mtime untouched).
+    """
+    _scan_harbor_services.cache_clear()
+    _scan_dependencies.cache_clear()
+    _load_harbor_env.cache_clear()
