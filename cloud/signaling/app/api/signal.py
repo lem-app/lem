@@ -199,9 +199,7 @@ async def fetch_owned_device_ids(user_id: int) -> set[str]:
     """
     async with db_connection() as db:
         if USE_POSTGRES:
-            rows = await as_postgres(db).fetch(
-                "SELECT id FROM devices WHERE user_id = $1", user_id
-            )
+            rows = await as_postgres(db).fetch("SELECT id FROM devices WHERE user_id = $1", user_id)
             return {str(row["id"]) for row in rows}
         async with as_sqlite(db).execute(
             "SELECT id FROM devices WHERE user_id = ?", (user_id,)
@@ -335,9 +333,7 @@ async def authenticate_connection(websocket: WebSocket) -> tuple[int, str] | Non
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return None
     except ValueError as e:
-        await close_with_error(
-            websocket, f"Invalid auth message: {e}", ErrorReason.PROTOCOL_ERROR
-        )
+        await close_with_error(websocket, f"Invalid auth message: {e}", ErrorReason.PROTOCOL_ERROR)
         return None
 
     if not isinstance(auth_msg, dict) or auth_msg.get("type") != "auth":
@@ -486,9 +482,7 @@ async def route_message(
             f"Blocked cross-user routing: device {device_id} (user {user_id}) "
             f"targeted {target_device_id}"
         )
-        await websocket.send_json(
-            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
-        )
+        await websocket.send_json(error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE))
         return
 
     if msg_type == "connect-request":
@@ -516,9 +510,7 @@ async def route_message(
         )
     else:
         logger.info(f"Target device {target_device_id} owned but not connected")
-        await websocket.send_json(
-            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
-        )
+        await websocket.send_json(error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE))
 
 
 async def handle_connect_request(
@@ -543,9 +535,7 @@ async def handle_connect_request(
     """
     if target_device_id == device_id:
         await websocket.send_json(
-            error_frame(
-                "Cannot open a relay session to the same device", ErrorReason.SAME_DEVICE
-            )
+            error_frame("Cannot open a relay session to the same device", ErrorReason.SAME_DEVICE)
         )
         return
 
@@ -565,9 +555,7 @@ async def handle_connect_request(
     delivered = await manager.send_message(target_device_id, notification)
     if not delivered:
         logger.info(f"Target device {target_device_id} owned but not connected")
-        await websocket.send_json(
-            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
-        )
+        await websocket.send_json(error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE))
         return
 
     logger.info(f"Minted relay session for {device_id} <-> {target_device_id}")
@@ -609,9 +597,7 @@ async def websocket_signal_endpoint(websocket: WebSocket) -> None:
 
     if "token" in websocket.query_params:
         logger.warning(f"Refused query-string credential from {source}")
-        await close_with_error(
-            websocket, UPGRADE_REQUIRED_MESSAGE, ErrorReason.UNSUPPORTED_CLIENT
-        )
+        await close_with_error(websocket, UPGRADE_REQUIRED_MESSAGE, ErrorReason.UNSUPPORTED_CLIENT)
         return
 
     try:
@@ -662,9 +648,7 @@ async def websocket_signal_endpoint(websocket: WebSocket) -> None:
                 raise
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
-                await websocket.send_json(
-                    error_frame("Internal error", ErrorReason.INTERNAL_ERROR)
-                )
+                await websocket.send_json(error_frame("Internal error", ErrorReason.INTERNAL_ERROR))
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for device {verified_device_id}")

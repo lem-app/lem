@@ -58,17 +58,13 @@ async def register(
     source = client_ip(request)
     if not register_limiter.check(source):
         logger.warning(f"Registration rate limit exceeded for {source}")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED
-        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED)
 
     user_id: int | None
     if USE_POSTGRES:
         # PostgreSQL syntax
         pg = as_postgres(db)
-        existing_user = await pg.fetchrow(
-            "SELECT id FROM users WHERE email = $1", user_data.email
-        )
+        existing_user = await pg.fetchrow("SELECT id FROM users WHERE email = $1", user_data.email)
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -140,9 +136,7 @@ async def login(
     account = credentials.email.lower()
     if not login_ip_limiter.check(source) or not login_account_limiter.check(account):
         logger.warning(f"Login rate limit exceeded for {source}")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED
-        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_RATE_LIMITED)
 
     user: DBRow | None
     if USE_POSTGRES:

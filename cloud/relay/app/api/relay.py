@@ -45,9 +45,7 @@ UPGRADE_REQUIRED_MESSAGE = (
 )
 
 
-async def close_with_error(
-    websocket: WebSocket, message: str, code: int, reason: str
-) -> None:
+async def close_with_error(websocket: WebSocket, message: str, code: int, reason: str) -> None:
     """Send a classified error frame then close the connection.
 
     ``reason`` and ``retryable`` travel on the frame itself so a client never
@@ -89,9 +87,7 @@ async def authenticate(websocket: WebSocket, session_id: str) -> SessionGrant | 
         The verified grant, or None if the connection was closed.
     """
     try:
-        auth_data = await asyncio.wait_for(
-            websocket.receive_text(), timeout=AUTH_TIMEOUT_SECONDS
-        )
+        auth_data = await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT_SECONDS)
     except TimeoutError:
         logger.warning(f"Session {session_id}: Auth timeout")
         with contextlib.suppress(Exception):

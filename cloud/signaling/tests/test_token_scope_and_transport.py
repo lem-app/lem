@@ -101,9 +101,7 @@ def test_signal_refuses_a_query_string_credential(client: TestClient) -> None:
     account = Account(client, "querystring@example.com")
     account.register_device(DEVICE)
 
-    with client.websocket_connect(
-        f"/signal?token={account.token}&device_id={DEVICE}"
-    ) as websocket:
+    with client.websocket_connect(f"/signal?token={account.token}&device_id={DEVICE}") as websocket:
         frame = websocket.receive_json()
 
     assert frame["type"] == "error"
@@ -121,9 +119,7 @@ def test_a_query_string_credential_never_authenticates(client: TestClient) -> No
     account = Account(client, "querystring-noauth@example.com")
     account.register_device(DEVICE)
 
-    with client.websocket_connect(
-        f"/signal?token={account.token}&device_id={DEVICE}"
-    ) as websocket:
+    with client.websocket_connect(f"/signal?token={account.token}&device_id={DEVICE}") as websocket:
         websocket.receive_json()
 
     assert DEVICE not in manager.active_connections
@@ -140,9 +136,7 @@ def test_error_frames_are_classified(client: TestClient) -> None:
     account.register_device(DEVICE)
 
     with account.connect_signaling(DEVICE) as websocket:
-        websocket.send_json(
-            {"type": "connect-request", "target_device_id": "not-a-device-of-mine"}
-        )
+        websocket.send_json({"type": "connect-request", "target_device_id": "not-a-device-of-mine"})
         frame = websocket.receive_json()
 
     # Offline / unknown / not-yours is retryable: the usual cause is a device

@@ -68,9 +68,7 @@ def captured_grant(victim: Account) -> str:
         A real relay session grant for two of the victim's own devices.
     """
     user_id: int = decode_access_token(victim.token)["user_id"]
-    return create_relay_grant(
-        new_relay_session_id(), VICTIM_LAPTOP, VICTIM_BROWSER, user_id
-    )
+    return create_relay_grant(new_relay_session_id(), VICTIM_LAPTOP, VICTIM_BROWSER, user_id)
 
 
 def test_relay_grant_cannot_be_used_as_an_account_bearer_token(
@@ -99,14 +97,10 @@ def test_relay_grant_cannot_be_used_as_an_account_bearer_token(
     # would succeed - proving possession of a key says nothing about being the
     # account holder, which is exactly why the scope check has to do that job.
     attacker_key = Ed25519PrivateKey.generate()
-    attacker_pubkey = base64.b64encode(
-        attacker_key.public_key().public_bytes_raw()
-    ).decode("ascii")
+    attacker_pubkey = base64.b64encode(attacker_key.public_key().public_bytes_raw()).decode("ascii")
     forged_challenge = base64.b64encode(b"a" * 32).decode("ascii")
     signature = base64.b64encode(
-        attacker_key.sign(
-            signed_message(REGISTER_CONTEXT, ROGUE_DEVICE, forged_challenge)
-        )
+        attacker_key.sign(signed_message(REGISTER_CONTEXT, ROGUE_DEVICE, forged_challenge))
     ).decode("ascii")
 
     register_response = client.post(
@@ -153,9 +147,7 @@ def test_relay_grant_cannot_open_a_signaling_socket(client: TestClient) -> None:
     grant = captured_grant(victim)
 
     with client.websocket_connect("/signal") as websocket:
-        websocket.send_json(
-            {"type": "auth", "token": grant, "device_id": VICTIM_LAPTOP}
-        )
+        websocket.send_json({"type": "auth", "token": grant, "device_id": VICTIM_LAPTOP})
         frame = websocket.receive_json()
 
     # Never a challenge frame: the socket is refused before proof of possession.

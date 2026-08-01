@@ -45,8 +45,7 @@ class UserCreate(BaseModel):
         # passwords can pass the field constraint and still be too long.
         if len(self.password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
             raise ValueError(
-                f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes "
-                "when UTF-8 encoded"
+                f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes when UTF-8 encoded"
             )
         return self
 
@@ -157,9 +156,7 @@ class ConnectRequestReceived(BaseModel):
         description="Preferred transport mode"
     )
     relay_session_id: str = Field(description="Server-minted relay session ID")
-    relay_url: str | None = Field(
-        default=None, description="Relay server WebSocket URL"
-    )
+    relay_url: str | None = Field(default=None, description="Relay server WebSocket URL")
     relay_token: str = Field(description="Single-use grant authorizing this device to join")
     relay_token_expires_in: int = Field(description="Grant lifetime in seconds")
 
@@ -169,15 +166,11 @@ class ConnectAck(BaseModel):
 
     type: Literal["connect-ack"]
     target_device_id: str = Field(description="Requesting device ID to ack")
-    transport: Literal["webrtc", "relay"] = Field(
-        description="Confirmed transport mode"
-    )
+    transport: Literal["webrtc", "relay"] = Field(description="Confirmed transport mode")
     relay_session_id: str | None = Field(
         default=None, description="Relay session ID if using relay"
     )
-    status: Literal["connecting", "connected", "failed"] = Field(
-        description="Connection status"
-    )
+    status: Literal["connecting", "connected", "failed"] = Field(description="Connection status")
 
 
 class ConnectAckReceived(BaseModel):
@@ -189,6 +182,4 @@ class ConnectAckReceived(BaseModel):
     relay_session_id: str | None = Field(
         default=None, description="Relay session ID if using relay"
     )
-    status: Literal["connecting", "connected", "failed"] = Field(
-        description="Connection status"
-    )
+    status: Literal["connecting", "connected", "failed"] = Field(description="Connection status")

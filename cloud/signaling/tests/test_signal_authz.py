@@ -219,9 +219,7 @@ def test_no_grant_is_minted_when_the_target_is_offline(client: TestClient) -> No
     alice.register_device(VICTIM_BROWSER)
 
     with alice.connect_signaling(VICTIM_BROWSER) as browser_ws:
-        browser_ws.send_json(
-            {"type": "connect-request", "target_device_id": VICTIM_LAPTOP}
-        )
+        browser_ws.send_json({"type": "connect-request", "target_device_id": VICTIM_LAPTOP})
         response = browser_ws.receive_json()
 
     assert response["type"] == "error"
@@ -234,9 +232,7 @@ def test_connect_request_to_self_is_refused(client: TestClient) -> None:
     alice.register_device(VICTIM_BROWSER)
 
     with alice.connect_signaling(VICTIM_BROWSER) as browser_ws:
-        browser_ws.send_json(
-            {"type": "connect-request", "target_device_id": VICTIM_BROWSER}
-        )
+        browser_ws.send_json({"type": "connect-request", "target_device_id": VICTIM_BROWSER})
         response = browser_ws.receive_json()
 
     assert response["type"] == "error"

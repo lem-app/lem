@@ -144,9 +144,7 @@ class Account:
         """
         self.client = client
         self.email = email
-        response = client.post(
-            "/auth/register", json={"email": email, "password": password}
-        )
+        response = client.post("/auth/register", json={"email": email, "password": password})
         assert response.status_code == 201, response.text
         self.token: str = response.json()["access_token"]
         self.keys: dict[str, DeviceKey] = {}
@@ -238,9 +236,7 @@ class SignalingSession:
         websocket.send_json(
             {
                 "type": "auth-response",
-                "signature": key.sign(
-                    SIGNAL_CONTEXT, self.device_id, challenge_frame["challenge"]
-                ),
+                "signature": key.sign(SIGNAL_CONTEXT, self.device_id, challenge_frame["challenge"]),
             }
         )
         self.connected = websocket.receive_json()

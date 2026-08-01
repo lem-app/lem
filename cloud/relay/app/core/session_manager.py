@@ -136,9 +136,7 @@ class RelaySession:
             JoinRejectedError: If the grant does not authorize this session slot.
         """
         if self._closed:
-            raise JoinRejectedError(
-                "Session is closed", reason_code=ErrorReason.SESSION_CLOSED
-            )
+            raise JoinRejectedError("Session is closed", reason_code=ErrorReason.SESSION_CLOSED)
 
         # Every grant for a session must describe the same user and the same
         # pair of devices. A grant minted for some other conversation cannot
@@ -219,9 +217,7 @@ class RelaySession:
                 self._record(connection, len(data))
                 await peer.websocket.send_bytes(data)
         except TimeoutError:
-            logger.info(
-                f"Session {self.session_id}: idle for {settings.session_timeout}s, closing"
-            )
+            logger.info(f"Session {self.session_id}: idle for {settings.session_timeout}s, closing")
         except Exception as e:
             logger.info(f"Session {self.session_id}: {connection.device_id} closed: {e}")
         finally:

@@ -129,9 +129,7 @@ def test_disconnect_while_waiting_releases_the_session(client: TestClient) -> No
     assert wait_until(lambda: session_manager.get_session_count() == 0, timeout=1.5)
 
 
-def test_total_session_cap_is_enforced(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_total_session_cap_is_enforced(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """The relay refuses new sessions once it is at capacity."""
     monkeypatch.setattr(settings, "max_sessions", 1)
 
@@ -183,9 +181,7 @@ def test_session_stats_go_to_the_metering_logger(
 
         # The session is dropped from the registry slightly before the closing
         # session finishes emitting its accounting, so wait for the record.
-        assert wait_until(
-            lambda: any(r.name == "lem.relay.metering" for r in caplog.records)
-        )
+        assert wait_until(lambda: any(r.name == "lem.relay.metering" for r in caplog.records))
 
     records = [r for r in caplog.records if r.name == "lem.relay.metering"]
     assert records, "expected a metering record"

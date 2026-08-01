@@ -176,9 +176,7 @@ def test_signaling_connect_requires_the_device_key(client: TestClient) -> None:
     impostor_key = new_device_key()
 
     with client.websocket_connect("/signal") as websocket:
-        websocket.send_json(
-            {"type": "auth", "token": alice.token, "device_id": DEVICE_ID}
-        )
+        websocket.send_json({"type": "auth", "token": alice.token, "device_id": DEVICE_ID})
         challenge_frame = websocket.receive_json()
         assert challenge_frame["type"] == "challenge"
         assert challenge_frame["context"] == SIGNAL_CONTEXT.decode("ascii")
@@ -230,9 +228,7 @@ def test_signaling_rejects_a_device_owned_by_another_user(client: TestClient) ->
     mallory = Account(client, "mallory@evil.com")
 
     with client.websocket_connect("/signal") as websocket:
-        websocket.send_json(
-            {"type": "auth", "token": mallory.token, "device_id": DEVICE_ID}
-        )
+        websocket.send_json({"type": "auth", "token": mallory.token, "device_id": DEVICE_ID})
         error = websocket.receive_json()
 
     assert error["message"] == "Authentication failed"
@@ -264,9 +260,7 @@ def test_signaling_rejects_a_wrong_challenge_response_type(client: TestClient) -
     alice.register_device(DEVICE_ID)
 
     with client.websocket_connect("/signal") as websocket:
-        websocket.send_json(
-            {"type": "auth", "token": alice.token, "device_id": DEVICE_ID}
-        )
+        websocket.send_json({"type": "auth", "token": alice.token, "device_id": DEVICE_ID})
         websocket.receive_json()
         websocket.send_json({"type": "offer", "target_device_id": DEVICE_ID})
         error = websocket.receive_json()
@@ -323,19 +317,13 @@ def test_verify_signature_is_domain_separated() -> None:
     challenge = "Y2hhbGxlbmdl"
     signature = key.sign(REGISTER_CONTEXT, DEVICE_ID, challenge)
 
-    assert verify_signature(
-        key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, challenge, signature
-    )
-    assert not verify_signature(
-        key.pubkey_b64, SIGNAL_CONTEXT, DEVICE_ID, challenge, signature
-    )
+    assert verify_signature(key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, challenge, signature)
+    assert not verify_signature(key.pubkey_b64, SIGNAL_CONTEXT, DEVICE_ID, challenge, signature)
     # Nor for a different device id or a different challenge.
     assert not verify_signature(
         key.pubkey_b64, REGISTER_CONTEXT, "other-device", challenge, signature
     )
-    assert not verify_signature(
-        key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, "b3RoZXI=", signature
-    )
+    assert not verify_signature(key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, "b3RoZXI=", signature)
 
 
 def test_verify_signature_rejects_malformed_input() -> None:

@@ -119,9 +119,7 @@ def test_grant_without_expiry_is_rejected(client: TestClient) -> None:
 
 def test_expired_grant_is_rejected(client: TestClient) -> None:
     """An expired grant does not admit a connection."""
-    stale = make_grant(
-        ALICE_SESSION, ALICE_BROWSER, ALICE_LAPTOP, ALICE_USER_ID, expires_in=-10
-    )
+    stale = make_grant(ALICE_SESSION, ALICE_BROWSER, ALICE_LAPTOP, ALICE_USER_ID, expires_in=-10)
     assert_rejected(client, ALICE_SESSION, stale)
 
 

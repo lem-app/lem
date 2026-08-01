@@ -114,9 +114,7 @@ def create_access_token(data: dict[str, Any], expires_delta: timedelta | None = 
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
     else:
-        expire = datetime.now(UTC) + timedelta(
-            minutes=settings.access_token_expire_minutes
-        )
+        expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     # Stamped unconditionally, after the copy, so a caller cannot mint an
     # account token wearing some other scope by passing one in ``data``.
     to_encode.update({"exp": expire, "scope": ACCOUNT_TOKEN_SCOPE})
@@ -190,9 +188,7 @@ def new_relay_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-def create_relay_grant(
-    session_id: str, device_id: str, peer_device_id: str, user_id: int
-) -> str:
+def create_relay_grant(session_id: str, device_id: str, peer_device_id: str, user_id: int) -> str:
     """Mint a short-lived token authorizing one device to join one relay session.
 
     The relay verifies this instead of accepting any signed account token, so
