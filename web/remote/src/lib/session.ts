@@ -39,6 +39,22 @@
  * remove the *durable, enumerable, cross-tab* copy that the framed realm can
  * lift without the dashboard ever running. See spec §8.4 requirement 1.
  *
+ * ### What this does NOT fix, stated here because this is where people look
+ *
+ * **A framed service can still read the token out of the React render tree.**
+ * `useAuth()` puts it in component state and `App.tsx` passes it to children as
+ * a prop, so it lives in fiber nodes attached to DOM elements as
+ * `__reactFiber$…` expandos — in the very subtree that hosts the service's
+ * iframe. Same-origin code in that frame walks `parent.document` to it.
+ *
+ * Storage custody and render-tree custody are two separate problems, and this
+ * module solves only the first. The second is
+ * [#82](https://github.com/lem-app/lem/issues/82), and its fix is the same
+ * shape as this one: components take `isAuthenticated` or a callback that
+ * closes over this variable, never the token value itself — a closure is
+ * invisible to a fiber walk for exactly the reason it is invisible to the
+ * property walk in `token-persistence.test.ts`.
+ *
  * ### The cost, stated plainly
  *
  * **Every full page reload logs the user out.** That is a real regression

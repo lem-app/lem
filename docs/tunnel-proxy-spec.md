@@ -1716,9 +1716,13 @@ The same-origin SW design makes this worse in one specific way and better in ano
 - **Worse**: the framed app now genuinely shares an origin with the dashboard. It can read
   `localStorage`, where the dashboard used to keep the signaling JWT. A hostile or compromised
   local service could exfiltrate the token that authorises tunnelling to the user's machine.
-  **Closed in Phase 6**: the token is held in a module-scoped variable in
-  `web/remote/src/lib/session.ts` and persisted nowhere, a legacy persisted token is purged on
-  load, and `lib/token-persistence.test.ts` sweeps every store for it. *(The line citations that
+  **Narrowed, not closed, in Phase 6**: the token is held in a module-scoped variable in
+  `web/remote/src/lib/session.ts` and written to no browser store, a legacy persisted token is
+  purged on load, and `lib/token-persistence.test.ts` asserts it is unreachable from any global
+  root. **The framed app can still reach it through the React render tree** — `useAuth()` puts it
+  in component state and it is passed as a prop, so it lives in fiber nodes hanging off the DOM,
+  in the same subtree that hosts the iframe. Getting it out of storage did not get it out of the
+  page; [#82](https://github.com/lem-app/lem/issues/82) is the remainder. *(The line citations that
   stood here — `hooks/useAuth.ts:33`, `:44`, `:70`, `:92` — were already stale when Phase 6
   began: [#68](https://github.com/lem-app/lem/pull/68) and #70 had moved custody into
   `lib/session.ts`. Recorded because a `file:line` that has drifted is the failure mode this

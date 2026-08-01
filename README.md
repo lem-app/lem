@@ -166,11 +166,21 @@ hatch, and dropping `allow-same-origin` would stop the proxy working at all.
 Hostile or compromised service code in that frame can reach the dashboard's
 DOM and its storage. What we do about it:
 
-- The signaling JWT is **never persisted** — it lives in a variable for the
-  lifetime of the page, so there is no stored credential for a framed app to
-  read. The cost is that **a full page reload logs you out**; the `HttpOnly`
+- The signaling JWT is **never written to browser storage** — no
+  `localStorage`, `sessionStorage`, IndexedDB, cookie or URL — so it does not
+  outlive the page and cannot be lifted from a store without the dashboard
+  running. The cost is that **a full page reload logs you out**; the `HttpOnly`
   refresh cookie that removes that cost is
   [#79](https://github.com/lem-app/lem/issues/79).
+
+  **This does not put the token out of a framed service's reach, and you should
+  not read it as though it does.** The dashboard is a React app, so while you
+  are signed in the token is held in the rendered component tree, which is
+  reachable from the DOM by same-origin code — including code running in a
+  framed service. Keeping it out of storage removed the durable copy; it did
+  not remove the page copy. That is tracked as
+  [#82](https://github.com/lem-app/lem/issues/82). Until it is closed, "only
+  launch services you trust" is doing the work here.
 - Upstream `Content-Security-Policy`, `X-Frame-Options` and
   `Strict-Transport-Security` are stripped and replaced, so a framed app cannot
   pin *your dashboard's* origin to HTTPS-only or break the proxy.

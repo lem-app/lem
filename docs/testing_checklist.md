@@ -644,7 +644,12 @@ http.server.HTTPServer(('127.0.0.1', 39999), H).serve_forever()
    violation in the console. If you cannot produce one on demand, step 3's silence proves
    nothing about this browser's reporting.
 
-**C. The JWT is not readable from a framed app, and a reload logs you out.**
+**C. The JWT is in no browser store, and a reload logs you out.**
+
+> **Scope, so this section is not over-read.** It checks that the token is out of *storage*. It
+> does **not** show the token is beyond a framed service's reach — it is not, because the React
+> render tree still holds it ([#82](https://github.com/lem-app/lem/issues/82)). Step 5 makes that
+> visible on purpose rather than leaving a tester with a false all-clear.
 
 1. On B at `http://localhost:5173` (a secure context, so the proxy works), log in and frame any
    service.
@@ -656,6 +661,20 @@ http.server.HTTPServer(('127.0.0.1', 39999), H).serve_forever()
 4. Press F5 on the dashboard. **Expected:** the login screen, every time. Staying signed in means
    the token is being re-hydrated from somewhere and the criterion has failed, whatever the
    suite says.
+5. **The exposure that remains, observed rather than assumed.** Still in the iframe's console:
+
+   ```js
+   const host = parent.document.body
+   const fiberKey = Object.keys(host).find((k) => k.startsWith('__reactFiber$'))
+   fiberKey ? 'fiber reachable: ' + fiberKey : 'no fiber found'
+   ```
+
+   **Expected while [#82](https://github.com/lem-app/lem/issues/82) is open:** a key is found, and
+   walking `host[fiberKey].return` upwards reaches props and hook state holding the token.
+   **Expected once #82 is closed:** the fiber is still there — React always attaches it — but no
+   token appears in any `memoizedProps` or `memoizedState` along that chain, because components
+   receive `isAuthenticated` and callbacks rather than the token itself. The automated form of
+   this check is `web/remote/src/lib/fiber-reachability.test.ts`.
 
 **In-suite for Phase 6, and therefore not repeated above:** the degradation reason table and its
 precedence (`sw-bridge.test.ts`), the degraded UI and the absence of an iframe fallback
