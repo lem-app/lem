@@ -160,15 +160,16 @@ Lem is open source software licensed under the **GNU Affero General Public Licen
 - Self-host all components (local server + cloud services)
 - Fork and experiment with the code
 - Audit the source code for security
+- Run an unmodified Lem as a service for other people, including commercially
 
-✅ **If you run Lem's cloud services publicly**, you must:
-- Open source any modifications you make
-- Use the same AGPL-3.0-or-later license
-- Provide source code to your users
+✅ **If you modify Lem and offer the modified version over a network**, you must:
+- Offer those users the source of your version, from a network server, at no charge
+- License your modifications under AGPL-3.0-or-later
+- Do the same when you distribute modified copies
 
 ### Why AGPL?
 
-We chose AGPL to keep Lem truly open source while ensuring that improvements benefit the entire community. If someone offers Lem as a hosted service, they must share their code—preventing proprietary forks.
+AGPL-3.0's network clause (§13) is triggered by **modification**, not by hosting. Someone can run Lem verbatim as a paid service and owe nothing back; the license does not prevent that. What it does prevent is the usual way an open project gets strip-mined — the proprietary fork. Anyone who improves Lem and then puts those improvements in front of users, over a network or as a distributed copy, has to publish them under the same license. Improvements come back to the commons.
 
 ### Commercial Licensing
 
