@@ -1275,65 +1275,19 @@ token stream is forwarded token-group by token-group. That is G4. Note `iter_chu
 > - The **server relays `Set-Cookie` verbatim** — every one of them, which is what §3.5's pair
 >   encoding is for. It does *not* rewrite: the rewrite needs the device segment, and the far
 >   side is the device, so that id is never on the wire for it to use.
-> - The **Service Worker re-scopes each cookie** as it builds the `Response`
->   (`lem-app-sw.js::rewriteSetCookie`): `Path` is *replaced* with
->   `/app/<deviceId>/<serviceId>/` — the **request's** segments, matching the device-mismatch
->   rule — `Domain` is dropped so the cookie stays host-only, and `HttpOnly`, `Secure`,
->   `SameSite` and everything else are passed through byte for byte. An app that deliberately
->   sets a cookie its own JavaScript reads needs it readable.
+> - ~~The **Service Worker re-scopes each cookie** as it builds the `Response`: `Path` replaced
+>   with `/app/<deviceId>/<serviceId>/`, `Domain` dropped.~~ **Not implemented — see §5.6.2.**
+>   This was built and then deleted: a browser discards `Set-Cookie` on a response a worker
+>   synthesises, so the rewrite could never take effect. The worker does no cookie handling at
+>   all today.
 > - `set-cookie2` stays blocked. RFC 6265 obsoleted RFC 2965, its attribute grammar is a
 >   different quoted one, and no upstream this proxy fronts emits it.
-> - A **`__Host-`-prefixed cookie is renamed across the boundary** — see below. It is the one
->   name for which "re-scope the `Path`" and "the browser stores it" cannot both be true.
+
+> ### ⚠️ §5.6.2 supersedes the browser half of this: the browser never sees these cookies
 >
-> **This is functional isolation, not a security boundary** — see §8.4.
-
-> ### ⚠️ 5.6.2 supersedes the above: the browser never sees these cookies
->
-> Everything in this block describes bytes the proxy produces. A browser does
-> **not** store them. Read §5.6.2 before building on any of it.
-
-#### 5.6.1 `__Host-` and the `Path` rewrite are mutually exclusive
-
-A cookie whose name begins with `__Host-` is accepted **only** if it carries `Secure`, carries no
-`Domain`, and has `Path=/` *exactly* (RFC 6265bis §4.1.3.2). So the §5.6 rewrite — which exists to
-replace `Path` — produces, for exactly these cookies, a `Set-Cookie` that every browser silently
-refuses to store. No error, no console entry: just a session that never comes into existence. It
-is the same failure shape as the header being stripped, one layer further along, and it lands on
-precisely the cookies a well-hardened login uses.
-
-The two behaviours cannot both hold on a shared origin. That is not an implementation gap, it is
-the conflict per-service origins (§8.4 requirement 4, Phase 7) exists to resolve. Until then:
-
-**The cookie is renamed across the boundary.** Only the leading `__` becomes `__Lem-`, so
-`__Host-session` travels as `__Lem-Host-session` and every other byte of the name — casing
-included — survives. On the request path the worker restores it, so **the upstream server always
-sees the name it set**. The browser stores an unprefixed, path-scoped cookie; the server is none
-the wiser.
-
-Normatively:
-
-- The prefix is matched **case-insensitively** (browsers match it that way), but only `__` is
-  substituted, so the transform is lossless and reversible.
-- The restore is **narrow**: only `__Lem-Host-…` is turned back into `__Host-…`, so a framed app's
-  own `__Lem-anything` cookie is left alone. A cookie literally named `__Lem-Host-x` is the single
-  collision this cannot distinguish; it is documented rather than guessed at.
-- `__Secure-` needs **no** handling. It requires only the `Secure` attribute, which already passes
-  through untouched, and it places no constraint on `Path`. Checked, and recorded as checked.
-- Every rename posts `LEM_COOKIE_RENAMED` to the page, which logs it. **The rename must never be
-  silent**, because it is the one transformation here that a framed app can actually observe.
-
-**The cost, stated plainly:** JavaScript in the frame reading `document.cookie` sees
-`__Lem-Host-session`, not `__Host-session`. `__Host-` cookies are overwhelmingly `HttpOnly` and
-server-read, so this is usually invisible — but it is a rename, not a no-op.
-
-**Rejected, and why:**
-
-- *Pass `__Host-` through with `Path=/`.* No path isolation for exactly the cookies that most need
-  it, and worse: `__Host-session` is the canonical name, so two services both using it would
-  collide on (name, path, host) — each login would destroy the other's session.
-- *Refuse the cookie and surface an error.* Visible rather than silent, which is an improvement,
-  but login stays broken — and making login work is what #72 is for.
+> The **server** relay above is real and shipped. The Service Worker rewrite this block
+> originally described is **not implemented** — it was built, found undeliverable, and deleted.
+> Read §5.6.2 before building on any of it.
 
 #### 5.6.2 The `Set-Cookie` design of #72 does not work in a browser
 
@@ -1376,12 +1330,42 @@ read these cookies.
 That is **stronger** than what §5.6 aimed at, on three counts: `HttpOnly` becomes real rather than
 emulated (the value never enters the browser at all), isolation becomes a genuine per-service
 partition rather than path-scoping the frame's own JavaScript could walk around, and the `__Host-`
-conflict of §5.6.1 disappears entirely along with the rename.
+`__Host-` conflict disappears entirely (see the implementation notes below).
 
 The cost is the mirror image: `document.cookie` in the frame sees none of it, so an app whose
 *client-side* JavaScript reads a cookie by name breaks. That is a real trade and it belongs to
 whoever owns #72, not to a review round — which is why PR #78 reports this rather than
 implementing it.
+
+##### Implementation notes for the jar, paid for once already
+
+These were learned while building the rewrite that was then deleted. They apply unchanged to a
+jar, which must also parse `Set-Cookie` and must also decide what a cookie name means.
+
+**1. Cookie name prefixes, and the trap in how they are specified.** RFC 6265bis §4.1.3 describes
+the `__Secure-`/`__Host-` prefixes from the *server's* point of view and says the match is
+**case-sensitive**. §5.4 and the storage model in §5.7 impose the requirement that actually binds
+an implementation, and there it is **case-insensitive** (`MUST`) — deliberately, so that a
+case-insensitive server cannot be tricked into accepting `__SECURE-` as an unprefixed name. **A
+user agent, or anything standing in for one, must match case-insensitively.**
+
+This is not academic. **tough-cookie matches case-sensitively.** Since tough-cookie via jsdom is
+this repository's only cookie-store oracle, a `__HOST-`-cased cookie passes the suite and fails in
+a real browser. Any test written against that jar inherits the gap; match case-insensitively in
+the implementation regardless of what the oracle accepts, and do not treat a green suite here as
+evidence about prefixes.
+
+**2. `__Host-` constrains `Path`; `__Secure-` does not.** `__Host-` requires `Secure`, no
+`Domain`, and `Path=/` *exactly*. `__Secure-` requires only `Secure` and says nothing about
+`Path`. A jar keyed by `(deviceId, serviceId)` sidesteps both — it never has to alter a `Path`,
+because the partition is the key rather than the path — which is one more reason it is the better
+design. Verified against tough-cookie: a `__Host-` cookie with a rewritten `Path` is silently
+refused, the same cookie with `Path=/` stores and reads back.
+
+**3. The failure is always silent.** Nothing in the platform reports a refused cookie: not an
+exception, not a console entry. Whatever the jar does, it should be able to say what it stored and
+why it dropped anything — the two bugs in this area both cost a review round precisely because the
+code believed it had succeeded.
 
 **Backpressure.** Before each chunk, if the transport's buffered amount exceeds
 `SEND_HIGH_WATER = 1 MiB`, await the low-water signal:
@@ -1736,25 +1720,29 @@ The same-origin SW design makes this worse in one specific way and better in ano
   choice is explicit rather than accidental.
 
 **Cookies on the shared origin (Phase 5, [#72](https://github.com/lem-app/lem/issues/72)).**
-Because every framed service shares the dashboard's origin, it also shares its cookie jar. The
-Service Worker therefore re-scopes each upstream `Set-Cookie` to
-`Path=/app/<deviceId>/<serviceId>/` and strips `Domain`, so the browser only *attaches* a
-service's cookie to requests for that service's path — not to another service's, and not to the
-dashboard's own requests. That is what makes login work without one app's session cookie being
-handed to the next.
+Because every framed service shares the dashboard's origin, it would also share its cookie jar.
 
-A `__Host-`-prefixed cookie cannot be path-scoped at all — the prefix mandates `Path=/` — so it is
-renamed across the boundary instead (§5.6.1), which keeps both the scoping and a working login at
-the cost of a name the frame's own JavaScript would notice.
+**Today there is nothing to partition: no cookie reaches the browser at all.** The plan was for
+the Service Worker to re-scope each upstream `Set-Cookie` to `Path=/app/<deviceId>/<serviceId>/`
+and strip `Domain`. That is undeliverable — a browser discards `Set-Cookie` on a
+worker-synthesised response (§5.6.2) — so it was built, found not to work, and deleted. **A framed
+app cannot hold a session over the tunnel**, which is a functional limitation rather than a
+security one, and it is the honest state of Phase 5.
 
-**It is functional isolation, not a security boundary. Do not describe it as "cookies are
-isolated per service".** Path-scoping governs what the browser sends on its own initiative and
-nothing else. Same-origin JavaScript in one framed app can still `fetch('/app/<other>/…')`
-deliberately and have that request carry the other service's cookies, and it can still read
-anything not marked `HttpOnly` through a request it makes itself. A hostile or compromised
-service framed on this origin is not contained by path scoping. **Per-service origins
-(requirement 4 below) is the actual boundary**; this makes v0.1 usable with a stated, understood
-limitation instead of shipping either a login-less viewer or one shared unpartitioned jar.
+When the §5.6.2 jar is built, note what changes about *this* section: a jar keyed by
+`(deviceId, serviceId)` and read only by the worker is a **stronger** position than the
+path-scoping described above, not a weaker one. `HttpOnly` becomes real rather than emulated,
+because the value never enters the browser; and one service's cookies become genuinely
+unreachable from another's frame, rather than merely un-sent-by-default.
+
+**Path-scoping, had it worked, would have been functional isolation and not a security boundary —
+and it must never be described as "cookies are isolated per service".** It governs what the
+browser sends on its own initiative and nothing else: same-origin JavaScript in one framed app can
+still `fetch('/app/<other>/…')` deliberately and have that request carry the other service's
+cookies, and can still read anything not marked `HttpOnly` through a request it makes itself. A
+hostile or compromised service framed on this origin is contained by none of it. **Per-service
+origins (requirement 4 below) is the actual boundary**, and that remains true whichever cookie
+design lands.
 
 **Normative requirements that ship with Phase 6:**
 
@@ -1955,13 +1943,13 @@ resumed over a WebSocket.
 - [ ] A WS message larger than `MAX_CHUNK_BYTES` is fragmented and reassembled intact.
 - [ ] The shim is the first `<script>` in the document — asserted by parsing the delivered HTML.
 - [ ] ~~An upstream `Set-Cookie` reaches the browser with `Path` rewritten to the requesting
-      service's segment and `Domain` removed~~ — **blocked, see §5.6.2.** The rewrite is
-      implemented and its output is asserted (`Path` replaced not appended, `Domain` removed,
-      other attributes byte-identical, every `Set-Cookie` surviving separately, `__Host-` renamed
-      per §5.6.1, `__Secure-` untouched), but a browser discards `Set-Cookie` on a
-      worker-synthesised `Response`, so **no cookie produced by this path is ever stored**. The
-      criterion is *not met*, and cannot be met by this design. Login over the tunnel therefore
-      still does not work, which also blocks the socket.io criterion above.
+      service's segment and `Domain` removed~~ — **withdrawn, see §5.6.2.** A browser discards
+      `Set-Cookie` on a worker-synthesised `Response`, so this criterion cannot be met by any
+      implementation of the §5.6 design. The Service Worker rewrite was built, found
+      undeliverable, and **deleted** rather than kept and annotated — code that looks like working
+      cookie handling, with a green suite behind it, is worse than none. What remains is the
+      server-side relay, which is the prerequisite for the §5.6.2 jar. **Login over the tunnel
+      still does not work**, which is also what blocks the socket.io criterion above.
 
 > **Which of these a test can settle, and which a human has to.** Two criteria above name a
 > product, a browser and a model: "Open WebUI's socket.io session establishes and a chat message

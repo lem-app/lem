@@ -37,13 +37,7 @@ import {
 } from '../test/sw-harness'
 import { FrameType, MAX_CHUNK_BYTES } from './http-frame'
 import { TunnelErrorCode } from './tunnel-errors'
-import {
-  HTML_SNIFF_BYTES,
-  SHIM_MARKER_ATTRIBUTE,
-  WS_SHIM_SOURCE,
-  restoreCookieHeader,
-} from '../../public/lem-app-sw.js'
-import type { CookieJar } from 'jsdom'
+import { HTML_SNIFF_BYTES, SHIM_MARKER_ATTRIBUTE, WS_SHIM_SOURCE } from '../../public/lem-app-sw.js'
 
 const DEVICE_A = 'dev-7f3a'
 const DEVICE_B = 'dev-91c2'
@@ -741,267 +735,47 @@ describe('the same-origin Service Worker proxy', () => {
     })
   })
 
-  // ==========================================================================
-  // Read this before trusting anything in the block below.
-  //
-  // Every assertion here is about the *bytes this proxy produces*. None of them
-  // is evidence that a browser stores the resulting cookie, and it does not:
-  // `Set-Cookie` is a forbidden response-header name, so a Response synthesised
-  // in a Service Worker cannot carry it. See the divergence test immediately
-  // below, and docs/tunnel-proxy-spec.md section 5.6.2.
-  // ==========================================================================
-  describe('cookies', () => {
-    const LOGIN_COOKIE = 'session=s3cret; Path=/; Domain=app.local; HttpOnly; Secure; SameSite=Lax'
-
-    it('are NOT delivered to a browser by this path - the divergence this suite hides', () => {
-      // `Set-Cookie` and `Set-Cookie2` are *forbidden response-header names*
-      // (Fetch Standard, "forbidden response-header name" - still present, it
-      // was never removed). A browser's `new Response(body, { headers })` gives
-      // its Headers the "response" guard, and `validate` drops a forbidden name
-      // silently. Even if it survived, "parse and store response Set-Cookie
-      // headers" is invoked only from HTTP-network-or-cache fetch - a path a
-      // service-worker-supplied response never enters.
+  // There is no cookie handling in the Service Worker to test, and that is the
+  // point of the single test below. #72 specified a `Set-Cookie` rewrite; it was
+  // built, and then found to be undeliverable. The rewrite is deleted rather
+  // than kept and annotated, so nothing here can be mistaken for working cookie
+  // support - but the *reason* is worth an assertion, because the suite would
+  // otherwise happily agree with a reimplementation of the same mistake.
+  describe('cookies, and why the worker does not handle them', () => {
+    it('cannot be delivered on a worker-synthesised Response - the rule undici does not enforce', () => {
+      // `Set-Cookie` and `Set-Cookie2` are *forbidden response-header names* in
+      // the Fetch Standard - a concept that is current, not removed. A browser's
+      // `new Response(body, { headers })` gives its Headers the "response"
+      // guard, and `validate` drops a forbidden name silently. Even if it
+      // survived, "parse and store response Set-Cookie headers" runs only inside
+      // HTTP-network-or-cache fetch, which a worker-supplied response never
+      // enters.
       //
-      // Node's undici does not enforce that guard, which is why every cookie
-      // test in this file passes. Recorded as an assertion rather than a
-      // comment so nobody re-derives it, and so the suite states plainly that
-      // it agrees with the rewrite for reasons that do not hold in a browser.
-      const response = new Response('x', { headers: [['Set-Cookie', 'a=1; Path=/']] })
-
-      expect(response.headers.getSetCookie()).toEqual(['a=1; Path=/'])
-      // ^ In every browser this is `[]`. The assertion above is the bug.
+      // Node's undici does not enforce that guard. This assertion pins the
+      // divergence so that a future rewrite cannot be "proved" correct by a
+      // suite that is simply more permissive than the platform.
+      const synthesised = new Response('x', { headers: [['Set-Cookie', 'a=1; Path=/']] })
+      expect(synthesised.headers.getSetCookie()).toEqual(['a=1; Path=/'])
+      // ^ In every browser this is `[]`. See docs/tunnel-proxy-spec.md 5.6.2.
     })
 
-    /** The real cookie jar jsdom uses for `document.cookie`: tough-cookie. */
-    async function realCookieJar(): Promise<InstanceType<typeof CookieJar>> {
-      const { CookieJar: Jar } = await import('jsdom')
-      return new Jar()
-    }
-
-    function serveLogin(cookies: string[]): void {
-      harness.tunnel.serve((request) => {
-        if (request.path.startsWith('/login')) {
-          return {
-            status: 200,
-            headers: [
-              ['Content-Type', 'text/plain'],
-              ...cookies.map((value): [string, string] => ['Set-Cookie', value]),
-            ],
-            chunks: ['ok'],
-          }
-        }
-        return { status: 200, headers: [['Content-Type', 'text/plain']], chunks: ['ok'] }
-      })
-    }
-
-    it('re-scopes Path to the requesting service and drops Domain, changing nothing else', async () => {
-      serveLogin([LOGIN_COOKIE])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      const result = await harness.dispatch(`${ORIGIN}/login`, {
-        clientId: 'frame-1',
-        method: 'POST',
-        body: 'user=a',
-      })
-
-      expect(result.response?.headers.getSetCookie()).toEqual([
-        'session=s3cret; HttpOnly; Secure; SameSite=Lax; Path=/app/dev-7f3a/webui/',
-      ])
-    })
-
-    // A `__Host-` cookie is valid only with `Path=/`, so a path-scoped one is
-    // refused by the browser's cookie store - silently, which is the failure
-    // mode #72 exists to remove. These assert against tough-cookie, which
-    // enforces the same rule real browsers do.
-    it('renames a __Host- cookie so the browser will actually store it', async () => {
-      serveLogin(['__Host-session=abc123; Path=/; Secure'])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const delivered = result.response?.headers.getSetCookie() ?? []
-      await settle()
-
-      expect(delivered).toEqual(['__Lem-Host-session=abc123; Secure; Path=/app/dev-7f3a/webui/'])
-
-      // The whole point: a real jar stores it and hands it back.
-      const jar = await realCookieJar()
-      jar.setCookieSync(delivered[0], appUrl(DEVICE_A, 'webui', '/login'))
-      expect(jar.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))).toBe(
-        '__Lem-Host-session=abc123'
-      )
-
-      // And it is still path-scoped, which is why the rename was needed at all.
-      expect(jar.getCookieStringSync(appUrl(DEVICE_A, 'ollama', '/api/tags'))).toBe('')
-      expect(jar.getCookieStringSync(`${ORIGIN}/`)).toBe('')
-
-      // Never silent.
-      expect(harness.bridge.cookieRenames).toBe(1)
-    })
-
-    it('the unrenamed form is what a real jar refuses - the counterfactual', async () => {
-      // The control for the test above. Without the rename the delivered cookie
-      // is well-formed, the SW believes it succeeded, and the browser is the
-      // only thing that knows the session was dropped.
-      const jar = await realCookieJar()
-      const login = appUrl(DEVICE_A, 'webui', '/login')
-
-      jar.setCookieSync('__Host-session=abc123; Secure; Path=/app/dev-7f3a/webui/', login)
-      expect(jar.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))).toBe('')
-
-      // Same cookie, untouched Path, stores fine - so the refusal above is the
-      // prefix rule, not a quirk of the jar or of this URL.
-      const control = await realCookieJar()
-      control.setCookieSync('__Host-session=abc123; Secure; Path=/', login)
-      expect(control.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))).toBe(
-        '__Host-session=abc123'
-      )
-    })
-
-    it('restores the original name on the way back to the upstream', async () => {
-      serveLogin(['__Host-session=abc123; Path=/; Secure'])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-      const login = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const delivered = login.response?.headers.getSetCookie() ?? []
-
-      const jar = await realCookieJar()
-      jar.setCookieSync(delivered[0], appUrl(DEVICE_A, 'webui', '/login'))
-      const attached = jar.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))
-
-      harness.tunnel.requests.length = 0
-      await harness.dispatch(`${ORIGIN}/api/models`, {
-        clientId: 'frame-1',
-        headers: [['Cookie', attached]],
-      })
-
-      // The server that set `__Host-session` must be handed `__Host-session`.
-      const cookie = harness.tunnel.requests[0].headers.find(
-        ([name]) => name.toLowerCase() === 'cookie'
-      )?.[1]
-      expect(cookie).toBe('__Host-session=abc123')
-    })
-
-    it('leaves every other cookie name alone on the request path', async () => {
-      // The rename must not be a wildcard: only `__Lem-Host-` comes back as
-      // `__Host-`. An app's own `__Lem-` cookie is not ours to touch.
-      harness.tunnel.serve(() => ({ status: 200, chunks: ['ok'] }))
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      await harness.dispatch(`${ORIGIN}/api/models`, {
-        clientId: 'frame-1',
-        headers: [['Cookie', '__Lem-Host-a=1; __Lem-other=2; plain=3; __Secure-s=4']],
-      })
-
-      const cookie = harness.tunnel.requests[0].headers.find(
-        ([name]) => name.toLowerCase() === 'cookie'
-      )?.[1]
-      expect(cookie).toBe('__Host-a=1; __Lem-other=2; plain=3; __Secure-s=4')
-    })
-
-    it('preserves the exact casing an upstream used for the prefix', async () => {
-      serveLogin(['__HOST-Session=v; Path=/; Secure'])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const [delivered] = result.response?.headers.getSetCookie() ?? []
-
-      // Only the leading `__` is substituted, so the round trip is lossless.
-      expect(delivered).toBe('__Lem-HOST-Session=v; Secure; Path=/app/dev-7f3a/webui/')
-      expect(restoreCookieHeader('__Lem-HOST-Session=v')).toBe('__HOST-Session=v')
-    })
-
-    it('leaves a __Secure- cookie completely alone', async () => {
-      // `__Secure-` requires only the `Secure` attribute, which passes through
-      // untouched, so it needs no rename - and must not get one.
-      serveLogin(['__Secure-sid=xyz; Path=/; Secure; HttpOnly'])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const delivered = result.response?.headers.getSetCookie() ?? []
-      await settle()
-
-      expect(delivered).toEqual(['__Secure-sid=xyz; Secure; HttpOnly; Path=/app/dev-7f3a/webui/'])
-      expect(harness.bridge.cookieRenames).toBe(0)
-
-      // And a real jar accepts it path-scoped, which is why no rename is needed.
-      const jar = await realCookieJar()
-      jar.setCookieSync(delivered[0], appUrl(DEVICE_A, 'webui', '/login'))
-      expect(jar.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))).toBe(
-        '__Secure-sid=xyz'
-      )
-    })
-
-    it('replaces an existing Path rather than appending a second one', async () => {
-      serveLogin(['a=1; Path=/deep/nested; Max-Age=60'])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-
-      const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const [cookie] = result.response?.headers.getSetCookie() ?? []
-
-      expect(cookie).toBe('a=1; Max-Age=60; Path=/app/dev-7f3a/webui/')
-      expect(cookie.match(/Path=/gi)).toHaveLength(1)
-      expect(cookie).not.toContain('/deep/nested')
-    })
-
-    it('keeps every Set-Cookie a login sets, separately', async () => {
-      serveLogin([LOGIN_COOKIE, 'csrftoken=abc123; Path=/api; SameSite=Strict', 'theme=dark'])
+    it('are dropped by the worker rather than handed to the frame', async () => {
+      // The worker mirrors the browser instead of diverging from it: an upstream
+      // cookie reaches the worker (the server relays it, which the jar design
+      // needs) and goes no further.
+      harness.tunnel.serve(() => ({
+        status: 200,
+        headers: [
+          ['Content-Type', 'text/plain'],
+          ['Set-Cookie', 'session=s3cret; Path=/; HttpOnly'],
+        ],
+        chunks: ['ok'],
+      }))
       harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
 
       const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
 
-      expect(result.response?.headers.getSetCookie()).toEqual([
-        'session=s3cret; HttpOnly; Secure; SameSite=Lax; Path=/app/dev-7f3a/webui/',
-        'csrftoken=abc123; SameSite=Strict; Path=/app/dev-7f3a/webui/',
-        'theme=dark; Path=/app/dev-7f3a/webui/',
-      ])
-    })
-
-    it('never reaches another service or the dashboard root, asserted at the transport', async () => {
-      await harness.bridge.openSession(DEVICE_A, 'ollama')
-      serveLogin([LOGIN_COOKIE])
-      harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
-      harness.clients.add('frame-2', appUrl(DEVICE_A, 'ollama'))
-
-      const login = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
-      const delivered = login.response?.headers.getSetCookie() ?? []
-
-      // What the *browser* would do next, run through tough-cookie - the same
-      // implementation jsdom's own `document.cookie` uses. Not `document.cookie`
-      // itself: that reads one document's jar at one path, which cannot show
-      // what a request to a different path would carry.
-      const jar = await realCookieJar()
-      for (const value of delivered) jar.setCookieSync(value, appUrl(DEVICE_A, 'webui', '/login'))
-
-      const toWebui = jar.getCookieStringSync(appUrl(DEVICE_A, 'webui', '/api/models'))
-      const toOllama = jar.getCookieStringSync(appUrl(DEVICE_A, 'ollama', '/api/tags'))
-      const toDashboard = jar.getCookieStringSync(`${ORIGIN}/`)
-
-      // Positive control first: the jar is reading real content, and the
-      // cookie *is* attached where it belongs.
-      expect(toWebui).toBe('session=s3cret')
-      expect(toOllama).toBe('')
-      expect(toDashboard).toBe('')
-
-      // Now the transport. Replay each request with exactly the Cookie header
-      // the browser would have attached, and read what the far side received.
-      harness.tunnel.requests.length = 0
-      await harness.dispatch(`${ORIGIN}/api/models`, {
-        clientId: 'frame-1',
-        headers: toWebui === '' ? [] : [['Cookie', toWebui]],
-      })
-      await harness.dispatch(`${ORIGIN}/api/tags`, {
-        clientId: 'frame-2',
-        headers: toOllama === '' ? [] : [['Cookie', toOllama]],
-      })
-
-      const cookieHeaderOf = (index: number): string | undefined =>
-        harness.tunnel.requests[index].headers.find(
-          ([name]) => name.toLowerCase() === 'cookie'
-        )?.[1]
-
-      expect(harness.tunnel.requests[0].service).toBe('webui')
-      expect(cookieHeaderOf(0)).toBe('session=s3cret')
-      expect(harness.tunnel.requests[1].service).toBe('ollama')
-      expect(cookieHeaderOf(1)).toBeUndefined()
+      expect(result.response?.headers.getSetCookie()).toEqual([])
     })
   })
 })

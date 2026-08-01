@@ -191,9 +191,6 @@ export class ServiceWorkerBridge {
   /** Exposed for tests: documents delivered without the WebSocket shim. */
   shimSkips = 0
 
-  /** Exposed for tests: `__Host-` cookies renamed to survive path-scoping. */
-  cookieRenames = 0
-
   constructor(options: ServiceWorkerBridgeOptions) {
     this.proxyFetch = options.proxyFetch
     this.container =
@@ -369,25 +366,6 @@ export class ServiceWorkerBridge {
           'WebSockets in that document will not reach the tunnel.'
       )
       this.shimSkips += 1
-      return
-    }
-
-    if (data?.type === 'LEM_COOKIE_RENAMED') {
-      // A `__Host-` cookie cannot be path-scoped and stored at the same time,
-      // so it crosses under a different name. Announced rather than done
-      // quietly: JavaScript in the frame looking the cookie up by name will
-      // not find it, and that is a real if usually invisible difference.
-      const { from, to, serviceId } = data as {
-        from?: unknown
-        to?: unknown
-        serviceId?: unknown
-      }
-      console.warn(
-        `[sw-bridge] Renamed ${String(from)} to ${String(to)} for ${String(serviceId)}: ` +
-          'a __Host- cookie cannot carry a per-service Path. The upstream server still ' +
-          'sees its original name; document.cookie in the frame does not.'
-      )
-      this.cookieRenames += 1
       return
     }
 

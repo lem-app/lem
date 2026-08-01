@@ -188,10 +188,14 @@ def test_upstream_response_headers_are_filtered() -> None:
 def test_set_cookie_crosses_the_tunnel_verbatim() -> None:
     """#72: blocking this header meant no framed app could ever log in.
 
-    The server relays the cookie exactly as the upstream wrote it. Re-scoping
-    it to ``/app/<deviceId>/<serviceId>/`` happens in the Service Worker, the
-    only side that knows the device segment - the far side *is* the device, so
-    the id is never on the wire. Rewriting here would require inventing it.
+    The server relays the cookie exactly as the upstream wrote it. It does not
+    rewrite: only the browser side knows the device segment, because the far
+    side *is* the device, so the id is never on the wire for it to use.
+
+    The browser side does not consume this yet - the Service Worker rewrite #72
+    specified is undeliverable (spec section 5.6.2), and the cookie jar that
+    replaces it is not built. The relay is that jar's prerequisite, which is why
+    this test guards it now rather than later.
     """
     upstream = "session=secret; Path=/; Domain=app.local; HttpOnly; Secure; SameSite=Lax"
 

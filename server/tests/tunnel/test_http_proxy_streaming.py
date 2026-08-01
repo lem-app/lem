@@ -337,13 +337,14 @@ async def test_login_cookies_reach_the_peer(
 ) -> None:
     """#72: every ``Set-Cookie`` a real login sets crosses, unmodified.
 
-    While this header was blocked, the frames a browser received carried no
-    cookie at all, so no framed app could hold a session. Reverting the
-    ``RESPONSE_BLOCKED_HEADERS`` change fails this on the empty list.
+    While this header was blocked, the frames carried no cookie at all. It
+    crosses now. Reverting the ``RESPONSE_BLOCKED_HEADERS`` change fails this
+    on the empty list.
 
-    The values are asserted byte-for-byte because the *server* must not
-    rewrite them: only the Service Worker knows the device segment the
-    ``Path`` has to name.
+    The values are asserted byte-for-byte because the server must not rewrite
+    them, and because the browser-side consumer does not exist yet: the Service
+    Worker rewrite #72 specified is undeliverable (spec section 5.6.2), and the
+    cookie jar that replaces it will parse exactly these bytes.
     """
     base, _ = upstream
     handler, collector = authorized_handler(base, RequestRouter(base))

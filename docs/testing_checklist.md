@@ -484,13 +484,12 @@ pulled, machine B on a different network. Everything below happens on **B**.
    than proving the browser did. If this step fails while step 3 shows the cookie correctly
    stored, the defect is on the request path, not in the `Set-Cookie` rewrite, and the fix
    belongs with whatever mechanism the worker uses to read cookies.
-7. **`__Host-` cookies specifically.** If the service sets one (Open WebUI does not; many
-   hardened apps do), DevTools → Application → Cookies shows it stored as
-   **`__Lem-Host-<name>`**, and the dashboard console carries a
-   `[sw-bridge] Renamed __Host-… to __Lem-Host-…` warning.
-   **Expected on A:** the upstream still logs the cookie under its **original** `__Host-` name.
-   A `__Host-` cookie that appears in DevTools *unrenamed* and with a per-service `Path` is a
-   bug — the browser will refuse to store it and login will fail with no other symptom.
+7. **When the §5.6.2 jar lands, re-run steps 3–6 and add:** a `__Host-`-prefixed cookie (Open
+   WebUI does not set one; many hardened apps do) must reach the upstream under its **original**
+   name, and must not appear in DevTools → Application → Cookies at all — under a jar the browser
+   never stores these, which is the point. Note that a `__HOST-`-cased name has to work too: user
+   agents match the prefix case-insensitively, and this repository's only cookie-store oracle
+   (tough-cookie) does not, so that case can only be checked here. See spec §5.6.2.
 
 **B. The shim is in the document, and it is first.**
 
