@@ -2,13 +2,13 @@
 
 **Your local AI infrastructure, securely accessible from anywhere.**
 
-Lem is an open-source platform for managing and remotely accessing your local AI services (Ollama, Open WebUI, and more) through secure peer-to-peer connections.
+Lem is an open-source platform for managing and remotely accessing your local AI services (Ollama, Open WebUI, and more) through peer-to-peer WebRTC connections, with a relay fallback for networks that block them.
 
 ## 🌟 Features
 
 - **🚀 One-Click Setup**: Install and manage Ollama + Open WebUI with a single command
-- **🔒 Secure Remote Access**: Access your local AI from anywhere using WebRTC P2P or encrypted relay
-- **🏠 Privacy-First**: Your data stays local. Remote access requires your explicit authentication
+- **🔒 Remote Access**: Reach your local AI from anywhere — direct WebRTC P2P, encrypted between the two peers with DTLS, where the network allows it; a relay fallback where it does not. **The relay fallback is not end-to-end encrypted: the relay terminates TLS and can see your traffic.** Read [Security](#-security) before you enable it
+- **🏠 Local-First**: Your services and their data run on your machine, not in anyone's cloud. Remote access requires your explicit authentication
 - **🐳 Docker-Based**: Clean, isolated environments for each service
 - **🌐 Cross-Platform**: Works on macOS, Linux, and Windows (WSL2)
 - **📱 Web Dashboard**: Beautiful, responsive UI built with React and Tailwind CSS
@@ -65,12 +65,26 @@ Lem consists of five main components:
   encryption on that path
 - **Encryption in transit**: TLS to the cloud services, DTLS on the P2P path.
   On the relay fallback path the relay terminates TLS and sees plaintext, so
-  it is trusted with your traffic. End-to-end encryption on the relay path is
-  on the roadmap, not shipped
-- **JWT authentication**: Account access to the cloud services
-- **Device authentication**: ed25519 challenge/response — a device proves
-  possession of its private key when it registers and when it connects to
-  signaling
+  it is trusted with your traffic — it forwards frames in the clear and meters
+  their size ([`cloud/relay`](./cloud/relay/README.md#security)). End-to-end
+  encryption on the relay path is on the roadmap, **not shipped**
+  ([#12](https://github.com/lem-app/lem/issues/12))
+- **JWT authentication**: account access to the cloud services (email/password).
+  This authenticates the *account*; the device key below authenticates the
+  *device*, and both are required
+- **Device authentication**: ed25519 challenge/response, implemented on every
+  client and verified by the server. A device signs a single-use challenge to
+  register and signs a fresh one each time it connects to signaling; the
+  signaling server checks both against the key on file and refuses otherwise
+  ([`cloud/signaling`](./cloud/signaling/README.md#security)). The key is pinned
+  on first registration — replacing it requires a second signature from the key
+  already on file, so holding your account password is not enough to swap a
+  device's identity
+- **What device authentication does not yet cover**: a tunnel peer is authorized
+  by asking the signaling server which devices your account owns, not by making
+  the peer prove key possession directly to your machine. That check trusts the
+  signaling server's answer. Peer-to-peer proof of possession is tracked in
+  [#29](https://github.com/lem-app/lem/issues/29)
 - **Session authorization**: relay sessions are bound by a signed grant to two
   devices of one account; signaling only routes between devices you own
 - **Open source**: Full transparency, audit the code yourself
