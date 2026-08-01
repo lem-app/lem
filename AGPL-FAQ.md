@@ -358,14 +358,15 @@ For official licensing inquiries, contact: blake@lem.gg
 | Action | Personal | Company Internal | Public SaaS | Commercial Product |
 |--------|----------|-----------------|-------------|-------------------|
 | Use Lem | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
+| Run Lem **unmodified** and share nothing back | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No† |
 | Modify code | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
-| Keep modifications private | ✅ Yes | ✅ Yes | ❌ No* | ❌ No* |
+| Keep **your modifications** private | ✅ Yes | ✅ Yes | ❌ No* | ❌ No* |
 | Charge for services | ✅ Yes | N/A | ✅ Yes | ✅ Yes |
-| Distribute binaries | ✅ Yes | ⚠️ Internal only | ✅ Yes* | ⚠️ Need commercial license |
+| Distribute binaries | ✅ Yes† | ⚠️ Internal only | N/A | ⚠️ Need commercial license |
 
-\* Must provide source code to users
+\* Applies only if you modified Lem. You must offer your version's source to the people using your instance — not to the world. If you have not modified Lem, nothing is owed; see the "Run Lem unmodified" row.
 
-The §13 network obligation applies only if you modified Lem. The distribution obligations in §4–§6 apply to any copy you hand out, modified or not.
+† Distributing a copy — modified or not — carries the source-availability obligations in §4–§6. Those are separate from §13 and are not conditioned on modification, which is why an unmodified Lem inside a product you ship is not "share nothing back", while an unmodified Lem you host is.
 
 ---
 
