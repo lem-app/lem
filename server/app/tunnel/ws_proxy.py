@@ -28,7 +28,6 @@ import aiohttp
 from .router import RequestRouter
 from .ws_frame import (
     WSCloseFrame,
-    WSConnectFrame,
     WSDataFrame,
     WSOpcode,
     deserialize_ws_close,
@@ -56,7 +55,8 @@ class WSProxyHandler:
 
         Args:
             router: Request router for determining WebSocket targets
-            send_frame: Async callable to send frames back to client (signature: async def(bytes) -> None)
+            send_frame: Async callable to send frames back to client
+                (signature: async def(bytes) -> None)
         """
         self.router = router
         self.send_frame = send_frame
@@ -186,7 +186,10 @@ class WSProxyHandler:
             elif frame["opcode"] == WSOpcode.BINARY:
                 # Binary message
                 await ws.send_bytes(frame["payload"])
-                logger.debug(f"WebSocket {conn_id}: Sent binary message ({len(frame['payload'])} bytes)")
+                logger.debug(
+                    f"WebSocket {conn_id}: Sent binary message "
+                    f"({len(frame['payload'])} bytes)"
+                )
             elif frame["opcode"] == WSOpcode.PING:
                 # Ping
                 await ws.ping(frame["payload"])
@@ -210,7 +213,10 @@ class WSProxyHandler:
             frame = deserialize_ws_close(data)
             conn_id = frame["connection_id"]
 
-            logger.info(f"WebSocket CLOSE {conn_id}: code={frame['close_code']}, reason={frame['reason']}")
+            logger.info(
+                f"WebSocket CLOSE {conn_id}: code={frame['close_code']}, "
+                f"reason={frame['reason']}"
+            )
 
             # Get connection
             ws = self.connections.get(conn_id)
@@ -253,7 +259,10 @@ class WSProxyHandler:
                     }
                     frame_data = serialize_ws_data(data_frame)
                     await self.send_frame(frame_data)
-                    logger.debug(f"WebSocket {conn_id}: Relayed text message ({len(msg.data)} chars)")
+                    logger.debug(
+                        f"WebSocket {conn_id}: Relayed text message "
+                        f"({len(msg.data)} chars)"
+                    )
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     # Binary message
@@ -264,7 +273,10 @@ class WSProxyHandler:
                     }
                     frame_data = serialize_ws_data(data_frame)
                     await self.send_frame(frame_data)
-                    logger.debug(f"WebSocket {conn_id}: Relayed binary message ({len(msg.data)} bytes)")
+                    logger.debug(
+                        f"WebSocket {conn_id}: Relayed binary message "
+                        f"({len(msg.data)} bytes)"
+                    )
 
                 elif msg.type == aiohttp.WSMsgType.PING:
                     # Ping (relay as data)
@@ -288,7 +300,11 @@ class WSProxyHandler:
                     await self.send_frame(frame_data)
                     logger.debug(f"WebSocket {conn_id}: Relayed pong")
 
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
                     # Connection closed by server
                     close_frame: WSCloseFrame = {
                         "connection_id": conn_id,
@@ -297,7 +313,10 @@ class WSProxyHandler:
                     }
                     close_data = serialize_ws_close(close_frame)
                     await self.send_frame(close_data)
-                    logger.info(f"WebSocket {conn_id}: Server closed connection (code: {ws.close_code})")
+                    logger.info(
+                        f"WebSocket {conn_id}: Server closed connection "
+                        f"(code: {ws.close_code})"
+                    )
                     break
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:

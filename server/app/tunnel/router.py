@@ -21,7 +21,7 @@ Routes HTTP requests to appropriate targets based on query parameters:
 """
 
 import logging
-from typing import Callable
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
