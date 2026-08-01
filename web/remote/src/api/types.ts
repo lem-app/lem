@@ -51,12 +51,26 @@ export interface Device {
 }
 
 /**
+ * A single-use challenge the device must sign to prove it holds its key.
+ */
+export interface DeviceChallenge {
+  device_id: string
+  /** Base64 challenge bytes, signed as-is inside the payload. */
+  challenge: string
+  /** Domain separation prefix the server expects in the signed payload. */
+  context: string
+  /** Seconds until the challenge stops being redeemable. */
+  expires_in: number
+}
+
+/**
  * WebRTC signaling message types.
  */
 export type SignalingMessageType =
   | 'offer'
   | 'answer'
   | 'ice-candidate'
+  | 'challenge'
   | 'connected'
   | 'ack'
   | 'error'
@@ -133,6 +147,22 @@ export interface ConnectedMessage extends BaseSignalingMessage {
   device_id: string
   message: string
   ice_servers?: ICEServerConfig[]
+}
+
+/**
+ * Proof-of-possession challenge sent after the `auth` message.
+ *
+ * The signaling handshake is: `auth` -> `challenge` -> `auth-response` ->
+ * `connected`. A client that does not answer the challenge is closed, so the
+ * account token alone no longer opens a device socket.
+ */
+export interface ChallengeMessage extends BaseSignalingMessage {
+  type: 'challenge'
+  device_id: string
+  /** Base64 challenge bytes, signed as-is inside the payload. */
+  challenge: string
+  /** Domain separation prefix the server expects in the signed payload. */
+  context: string
 }
 
 /**
@@ -229,6 +259,7 @@ export type ReceivedSignalingMessage =
   | ReceivedOfferMessage
   | ReceivedAnswerMessage
   | ReceivedICECandidateMessage
+  | ChallengeMessage
   | ConnectedMessage
   | AckMessage
   | ErrorMessage

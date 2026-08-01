@@ -28,7 +28,7 @@ import aiohttp
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from app.crypto import generate_keypair
+from app.crypto import REGISTER_CONTEXT, generate_keypair, sign_challenge
 from app.db import (
     AuthState,
     delete_auth_state,
@@ -57,6 +57,107 @@ def set_tunnel_manager(manager: "TunnelManager") -> None:
     """
     global _tunnel_manager
     _tunnel_manager = manager
+
+
+def local_device_identity() -> tuple[str, str, str]:
+    """Get this machine's device id and Ed25519 keypair, creating one if needed.
+
+    A stored device whose private key is missing cannot prove possession of the
+    key the signaling server has on file for it, and cannot authorize replacing
+    that key either. There is no recovery for that identity, so a fresh
+    device_id is minted instead of silently reusing an unprovable one.
+
+    Returns:
+        Tuple of (device_id, base64 public key, base64 private key).
+    """
+    device = get_device()
+    if device is not None and device.privkey is not None:
+        logger.info(f"Reusing existing device_id: {device.id}")
+        return device.id, device.pubkey, device.privkey
+
+    device_id = f"local-server-{uuid.uuid4().hex[:8]}"
+    keypair = generate_keypair()
+    register_device(
+        device_id=device_id,
+        pubkey=keypair.public_key_b64,
+        privkey=keypair.private_key_b64,
+    )
+    logger.info(f"Created new device with Ed25519 keypair: {device_id}")
+    return device_id, keypair.public_key_b64, keypair.private_key_b64
+
+
+async def enrol_device_with_signaling(
+    session: aiohttp.ClientSession, signaling_url: str, jwt_token: str
+) -> str:
+    """Register this machine's device key, proving possession of it.
+
+    The signaling server issues a single-use challenge; this device signs it
+    with the private key behind the public key it is registering. Before this,
+    the local server posted a bare pubkey and the signaling server stored it
+    without ever checking that anyone held the matching private key.
+
+    Args:
+        session: HTTP session to reuse.
+        signaling_url: Signaling server base URL, without a trailing slash.
+        jwt_token: Account token from login or registration.
+
+    Returns:
+        The device_id registered.
+
+    Raises:
+        HTTPException: If the signaling server refuses the challenge or the
+            registration.
+    """
+    device_id, pubkey, privkey = local_device_identity()
+
+    async with session.post(
+        f"{signaling_url}/devices/challenge",
+        headers={"Authorization": f"Bearer {jwt_token}"},
+        json={"device_id": device_id},
+    ) as resp:
+        if resp.status != 200:
+            error_text = await resp.text()
+            logger.error(f"Device challenge request failed: {error_text}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Device challenge failed: {error_text}",
+            )
+        challenge: str = (await resp.json())["challenge"]
+
+    async with session.post(
+        f"{signaling_url}/devices/register",
+        headers={"Authorization": f"Bearer {jwt_token}"},
+        json={
+            "device_id": device_id,
+            "pubkey": pubkey,
+            "challenge": challenge,
+            "signature": sign_challenge(privkey, REGISTER_CONTEXT, device_id, challenge),
+        },
+    ) as resp:
+        if resp.status == 401:
+            # The signaling server has a different key on file for this device
+            # id, and replacing it needs the key we no longer hold. Say so,
+            # rather than reporting a generic outage.
+            error_text = await resp.text()
+            logger.error(f"Device key rejected by signaling server: {error_text}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    f"The signaling server has a different key registered for device "
+                    f"{device_id} and this machine cannot prove possession of it. "
+                    f"Remove the device from your account, or reset this machine's "
+                    f"device identity, then try again."
+                ),
+            )
+        if resp.status not in (200, 201):
+            error_text = await resp.text()
+            logger.error(f"Device registration failed: {error_text}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Device registration failed: {error_text}",
+            )
+
+    return device_id
 
 
 class RegisterRequest(BaseModel):
@@ -147,35 +248,8 @@ async def register(request: RegisterRequest) -> AuthResponse:
                 auth_data = await resp.json()
                 jwt_token: str = auth_data["access_token"]
 
-            # Step 2: Get or create persistent device_id and keypair for this local server
-            device = get_device()
-            if device is None or device.privkey is None:
-                # First time registration or missing keys - create new keypair
-                device_id = f"local-server-{uuid.uuid4().hex[:8]}"
-                keypair = generate_keypair()
-                pubkey = keypair.public_key_b64
-                privkey = keypair.private_key_b64
-                register_device(device_id=device_id, pubkey=pubkey, privkey=privkey)
-                logger.info(f"Created new device with Ed25519 keypair: {device_id}")
-            else:
-                # Reuse existing device_id and keypair
-                device_id = device.id
-                pubkey = device.pubkey
-                logger.info(f"Reusing existing device_id: {device_id}")
-
-            # Step 3: Register device with signaling server
-            async with session.post(
-                f"{signaling_url}/devices/register",
-                headers={"Authorization": f"Bearer {jwt_token}"},
-                json={"device_id": device_id, "pubkey": pubkey},
-            ) as resp:
-                if resp.status not in (200, 201):
-                    error_text = await resp.text()
-                    logger.error(f"Device registration failed: {error_text}")
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail=f"Device registration failed: {error_text}",
-                    )
+            # Steps 2 and 3: enrol this machine's device key, proving possession
+            device_id = await enrol_device_with_signaling(session, signaling_url, jwt_token)
 
         # Step 4: Store auth state in SQLite
         auth_state = AuthState(
@@ -261,35 +335,8 @@ async def login(request: LoginRequest) -> AuthResponse:
                 auth_data = await resp.json()
                 jwt_token: str = auth_data["access_token"]
 
-            # Step 2: Get or create persistent device_id and keypair for this local server
-            device = get_device()
-            if device is None or device.privkey is None:
-                # First time login or missing keys - create new keypair
-                device_id = f"local-server-{uuid.uuid4().hex[:8]}"
-                keypair = generate_keypair()
-                pubkey = keypair.public_key_b64
-                privkey = keypair.private_key_b64
-                register_device(device_id=device_id, pubkey=pubkey, privkey=privkey)
-                logger.info(f"Created new device with Ed25519 keypair: {device_id}")
-            else:
-                # Reuse existing device_id and keypair
-                device_id = device.id
-                pubkey = device.pubkey
-                logger.info(f"Reusing existing device_id: {device_id}")
-
-            # Step 3: Register device with signaling server
-            async with session.post(
-                f"{signaling_url}/devices/register",
-                headers={"Authorization": f"Bearer {jwt_token}"},
-                json={"device_id": device_id, "pubkey": pubkey},
-            ) as resp:
-                if resp.status not in (200, 201):
-                    error_text = await resp.text()
-                    logger.error(f"Device registration failed: {error_text}")
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail=f"Device registration failed: {error_text}",
-                    )
+            # Steps 2 and 3: enrol this machine's device key, proving possession
+            device_id = await enrol_device_with_signaling(session, signaling_url, jwt_token)
 
         # Step 4: Store auth state in SQLite
         auth_state = AuthState(

@@ -30,33 +30,13 @@ import { ClientViewer } from './components/ClientViewer'
 import { ClientSelector } from './components/ClientSelector'
 import { ServicesCatalog } from './components/ServicesCatalog'
 import { Button } from '@/components/ui/button'
-import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { config, configError } from './lib/env'
 
-// Generate a UUID v4-like string (fallback for non-secure contexts)
-function generateUUID(): string {
-  // Check if crypto.randomUUID is available (secure context)
-  if (crypto.randomUUID) {
-    return crypto.randomUUID()
-  }
-
-  // Fallback for non-secure contexts (HTTP on LAN)
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0
-    const v = c === 'x' ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
-}
-
-// Generate a browser device ID (stored in localStorage)
-function getBrowserDeviceId(): string {
-  const stored = localStorage.getItem('browser_device_id')
-  if (stored) return stored
-
-  const newId = `browser-${generateUUID()}`
-  localStorage.setItem('browser_device_id', newId)
-  return newId
-}
+// The browser's device id used to be minted here and kept in localStorage,
+// separately from the (fake) `'browser-key'` it registered. It now comes from
+// `api/device-key`, which stores the id alongside the Ed25519 key that owns
+// it, so the two cannot drift apart.
 
 type ViewMode = 'clients' | 'services'
 
@@ -108,7 +88,11 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('services')
 
-  const browserDeviceId = getBrowserDeviceId()
+  // Set once the browser's Ed25519 identity is registered with signaling.
+  // Until then there is no device id to connect as, which is the point: an
+  // unregistered browser has nothing to prove it is a device of this account.
+  const [browserDeviceId, setBrowserDeviceId] = useState<string | null>(null)
+  const [deviceKeyError, setDeviceKeyError] = useState<string | null>(null)
 
   const {
     connectionState,
@@ -121,7 +105,7 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
   } = useWebRTC({
     signalUrl,
     token: token ?? '',
-    deviceId: browserDeviceId,
+    deviceId: browserDeviceId ?? '',
     targetDeviceId: targetDeviceId ?? '',
     autoConnect: false,
     relayUrl,
@@ -164,14 +148,32 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
     }
   }
 
-  // Register browser device when authenticated
+  // Enrol this browser's Ed25519 device key once authenticated. The device id
+  // is whatever the key store says it is, so it always matches the key that
+  // signs for it.
   useEffect(() => {
-    if (isAuthenticated && token) {
-      registerDevice(browserDeviceId, token).catch((err: unknown) => {
-        console.error('Failed to register browser device:', err)
+    if (!isAuthenticated || !token) return
+
+    let cancelled = false
+    registerDevice(token)
+      .then((deviceId) => {
+        if (!cancelled) {
+          setBrowserDeviceId(deviceId)
+          setDeviceKeyError(null)
+        }
       })
+      .catch((err: unknown) => {
+        console.error('Failed to register browser device:', err)
+        if (!cancelled) {
+          setBrowserDeviceId(null)
+          setDeviceKeyError(err instanceof Error ? err.message : 'Device registration failed')
+        }
+      })
+
+    return () => {
+      cancelled = true
     }
-  }, [isAuthenticated, token, browserDeviceId])
+  }, [isAuthenticated, token])
 
   // Not authenticated - show login
   if (!isAuthenticated) {
@@ -192,6 +194,15 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
         </header>
 
         <div className="container mx-auto">
+          {deviceKeyError !== null && (
+            <Alert variant="destructive" className="mx-6 mt-6">
+              <AlertTitle>This browser could not register its device key</AlertTitle>
+              <AlertDescription>
+                {deviceKeyError} Remote connections stay disabled until this browser can prove it
+                owns an Ed25519 device key.
+              </AlertDescription>
+            </Alert>
+          )}
           <DeviceSelector onSelectDevice={handleDeviceSelect} token={token ?? ''} />
         </div>
       </div>
@@ -225,7 +236,9 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
             <h1 className="text-2xl font-bold">Lem Remote Access</h1>
             <p className="text-sm text-muted-foreground">
               Browser Device ID:{' '}
-              <code className="rounded bg-muted px-1 py-0.5 text-xs">{browserDeviceId}</code>
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                {browserDeviceId ?? 'registering…'}
+              </code>
             </p>
             <p className="text-sm text-muted-foreground">
               Target Device ID:{' '}

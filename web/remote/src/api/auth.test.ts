@@ -19,7 +19,20 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { login, register, listDevices, registerDevice, UnauthorizedError } from './auth'
+import { REGISTER_CONTEXT, signedMessage } from './device-key'
 import { onSessionExpired, storeToken, readToken } from '../lib/session'
+import { memoryKeyStore } from '../test/fakes'
+
+const CHALLENGE = 'Q0hBTExFTkdFLTAxMjM0NTY3ODlhYmNkZWZnaGlqa2w='
+
+/** Parse a recorded request body, which our client always sends as a string. */
+function requestBody(init: RequestInit | undefined): Record<string, string> {
+  const body = init?.body
+  if (typeof body !== 'string') {
+    throw new Error('expected a JSON string body')
+  }
+  return JSON.parse(body) as Record<string, string>
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -92,10 +105,66 @@ describe('Authentication API', () => {
   })
 
   describe('registerDevice', () => {
-    it('treats 409 as success (device already registered)', async () => {
-      mockFetch(jsonResponse({ detail: 'already registered' }, 409))
+    it('registers a real Ed25519 key and a signature, never "browser-key"', async () => {
+      mockFetch(
+        jsonResponse({ device_id: 'ignored', challenge: CHALLENGE, context: 'x', expires_in: 120 }),
+        jsonResponse({ id: 'ignored', user_id: 1, pubkey: 'x', created_at: 'now' })
+      )
 
-      await expect(registerDevice('browser-1', 'token')).resolves.toBeUndefined()
+      const deviceId = await registerDevice('token', memoryKeyStore())
+
+      const [challengeUrl, challengeInit] = fetchMockCalls()[0]
+      expect(challengeUrl).toBe('http://localhost:8000/devices/challenge')
+      expect(requestBody(challengeInit)).toEqual({ device_id: deviceId })
+
+      const [registerUrl, registerInit] = fetchMockCalls()[1]
+      expect(registerUrl).toBe('http://localhost:8000/devices/register')
+      const body = requestBody(registerInit)
+      expect(body.device_id).toBe(deviceId)
+      expect(body.pubkey).not.toBe('browser-key')
+      expect(atob(body.pubkey)).toHaveLength(32)
+      expect(body.challenge).toBe(CHALLENGE)
+      expect(atob(body.signature)).toHaveLength(64)
+    })
+
+    it('signs the challenge verifiably under the key it registers', async () => {
+      mockFetch(
+        jsonResponse({ device_id: 'ignored', challenge: CHALLENGE, context: 'x', expires_in: 120 }),
+        jsonResponse({ id: 'ignored', user_id: 1, pubkey: 'x', created_at: 'now' })
+      )
+
+      const deviceId = await registerDevice('token', memoryKeyStore())
+      const body = requestBody(fetchMockCalls()[1][1])
+
+      const publicKey = await crypto.subtle.importKey(
+        'raw',
+        Uint8Array.from(atob(body.pubkey), (c) => c.charCodeAt(0)),
+        { name: 'Ed25519' },
+        false,
+        ['verify']
+      )
+
+      await expect(
+        crypto.subtle.verify(
+          'Ed25519',
+          publicKey,
+          Uint8Array.from(atob(body.signature), (c) => c.charCodeAt(0)),
+          signedMessage(REGISTER_CONTEXT, deviceId, CHALLENGE)
+        )
+      ).resolves.toBe(true)
+    })
+
+    it('no longer swallows a 409, and does not swallow a 401', async () => {
+      // A 401 here means the server has a different key on file for this
+      // device. Treating that as success would be swallowing a hijack.
+      mockFetch(
+        jsonResponse({ device_id: 'ignored', challenge: CHALLENGE, context: 'x', expires_in: 120 }),
+        jsonResponse({ detail: 'previous_signature required' }, 401)
+      )
+
+      await expect(registerDevice('token', memoryKeyStore())).rejects.toBeInstanceOf(
+        UnauthorizedError
+      )
     })
   })
 

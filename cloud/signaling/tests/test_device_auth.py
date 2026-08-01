@@ -33,6 +33,8 @@ from app.core.crypto import (
     ChallengeStore,
     InvalidPublicKeyError,
     decode_public_key,
+    new_challenge,
+    signed_message,
     verify_signature,
 )
 from tests.conftest import Account, new_device_key
@@ -317,23 +319,47 @@ def test_verify_signature_is_domain_separated() -> None:
     challenge = "Y2hhbGxlbmdl"
     signature = key.sign(REGISTER_CONTEXT, DEVICE_ID, challenge)
 
-    assert verify_signature(key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, challenge, signature)
-    assert not verify_signature(key.pubkey_b64, SIGNAL_CONTEXT, DEVICE_ID, challenge, signature)
+    assert verify_signature(
+        key.pubkey_b64, signature, signed_message(REGISTER_CONTEXT, DEVICE_ID, challenge)
+    )
+    assert not verify_signature(
+        key.pubkey_b64, signature, signed_message(SIGNAL_CONTEXT, DEVICE_ID, challenge)
+    )
     # Nor for a different device id or a different challenge.
     assert not verify_signature(
-        key.pubkey_b64, REGISTER_CONTEXT, "other-device", challenge, signature
+        key.pubkey_b64, signature, signed_message(REGISTER_CONTEXT, "other-device", challenge)
     )
-    assert not verify_signature(key.pubkey_b64, REGISTER_CONTEXT, DEVICE_ID, "b3RoZXI=", signature)
+    assert not verify_signature(
+        key.pubkey_b64, signature, signed_message(REGISTER_CONTEXT, DEVICE_ID, "b3RoZXI=")
+    )
+
+
+def test_signed_message_is_unambiguous_for_fixed_length_fields() -> None:
+    """Two device ids cannot produce the same payload for real challenges.
+
+    The fields after ``device_id`` are base64 of a fixed 32 bytes, so they are
+    44 characters and contain no ``:``. Equal payload lengths therefore force
+    equal device id lengths, which forces the ids to be equal. This test pins
+    that invariant, because it is the only thing making the separator safe.
+    """
+    challenge_a = new_challenge()
+    challenge_b = new_challenge()
+    assert len(challenge_a) == 44 and ":" not in challenge_a
+
+    # A device id containing a colon still cannot impersonate another device,
+    # because doing so would need a shorter-than-44-character challenge.
+    assert signed_message(REGISTER_CONTEXT, "device:a", challenge_a) != signed_message(
+        REGISTER_CONTEXT, "device", f"a:{challenge_b}"[:44]
+    )
 
 
 def test_verify_signature_rejects_malformed_input() -> None:
     """Garbage keys and signatures are refused without raising."""
     key = new_device_key()
-    assert not verify_signature("not-base64!", REGISTER_CONTEXT, "d", "c", "s")
-    assert not verify_signature(key.pubkey_b64, REGISTER_CONTEXT, "d", "c", "!!")
-    assert not verify_signature(
-        key.pubkey_b64, REGISTER_CONTEXT, "d", "c", base64.b64encode(b"short").decode()
-    )
+    message = signed_message(REGISTER_CONTEXT, "d", "c")
+    assert not verify_signature("not-base64!", "s", message)
+    assert not verify_signature(key.pubkey_b64, "!!", message)
+    assert not verify_signature(key.pubkey_b64, base64.b64encode(b"short").decode(), message)
 
 
 def test_challenge_store_expires_entries() -> None:

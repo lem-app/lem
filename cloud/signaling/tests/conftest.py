@@ -42,7 +42,12 @@ from starlette.testclient import WebSocketTestSession  # noqa: E402
 from app.api.devices import registration_challenges  # noqa: E402
 from app.api.signal import manager  # noqa: E402
 from app.core import ratelimit  # noqa: E402
-from app.core.crypto import REGISTER_CONTEXT, SIGNAL_CONTEXT, signed_message  # noqa: E402
+from app.core.crypto import (  # noqa: E402
+    REGISTER_CONTEXT,
+    ROTATE_CONTEXT,
+    SIGNAL_CONTEXT,
+    signed_message,
+)
 from app.db import database  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -68,18 +73,17 @@ class DeviceKey:
         )
         return base64.b64encode(raw).decode("ascii")
 
-    def sign(self, context: bytes, device_id: str, challenge: str) -> str:
+    def sign(self, context: bytes, *fields: str) -> str:
         """Sign a server challenge the way a real client must.
 
         Args:
             context: Domain separation constant.
-            device_id: Device the signature is for.
-            challenge: Challenge string issued by the server.
+            *fields: Payload fields, normally ``(device_id, challenge)``.
 
         Returns:
             Base64-encoded signature.
         """
-        signature = self.private_key.sign(signed_message(context, device_id, challenge))
+        signature = self.private_key.sign(signed_message(context, *fields))
         return base64.b64encode(signature).decode("ascii")
 
 
@@ -158,21 +162,37 @@ class Account:
         """
         return {"Authorization": f"Bearer {self.token}"}
 
-    def register_device(self, device_id: str) -> DeviceKey:
+    def challenge_for(self, device_id: str) -> str:
+        """Ask the server for a registration challenge.
+
+        Args:
+            device_id: Device the challenge is for.
+
+        Returns:
+            The issued challenge string.
+        """
+        response = self.client.post(
+            "/devices/challenge", json={"device_id": device_id}, headers=self.headers
+        )
+        assert response.status_code == 200, response.text
+        return str(response.json()["challenge"])
+
+    def register_device(self, device_id: str, key: DeviceKey | None = None) -> DeviceKey:
         """Enrol a device, completing the ed25519 proof of possession.
+
+        Re-registering a device reuses the key already enrolled for it unless
+        one is passed explicitly, because replacing a device's key now needs a
+        rotation proof - see :meth:`rotate_device_key`.
 
         Args:
             device_id: Device identifier to register.
+            key: Key to enrol; defaults to the enrolled key, else a fresh one.
 
         Returns:
-            The generated device key.
+            The enrolled device key.
         """
-        key = new_device_key()
-        challenge_response = self.client.post(
-            "/devices/challenge", json={"device_id": device_id}, headers=self.headers
-        )
-        assert challenge_response.status_code == 200, challenge_response.text
-        challenge = challenge_response.json()["challenge"]
+        key = key or self.keys.get(device_id) or new_device_key()
+        challenge = self.challenge_for(device_id)
 
         response = self.client.post(
             "/devices/register",
@@ -187,6 +207,37 @@ class Account:
         assert response.status_code == 200, response.text
         self.keys[device_id] = key
         return key
+
+    def rotate_device_key(self, device_id: str, new_key: DeviceKey | None = None) -> DeviceKey:
+        """Replace a device's key, authorized by the key currently on file.
+
+        Args:
+            device_id: Device whose key is being replaced.
+            new_key: Replacement key; a fresh one by default.
+
+        Returns:
+            The newly enrolled device key.
+        """
+        old_key = self.keys[device_id]
+        new_key = new_key or new_device_key()
+        challenge = self.challenge_for(device_id)
+
+        response = self.client.post(
+            "/devices/register",
+            json={
+                "device_id": device_id,
+                "pubkey": new_key.pubkey_b64,
+                "challenge": challenge,
+                "signature": new_key.sign(REGISTER_CONTEXT, device_id, challenge),
+                "previous_signature": old_key.sign(
+                    ROTATE_CONTEXT, device_id, challenge, new_key.pubkey_b64
+                ),
+            },
+            headers=self.headers,
+        )
+        assert response.status_code == 200, response.text
+        self.keys[device_id] = new_key
+        return new_key
 
     def connect_signaling(self, device_id: str) -> "SignalingSession":
         """Open an authenticated signaling WebSocket for a device.

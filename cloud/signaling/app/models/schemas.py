@@ -91,6 +91,14 @@ class DeviceRegister(BaseModel):
     pubkey: str = Field(description="Base64-encoded raw ed25519 public key (32 bytes)")
     challenge: str = Field(description="Challenge issued by POST /devices/challenge")
     signature: str = Field(description="Base64-encoded ed25519 signature over the challenge")
+    previous_signature: str | None = Field(
+        default=None,
+        description=(
+            "Required only when replacing the key already registered for this "
+            "device: an ed25519 signature by the key on file, over the "
+            "rotation payload, authorizing this specific new pubkey."
+        ),
+    )
 
 
 class DeviceResponse(BaseModel):
