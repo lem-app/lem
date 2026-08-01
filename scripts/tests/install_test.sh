@@ -445,6 +445,29 @@ grep -qE '^[[:space:]]*LEM_HOST=' "$LEM_HOME/config/server.env"
 assert_false $? "LEM_HOST is commented out by default"
 
 # ===========================================================================
+section "install.env survives an awkward prefix"
+# ===========================================================================
+
+# The CLI sources this file, so an unquoted value with a space in it would be a
+# syntax error rather than a path.
+LEM_HOME="$WORK/lem home"
+SERVER_DIR="$LEM_HOME/src/server"
+LEM_PLATFORM="linux"
+LEM_IS_WSL=0
+LEM_ARCH="testarch"
+# shellcheck disable=SC2034  # read by write_install_env, from install.sh.
+LEM_SERVICE="none"
+# shellcheck disable=SC2034  # ditto.
+LEM_SOURCE_MODE="download"
+write_install_env
+(
+  # shellcheck disable=SC1090,SC1091  # generated above, path known only at runtime.
+  . "$LEM_HOME/config/install.env"
+  [ "$LEM_HOME" = "$WORK/lem home" ] && [ "$LEM_LAUNCHER" = "$WORK/lem home/bin/lem-server" ]
+)
+assert_true $? "install.env round-trips a prefix containing a space"
+
+# ===========================================================================
 section "port probing"
 # ===========================================================================
 
