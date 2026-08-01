@@ -44,15 +44,19 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || ''
 const CLIENT_HEADER = 'X-Lem-Client'
 const CLIENT_NAME = 'lem-dashboard'
 
-// On a loopback bind the server accepts requests without a token. When the
-// server is bound to the LAN (LEM_HOST), every /v1/* request needs the bearer
-// token from ~/.lem/api_token - a browser cannot read that file, so it has to
-// be handed to the dashboard at build/dev time via VITE_LEM_API_TOKEN.
-const API_TOKEN: string = import.meta.env.VITE_LEM_API_TOKEN || "";
-
-function authHeaders(): Record<string, string> {
-  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {};
-}
+// This dashboard sends no bearer token, on purpose.
+//
+// The local API requires one on every /v1/* request unless it verified a
+// loopback-only bind, and a browser cannot read ~/.lem/api_token. The obvious
+// shortcut - a build-time `import.meta.env.VITE_*` - does not work here: Vite
+// inlines those as plaintext literals into dist/assets/*.js, so the token would
+// ship to everyone who can load the page. That is the same LAN population the
+// token exists to keep out of Docker.
+//
+// So the supported dashboard path is a loopback-bound server. Reaching the
+// dashboard over the LAN needs a real credential-delivery design (operator
+// enters the token at runtime, held in session state, prompted on 401) and is
+// tracked on https://github.com/lem-app/lem/issues/48.
 
 class ApiError extends Error {
   status: number
@@ -75,7 +79,6 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
       headers: {
         'Content-Type': 'application/json',
         [CLIENT_HEADER]: CLIENT_NAME,
-        ...authHeaders(),
         ...options?.headers,
       },
     })
