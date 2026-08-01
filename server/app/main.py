@@ -24,37 +24,29 @@ This is the local server that runs on the user's machine and manages:
 Port: 5142 (default)
 """
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth as auth_module
 from app.api.v1.auth import router as auth_router
 from app.catalog import get_all_services, get_service_definition
-from app.catalog.models import ServiceCategory
+from app.catalog.models import ServiceCategory, ServiceStatus
+from app.config.platform import ARCH, DOCKER_HOST, IS_WSL, OS_TYPE, PLATFORM
 from app.db import init_db
-
-# Legacy imports for backward compatibility
-from app.drivers.clients.openwebui import (
-    get_openwebui_status,
-    get_openwebui_url,
-    install_openwebui,
-    start_openwebui,
-    stop_openwebui,
-)
+from app.drivers.clients.openwebui import OPENWEBUI_SERVICE_ID, get_openwebui_url
+from app.drivers.harbor_wrapper import HarborError, check_harbor_installed
 from app.drivers.runners.ollama import (
+    OLLAMA_SERVICE_ID,
     get_ollama_endpoint,
-    get_ollama_health,
-    get_ollama_status,
-    install_ollama,
     list_ollama_models,
     pull_ollama_model,
-    start_ollama,
-    stop_ollama,
 )
 from app.jobs import JobStatus, get_job, get_recent_jobs
 from app.jobs.queue import init_job_queue, shutdown_job_queue
@@ -67,7 +59,8 @@ from app.services import (
     start_service,
     stop_service,
 )
-from app.services.lifecycle import register_job_handlers
+from app.services.lifecycle import install_service_inline, register_job_handlers
+from app.services.status import probe_docker
 from app.tunnel.manager import TunnelManager
 
 # Configure logging for the application
@@ -157,20 +150,88 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/v1")
 
 
+async def _legacy_status(service_id: str) -> str:
+    """
+    Map a service's status onto the legacy runner/client vocabulary.
+
+    The legacy endpoints only know "running" | "stopped" | "error", and they
+    report rather than raise when Docker is unreachable.
+
+    Args:
+        service_id: Harbor service ID
+
+    Returns:
+        "running", "stopped" or "error"
+    """
+    try:
+        status = await get_service_status(service_id)
+    except HTTPException as e:
+        logger.warning(f"Status check for {service_id} failed: {e.detail}")
+        return "error"
+
+    if status == ServiceStatus.RUNNING:
+        return "running"
+    if status == ServiceStatus.ERROR:
+        return "error"
+    return "stopped"
+
+
 @app.get("/v1/health")
 async def health() -> dict[str, Any]:
     """
     Health check endpoint.
 
-    Returns composed health status across Docker, runners, clients, and tunnel.
-    In this initial version, we return a minimal response.
+    Actually probes Docker and the Harbor CLI - this used to report
+    `"docker": "ok"` unconditionally, including while every Docker call was
+    failing.
 
     Returns:
         dict: Health status with components
     """
+    docker_ok, docker_detail = await asyncio.to_thread(probe_docker)
+
+    harbor_detail: str
+    try:
+        harbor_detail = f"ok (v{await asyncio.to_thread(check_harbor_installed)})"
+        harbor_ok = True
+    except HarborError as e:
+        harbor_detail = str(e)
+        harbor_ok = False
+
+    if docker_ok:
+        runners = {OLLAMA_SERVICE_ID: await _legacy_status(OLLAMA_SERVICE_ID)}
+        clients = {"openwebui": await _legacy_status(OPENWEBUI_SERVICE_ID)}
+    else:
+        runners = {}
+        clients = {}
+
+    if not docker_ok:
+        status = "error"
+    elif not harbor_ok:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    tunnel_mode = "offline"
+    if tunnel_manager is not None:
+        tunnel_mode = str(tunnel_manager.get_status().get("mode", "offline"))
+
     return {
-        "status": "ok",
-        "components": {"docker": "ok", "runners": {}, "clients": {}, "tunnel": "offline"},
+        "status": status,
+        "components": {
+            "docker": f"ok (v{docker_detail})" if docker_ok else f"unavailable: {docker_detail}",
+            "harbor": harbor_detail,
+            "runners": runners,
+            "clients": clients,
+            "tunnel": tunnel_mode,
+        },
+        "platform": {
+            "os": OS_TYPE,
+            "arch": ARCH,
+            "platform": PLATFORM,
+            "wsl": IS_WSL,
+            "docker_host": DOCKER_HOST,
+        },
     }
 
 
@@ -200,9 +261,8 @@ async def list_runners() -> list[dict[str, Any]]:
         list[dict]: List of runners with their status
     """
     # For v0.1, we only have Ollama
-    # Get actual status from Docker via harbor_ps()
-    status = await get_ollama_status()
-    endpoint = get_ollama_endpoint()
+    status = await _legacy_status(OLLAMA_SERVICE_ID)
+    endpoint = await get_ollama_endpoint()
 
     return [
         {
@@ -234,7 +294,8 @@ async def ollama_install() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails, 504 if timeout
     """
-    return await install_ollama()
+    await install_service_inline(OLLAMA_SERVICE_ID)
+    return {"status": "ok", "message": "Ollama installed successfully"}
 
 
 @app.post("/v1/runners/ollama/start")
@@ -250,7 +311,7 @@ async def ollama_start() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails, 504 if timeout
     """
-    return await start_ollama()
+    return await start_service(OLLAMA_SERVICE_ID)
 
 
 @app.post("/v1/runners/ollama/stop")
@@ -264,7 +325,7 @@ async def ollama_stop() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails
     """
-    return await stop_ollama()
+    return await stop_service(OLLAMA_SERVICE_ID)
 
 
 @app.get("/v1/runners/ollama/health")
@@ -272,13 +333,43 @@ async def ollama_health() -> dict[str, Any]:
     """
     Get Ollama service health status.
 
+    Probes the Ollama HTTP API rather than returning a placeholder.
+
     Returns:
-        dict: {"status": "ok", "uptime_sec": 1234, "details": {...}}
+        dict: {"status": "ok", "details": {...}}
 
     Raises:
         HTTPException: 503 if Ollama is not running or unhealthy
     """
-    return await get_ollama_health()
+    status = await _legacy_status(OLLAMA_SERVICE_ID)
+    endpoint = await get_ollama_endpoint()
+
+    if status != "running":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "type": "https://lem.gg/errors/ollama-unavailable",
+                "title": "Ollama Not Running",
+                "detail": f"Ollama container status is '{status}'",
+            },
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{endpoint}/api/version")
+            response.raise_for_status()
+            version = response.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "type": "https://lem.gg/errors/ollama-unavailable",
+                "title": "Ollama API Unhealthy",
+                "detail": f"Ollama container is running but its API did not respond: {e}",
+            },
+        ) from e
+
+    return {"status": "ok", "details": {"endpoint": endpoint, "version": version}}
 
 
 # ----- Clients List Endpoint -----
@@ -296,9 +387,8 @@ async def list_clients() -> list[dict[str, Any]]:
         list[dict]: List of clients with their status
     """
     # For v0.1, we only have Open WebUI
-    # Get actual status from Docker via harbor_ps()
-    status = await get_openwebui_status()
-    url = get_openwebui_url()
+    status = await _legacy_status(OPENWEBUI_SERVICE_ID)
+    url = await asyncio.to_thread(get_openwebui_url)
 
     return [
         {
@@ -331,7 +421,8 @@ async def openwebui_install() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails, 504 if timeout
     """
-    return await install_openwebui()
+    await install_service_inline(OPENWEBUI_SERVICE_ID)
+    return {"status": "ok", "message": "Open WebUI installed successfully"}
 
 
 @app.post("/v1/clients/openwebui/start")
@@ -348,7 +439,7 @@ async def openwebui_start() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails, 504 if timeout
     """
-    return await start_openwebui()
+    return await start_service(OPENWEBUI_SERVICE_ID)
 
 
 @app.post("/v1/clients/openwebui/stop")
@@ -362,7 +453,7 @@ async def openwebui_stop() -> dict[str, str]:
     Raises:
         HTTPException: 503 if Harbor CLI fails
     """
-    return await stop_openwebui()
+    return await stop_service(OPENWEBUI_SERVICE_ID)
 
 
 # ----- Tunnel Endpoints -----

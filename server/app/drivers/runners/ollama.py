@@ -14,18 +14,16 @@
 # Public License for more details.
 
 """
-Ollama Runner Driver for Lem v0.1
+Ollama model operations for Lem.
 
-Provides lifecycle management for Ollama via Harbor CLI:
-- install: Pull and configure Ollama container
-- start: Start Ollama service (idempotent)
-- stop: Stop Ollama service
-- health: Check Ollama service health
-- models: List/pull/manage Ollama models
-
-All operations use Harbor CLI via the harbor_wrapper module.
+Install/start/stop/status for Ollama are handled by app.services (the generic
+Harbor service path); this module only covers what that path does not do -
+talking to the Ollama HTTP API to list and pull models.
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
 from typing import Any
@@ -33,227 +31,34 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from app.drivers.harbor_wrapper import HarborError, harbor_down, harbor_ps, harbor_up
+from app.services.status import get_service_url
 
 logger = logging.getLogger(__name__)
 
+# Harbor's service ID for Ollama
+OLLAMA_SERVICE_ID = "ollama"
+
 # Ollama API configuration
 OLLAMA_API_TIMEOUT = 300.0  # 5 minutes for model operations
+OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434"
 
 
-def _get_ollama_api_base() -> str:
+async def get_ollama_endpoint() -> str:
     """
-    Get the Ollama API base URL by discovering the actual port from Docker.
+    Get the Ollama API base URL, discovering the mapped host port from Docker.
 
-    Harbor maps Ollama to a dynamic port, so we need to query Docker to find it.
+    Harbor maps Ollama to a dynamic port, so the port has to be looked up.
     Falls back to the standard port 11434 if discovery fails.
 
     Returns:
         str: The Ollama API base URL (e.g., "http://127.0.0.1:33821")
     """
-    try:
-        # Use harbor_ps to get service info with parsed ports
-        services = harbor_ps()
-        if "ollama" in services:
-            host_port = services["ollama"].get("host_port")
-            if host_port:
-                logger.debug(f"Discovered Ollama on host port {host_port}")
-                return f"http://127.0.0.1:{host_port}"
+    url = await asyncio.to_thread(get_service_url, OLLAMA_SERVICE_ID)
+    if url:
+        return url
 
-        # Fallback to standard port
-        logger.warning("Could not discover Ollama port, using default 11434")
-        return "http://127.0.0.1:11434"
-
-    except Exception as e:
-        logger.warning(f"Error discovering Ollama port: {e}, using default 11434")
-        return "http://127.0.0.1:11434"
-
-
-async def install_ollama() -> dict[str, str]:
-    """
-    Install Ollama via Harbor CLI.
-
-    This performs the initial pull of the Ollama container image.
-    Uses a longer timeout (10 minutes) for the initial image pull.
-
-    Returns:
-        dict: {"status": "ok", "message": "Ollama installed successfully"}
-
-    Raises:
-        HTTPException: 503 if Harbor CLI fails, 504 if timeout
-    """
-    logger.info("Installing Ollama via Harbor CLI")
-    try:
-        # Use longer timeout for initial image pull
-        exit_code, stdout, stderr = harbor_up("ollama", timeout=600)
-        logger.info(f"Ollama installation completed (exit code: {exit_code})")
-        return {"status": "ok", "message": "Ollama installed successfully"}
-
-    except HarborError as e:
-        logger.error(f"Ollama installation failed: {e}")
-
-        # Handle timeout (exit code 124)
-        if e.exit_code == 124:
-            raise HTTPException(
-                status_code=504,
-                detail={
-                    "type": "https://lem.gg/errors/harbor-timeout",
-                    "title": "Harbor CLI Timeout",
-                    "detail": str(e),
-                },
-            ) from e
-
-        # Handle other Harbor CLI errors
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "type": "https://lem.gg/errors/harbor-unavailable",
-                "title": "Harbor CLI Unavailable",
-                "detail": str(e),
-                "harbor_stderr": e.stderr,
-            },
-        ) from e
-
-
-async def start_ollama() -> dict[str, str]:
-    """
-    Start Ollama service via Harbor CLI.
-
-    This operation is idempotent - if Ollama is already running, it succeeds.
-
-    Returns:
-        dict: {"status": "ok"}
-
-    Raises:
-        HTTPException: 503 if Harbor CLI fails, 504 if timeout
-    """
-    logger.info("Starting Ollama via Harbor CLI")
-    try:
-        exit_code, stdout, stderr = harbor_up("ollama")
-        logger.info(f"Ollama start completed (exit code: {exit_code})")
-        return {"status": "ok"}
-
-    except HarborError as e:
-        logger.error(f"Ollama start failed: {e}")
-
-        # Handle timeout (exit code 124)
-        if e.exit_code == 124:
-            raise HTTPException(
-                status_code=504,
-                detail={
-                    "type": "https://lem.gg/errors/harbor-timeout",
-                    "title": "Harbor CLI Timeout",
-                    "detail": str(e),
-                },
-            ) from e
-
-        # Handle other Harbor CLI errors
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "type": "https://lem.gg/errors/harbor-unavailable",
-                "title": "Harbor CLI Unavailable",
-                "detail": str(e),
-                "harbor_stderr": e.stderr,
-            },
-        ) from e
-
-
-async def stop_ollama() -> dict[str, str]:
-    """
-    Stop Ollama service via Harbor CLI.
-
-    Returns:
-        dict: {"status": "ok"}
-
-    Raises:
-        HTTPException: 503 if Harbor CLI fails
-    """
-    logger.info("Stopping Ollama via Harbor CLI")
-    try:
-        exit_code, stdout, stderr = harbor_down("ollama")
-        logger.info(f"Ollama stop completed (exit code: {exit_code})")
-        return {"status": "ok"}
-
-    except HarborError as e:
-        logger.error(f"Ollama stop failed: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "type": "https://lem.gg/errors/harbor-unavailable",
-                "title": "Harbor CLI Unavailable",
-                "detail": str(e),
-                "harbor_stderr": e.stderr,
-            },
-        ) from e
-
-
-async def get_ollama_status() -> str:
-    """
-    Get Ollama container status.
-
-    Queries Docker to check if the Ollama container is running.
-    Uses harbor_ps() which calls `docker ps --format json`.
-
-    Returns:
-        str: "running" | "stopped" | "error"
-            - "running": Container is running
-            - "stopped": Container exists but is not running, or doesn't exist
-            - "error": Error querying Docker status
-
-    Note:
-        This is different from get_ollama_health() which checks the Ollama API health.
-        This function only checks if the container is running.
-    """
-    try:
-        services = harbor_ps()
-
-        # Look for "ollama" service in Harbor services
-        if "ollama" in services:
-            service_status = services["ollama"]["status"]
-            # Docker states: running, exited, created, paused, restarting, removing, dead
-            if service_status == "running":
-                return "running"
-            else:
-                return "stopped"
-        else:
-            # No ollama container found
-            return "stopped"
-
-    except Exception as e:
-        logger.error(f"Error checking Ollama status: {e}")
-        return "error"
-
-
-def get_ollama_endpoint() -> str:
-    """
-    Get the Ollama API endpoint URL with the actual dynamically-mapped port.
-
-    Returns:
-        str: The Ollama endpoint URL (e.g., "http://127.0.0.1:33821")
-    """
-    return _get_ollama_api_base()
-
-
-async def get_ollama_health() -> dict[str, Any]:
-    """
-    Get Ollama service health status.
-
-    TODO: Implement actual health check by calling Ollama API /api/health
-
-    Returns:
-        dict: {"status": "ok", "uptime_sec": 1234, "details": {...}}
-
-    Raises:
-        HTTPException: 503 if Ollama is not running or unhealthy
-    """
-    # TODO: Implement health check by calling Ollama API
-    # For now, return a placeholder
-    return {
-        "status": "ok",
-        "uptime_sec": 0,
-        "details": {"note": "Health check not yet implemented"},
-    }
+    logger.warning("Could not discover Ollama port, using default 11434")
+    return OLLAMA_DEFAULT_URL
 
 
 async def list_ollama_models() -> list[dict[str, Any]]:
@@ -272,7 +77,7 @@ async def list_ollama_models() -> list[dict[str, Any]]:
     logger.info("Listing Ollama models via API")
 
     try:
-        ollama_api_base = _get_ollama_api_base()
+        ollama_api_base = await get_ollama_endpoint()
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{ollama_api_base}/api/tags")
             response.raise_for_status()
@@ -305,13 +110,13 @@ async def list_ollama_models() -> list[dict[str, Any]]:
             },
         ) from e
 
-    except Exception as e:
+    except httpx.HTTPError as e:
         logger.error(f"Unexpected error listing Ollama models: {e}")
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail={
-                "type": "https://lem.gg/errors/internal-error",
-                "title": "Internal Server Error",
+                "type": "https://lem.gg/errors/ollama-unavailable",
+                "title": "Ollama API Unavailable",
                 "detail": str(e),
             },
         ) from e
@@ -350,7 +155,7 @@ async def pull_ollama_model(model_ref: str) -> dict[str, Any]:
         )
 
     try:
-        ollama_api_base = _get_ollama_api_base()
+        ollama_api_base = await get_ollama_endpoint()
         async with httpx.AsyncClient(timeout=OLLAMA_API_TIMEOUT) as client:
             # Send pull request to Ollama API
             # The API returns a stream of JSON objects with progress updates
@@ -366,15 +171,17 @@ async def pull_ollama_model(model_ref: str) -> dict[str, Any]:
             # Each line is a JSON object with status/progress info
             last_status = None
             async for line in response.aiter_lines():
-                if line.strip():
-                    try:
-                        status_obj = json.loads(line)
-                        last_status = status_obj
-                        # Log progress
-                        if "status" in status_obj:
-                            logger.info(f"Pull progress: {status_obj['status']}")
-                    except Exception as parse_error:
-                        logger.warning(f"Failed to parse progress line: {parse_error}")
+                if not line.strip():
+                    continue
+                try:
+                    status_obj = json.loads(line)
+                except json.JSONDecodeError as parse_error:
+                    logger.warning(f"Failed to parse progress line: {parse_error}")
+                    continue
+
+                last_status = status_obj
+                if "status" in status_obj:
+                    logger.info(f"Pull progress: {status_obj['status']}")
 
             logger.info(f"Ollama model pull completed: {model_ref}")
             return {
@@ -411,12 +218,12 @@ async def pull_ollama_model(model_ref: str) -> dict[str, Any]:
 
     except httpx.HTTPStatusError as e:
         logger.error(f"Ollama API returned error: {e}")
-        error_detail = "Unknown error"
+        error_detail = str(e)
         try:
             error_data = e.response.json()
             error_detail = error_data.get("error", str(e))
-        except Exception:
-            error_detail = str(e)
+        except ValueError:
+            pass
 
         raise HTTPException(
             status_code=503,
@@ -427,13 +234,13 @@ async def pull_ollama_model(model_ref: str) -> dict[str, Any]:
             },
         ) from e
 
-    except Exception as e:
+    except httpx.HTTPError as e:
         logger.error(f"Unexpected error pulling Ollama model: {e}")
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail={
-                "type": "https://lem.gg/errors/internal-error",
-                "title": "Internal Server Error",
+                "type": "https://lem.gg/errors/ollama-unavailable",
+                "title": "Ollama API Unavailable",
                 "detail": str(e),
             },
         ) from e
