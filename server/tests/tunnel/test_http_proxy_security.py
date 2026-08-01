@@ -35,16 +35,38 @@ from app.tunnel.http_frame import (
     serialize_request,
 )
 from app.tunnel.http_proxy import (
+    MAX_PATH_LENGTH,
     HTTPProxyHandler,
     build_target_url,
     error_body,
     filter_request_headers,
+    filter_response_headers,
     validate_path,
 )
 from app.tunnel.router import RequestRouter
 from app.tunnel.ws_proxy import MAX_WS_CONNECTIONS
 
 LOCAL_SERVER = "http://localhost:5142"
+
+# Stand-in for a peer that passed app.tunnel.peer_auth.
+VERIFIED_PEER = "device-verified"
+
+
+def authorized_handler(
+    local_server_url: str, router: RequestRouter | None = None
+) -> HTTPProxyHandler:
+    """Build a proxy handler acting for an already-authorized peer.
+
+    Args:
+        local_server_url: Base URL of the local server
+        router: Optional router override
+
+    Returns:
+        Handler with the peer gate satisfied
+    """
+    handler = HTTPProxyHandler(local_server_url=local_server_url, router=router)
+    handler.authorize_peer(VERIFIED_PEER)
+    return handler
 
 
 # ============================================================================
@@ -150,6 +172,36 @@ def test_peer_cannot_supply_proxy_controlled_headers() -> None:
     assert filtered == {"User-Agent": "lem-remote"}
 
 
+def test_upstream_response_headers_are_filtered() -> None:
+    """Hop-by-hop, cookie and framing headers never cross back to the peer.
+
+    Ordinary application headers still do - the proxy fronts arbitrary client
+    UIs, so this is a denylist mirroring the request side, not an allowlist.
+    """
+    filtered = filter_response_headers(
+        {
+            "Set-Cookie": "session=secret; HttpOnly",
+            "Connection": "close",
+            "Transfer-Encoding": "chunked",
+            "Content-Length": "12",
+            "Content-Encoding": "gzip",
+            "X-Frame-Options": "DENY",
+            "Content-Type": "application/json",
+        }
+    )
+
+    assert filtered == {
+        "X-Frame-Options": "DENY",
+        "Content-Type": "application/json",
+    }
+
+
+def test_absurdly_long_paths_are_rejected() -> None:
+    """Defense in depth: the validator caps length itself."""
+    with pytest.raises(ValueError, match="too long"):
+        validate_path("/" + "a" * MAX_PATH_LENGTH)
+
+
 # ============================================================================
 # Error bodies (S5)
 # ============================================================================
@@ -173,7 +225,7 @@ def test_generic_errors_carry_no_internals(attribute: str) -> None:
 
 async def test_forward_rejects_hostile_path_without_network_call() -> None:
     """The handler answers 400 itself rather than issuing the request."""
-    handler = HTTPProxyHandler(local_server_url=LOCAL_SERVER)
+    handler = authorized_handler(LOCAL_SERVER)
     await handler.start()
     try:
         response = await handler._forward_request(
@@ -356,8 +408,12 @@ def _peer_frame(path: str) -> bytes:
 
 
 async def test_tunnel_request_reaches_protected_api(protected_api: str) -> None:
-    """Remote access keeps working: the proxy presents its own credentials."""
-    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    """Remote access keeps working for a *verified* peer.
+
+    The proxy presents the local server's own credentials only once the peer
+    has been authorized (see test_peer_auth.py for the gate itself).
+    """
+    handler = authorized_handler(protected_api, RequestRouter(protected_api))
     await handler.start()
     try:
         response = deserialize_response(
@@ -372,7 +428,7 @@ async def test_tunnel_request_reaches_protected_api(protected_api: str) -> None:
 
 async def test_tunnel_ssrf_attempt_never_leaves_the_target(protected_api: str) -> None:
     """The exploit is answered locally with 400 instead of being forwarded."""
-    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    handler = authorized_handler(protected_api, RequestRouter(protected_api))
     await handler.start()
     try:
         frame = _peer_frame("@evil.example.com/v1/tunnel/disable")

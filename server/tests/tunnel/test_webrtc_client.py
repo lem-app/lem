@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from aiortc import RTCDataChannel, RTCPeerConnection, RTCSessionDescription
 
+from app.tunnel.peer_auth import AllowAllVerifier
 from app.tunnel.webrtc_client import ConnectionState, TunnelAgent
 
 
@@ -304,8 +305,12 @@ class TestTunnelAgent:
 
     @pytest.mark.asyncio
     async def test_process_signaling_offer(self) -> None:
-        """Test processing signaling offer message."""
-        agent = TunnelAgent()
+        """Test processing signaling offer message.
+
+        Peer authorization is exercised in tests/tunnel/test_peer_auth.py; this
+        test is about the SDP exchange, so the peer is pre-authorized.
+        """
+        agent = TunnelAgent(peer_verifier=AllowAllVerifier())
 
         with patch("app.tunnel.webrtc_client.aiohttp.ClientSession"):
             with patch.object(agent, "_connect_signaling", new=AsyncMock()):
