@@ -38,7 +38,7 @@ describe('HTTP Frame Serialization', () => {
         method: 'GET',
         path: '/v1/health',
         headers: {
-          'Accept': 'application/json',
+          Accept: 'application/json',
         },
         body: '',
       }
@@ -56,7 +56,7 @@ describe('HTTP Frame Serialization', () => {
         path: '/v1/runners/ollama/start',
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
+          Accept: 'application/json',
         },
         body: JSON.stringify({ timeout: 300 }),
       }

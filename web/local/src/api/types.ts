@@ -17,175 +17,175 @@
 // Based on docs/api.md
 
 // Service catalog types
-export type ServiceCategory = "backend" | "frontend" | "satellite";
-export type ServiceStatus = "not_installed" | "stopped" | "running" | "error";
+export type ServiceCategory = 'backend' | 'frontend' | 'satellite'
+export type ServiceStatus = 'not_installed' | 'stopped' | 'running' | 'error'
 
 export interface Service {
-  id: string;
-  name: string;
-  category: ServiceCategory;
-  description: string;
-  status: ServiceStatus;
-  host_port: number | null;
-  endpoint: string | null;
-  tags: string[];
-  depends_on: string[];
-  has_api: boolean;
-  has_ui: boolean;
+  id: string
+  name: string
+  category: ServiceCategory
+  description: string
+  status: ServiceStatus
+  host_port: number | null
+  endpoint: string | null
+  tags: string[]
+  depends_on: string[]
+  has_api: boolean
+  has_ui: boolean
 }
 
 // Job types
-export type JobStatus = "pending" | "running" | "completed" | "failed";
-export type JobType = "install" | "remove" | "pull_model";
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type JobType = 'install' | 'remove' | 'pull_model'
 
 export interface Job {
-  id: string;
-  type: JobType;
-  service_id: string;
-  status: JobStatus;
-  progress: number;
-  message: string;
-  error: string | null;
-  created_at: string;
-  updated_at: string;
+  id: string
+  type: JobType
+  service_id: string
+  status: JobStatus
+  progress: number
+  message: string
+  error: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface JobResponse {
-  job_id: string;
+  job_id: string
 }
 
 // Runner types (§3)
-export type RunnerStatus = "running" | "stopped" | "error";
+export type RunnerStatus = 'running' | 'stopped' | 'error'
 
 export interface Runner {
-  id: string;
-  name: string;
-  status: RunnerStatus;
-  capabilities: string[];
-  endpoint: string;
-  harbor_service: string;
-  version: string;
+  id: string
+  name: string
+  status: RunnerStatus
+  capabilities: string[]
+  endpoint: string
+  harbor_service: string
+  version: string
 }
 
 // Client types (§4)
-export type ClientStatus = "running" | "stopped" | "error";
+export type ClientStatus = 'running' | 'stopped' | 'error'
 
 export interface Client {
-  id: string;
-  name: string;
-  status: ClientStatus;
-  url: string;
-  binds_to_runner: string;
-  harbor_service: string;
-  version: string;
+  id: string
+  name: string
+  status: ClientStatus
+  url: string
+  binds_to_runner: string
+  harbor_service: string
+  version: string
 }
 
 // Model types (§3.4)
-export type ModelStatus = "ready" | "pulling" | "stopped" | "error";
+export type ModelStatus = 'ready' | 'pulling' | 'stopped' | 'error'
 
 export interface Model {
-  id: string;
-  name: string;
-  tag?: string;
-  status: ModelStatus;
-  modality: string[];
+  id: string
+  name: string
+  tag?: string
+  status: ModelStatus
+  modality: string[]
 }
 
 export interface ModelPullRequest {
-  model_ref: string;
+  model_ref: string
 }
 
 export interface ModelPullResponse {
-  id: string;
-  status: ModelStatus;
+  id: string
+  status: ModelStatus
 }
 
 // Tunnel types (§6)
 export type TunnelMode =
-  | "webrtc"
-  | "turn"
-  | "relay-ws"
-  | "offline"
-  | "connecting"
-  | "connected"
-  | "failed";
+  | 'webrtc'
+  | 'turn'
+  | 'relay-ws'
+  | 'offline'
+  | 'connecting'
+  | 'connected'
+  | 'failed'
 
 export interface TunnelStatus {
-  mode: TunnelMode;
-  authenticated?: boolean;
-  device_id?: string;
-  connection_state?: string;
-  data_channel_state?: string;
-  last_error?: string | null;
+  mode: TunnelMode
+  authenticated?: boolean
+  device_id?: string
+  connection_state?: string
+  data_channel_state?: string
+  last_error?: string | null
 }
 
 // Auth types (§6.5)
 export interface RegisterRequest {
-  email: string;
-  password: string;
-  signaling_url: string;
+  email: string
+  password: string
+  signaling_url: string
 }
 
 export interface LoginRequest {
-  email: string;
-  password: string;
-  signaling_url: string;
+  email: string
+  password: string
+  signaling_url: string
 }
 
 export interface AuthResponse {
-  status: string;
-  device_id: string;
-  tunnel_status: string;
+  status: string
+  device_id: string
+  tunnel_status: string
 }
 
 export interface LogoutResponse {
-  status: string;
-  tunnel_status: string;
+  status: string
+  tunnel_status: string
 }
 
 export interface AuthStatus {
-  authenticated: boolean;
-  email?: string;
-  device_id?: string;
-  tunnel_status: string;
+  authenticated: boolean
+  email?: string
+  device_id?: string
+  tunnel_status: string
 }
 
 // Health types (§2.1)
 export interface Health {
-  status: "ok" | "degraded" | "error";
+  status: 'ok' | 'degraded' | 'error'
   components: {
-    docker: string;
-    runners: Record<string, RunnerStatus>;
-    clients: Record<string, ClientStatus>;
-    tunnel: TunnelMode;
-  };
+    docker: string
+    runners: Record<string, RunnerStatus>
+    clients: Record<string, ClientStatus>
+    tunnel: TunnelMode
+  }
 }
 
 // System types (§2.2)
 export interface System {
-  machine_id: string;
-  version: string;
-  device_pubkey: string;
+  machine_id: string
+  version: string
+  device_pubkey: string
   platform: {
-    os: string;
-    arch: string;
-  };
+    os: string
+    arch: string
+  }
   harbor: {
-    version: string;
-    cli_path: string;
-  };
+    version: string
+    cli_path: string
+  }
 }
 
 // Standard response types
 export interface StatusResponse {
-  status: "ok";
+  status: 'ok'
 }
 
 // Error types (§10)
 export interface ProblemDetails {
-  type: string;
-  title: string;
-  status: number;
-  detail: string;
-  harbor_stderr?: string;
+  type: string
+  title: string
+  status: number
+  detail: string
+  harbor_stderr?: string
 }
