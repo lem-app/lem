@@ -42,6 +42,15 @@ AI stack — not to one model, and not via a public URL.** That is much narrower
 original thesis, it is squarely in the part of the codebase that is most broken (#15, #16,
 #17), and it is worth pursuing only if the security model becomes genuinely excellent.
 
+One more thing that should shape expectations before anything else is read. **This product has
+already been built and abandoned once.** Faraday/Backyard AI shipped "Mobile Tethering" —
+*"utilize your computer's local resources remotely from a web browser"*, *"100% free"* — in
+**February 2024**. Their desktop app is now *"deprecated and no longer supported"* and they
+sell hosted inference at $12–35/month instead (§2.6). The economics of free tethering to
+hardware the user already owns point one way, and every company that has held both ends has
+drifted toward renting GPUs. **That is the strongest argument for Lem being open source, and
+the strongest argument against expecting it to fund itself.**
+
 **The one move I would make first:** stop building features and close #15, #16, #7. Not
 because security is virtuous, but because *authenticated remote access is now the entire
 product*, and Lem currently has an unauthenticated one.
@@ -173,6 +182,10 @@ to fix it.
 | **[Harbor](https://github.com/av/harbor)** | CLI + desktop app for a whole local AI stack | **Yes — the best in class** | **Yes** — `harbor tunnel` (cloudflared) | **No** — "⚠️ Ensure to configure authentication for the service" | **Yes — 89 services, 252 integrations** | Apache-2.0 | **3,150 stars**, 215 forks, v0.5.4 (20 Jul 2026) |
 | **[Tailscale](https://tailscale.com/pricing)** | Mesh VPN | **No** — explicitly | Yes, excellent | Yes, excellent | No | Clients BSD-3, control plane proprietary | Category leader; free ≤6 users |
 | **[Pangolin](https://github.com/fosrl/pangolin)** | Self-hosted tunnel + reverse proxy | No | Yes | Yes | No | AGPL-3 (CE) | **22,000+ stars** |
+| **[Pinokio](https://desktop.pinokio.co/)** | "AI browser" / one-click app launcher | Yes — JSON install scripts | **LAN only** — v8 (8 Jul 2026) added a "Home Server" with QR phone access | No | Yes | MIT (shell) | 7.8k stars but **41,670 Discord members**; 41k Windows downloads in 2 weeks |
+| **[Jan](https://jan.ai/docs/desktop/api-server)** | Desktop app + local API server | Models only | LAN only | **Yes — API keys, trusted-host allowlist, CORS; binds `127.0.0.1` by default** | No | Apache-2.0 + attribution request | 43.8k stars; claims 6.1M downloads |
+| **[LocalAI](https://localai.io/docs/features/authentication/)** | OpenAI-compatible inference engine | Models only | No first-party remote product | **Yes — OIDC, GitHub OAuth, per-user API keys and quotas** | No | MIT | 48.1k stars; 5.84M Docker pulls |
+| **[Backyard AI](https://backyard.ai/blog/mobile-tethering)** (ex-Faraday) | Desktop app + **"Mobile Tethering"**, Feb 2024 | Yes | **Yes — and they killed it** (§2.6) | Yes | No | Proprietary | Desktop **"deprecated and no longer supported"**; now sells hosted inference at $12–35/mo |
 | **Mobile Ollama clients** ([Chatbox](https://github.com/Bin-Huang/chatbox) 41.2k, [Enchanted](https://github.com/gluonfield/enchanted) 6.0k, [Conduit](https://github.com/cogwheel0/conduit) 1.9k, [Reins](https://github.com/ibrahimcetin/reins) 524) | Chat UIs | **No** | **No** — BYO tunnel; Enchanted's README tells you to install ngrok | Whatever you configured | No | GPL/MIT/Apache | 55k+ aggregate |
 | **[OpenLLM Bridge](https://openllmbridge.com/)** | Hosted web UI + desktop bridge | **No** — requires Ollama already running | Yes, via their relay | Yes | No | Proprietary ("planning to open-source… soon") | Early/unknown |
 | **[nekoni](https://github.com/nekonihq/nekoni)** | Local agent + phone via **P2P WebRTC** | Partial | Yes | Ed25519 mutual auth | No | MIT | **13 stars** |
@@ -220,11 +233,12 @@ Three things remain genuinely different, and they are the whole case for Lem's e
    implements it for exactly one service ID (`openwebui`), returning `None` for everything
    else. `server/app/drivers/clients/` contains exactly one driver.
 
-3. **Harbor is CLI-first with a desktop companion. Lem is web-first.** A browser-based
-   dashboard is inherently reachable from a phone in a way an Electron/Tauri desktop app is
-   not. This is a real structural advantage that Lem is not currently using — `web/remote/`
-   has a viewport meta tag, roughly **ten** responsive utility classes across all components,
-   no web app manifest, and no service worker.
+3. **Harbor is CLI-first with a Tauri desktop companion that is local-only.** The Harbor App's
+   documentation describes no way to manage a Harbor instance on another machine — all setup
+   is local, or local-via-WSL2. A browser-based dashboard is inherently reachable from a phone
+   in a way a Tauri desktop app is not. This is a real structural advantage that Lem is not
+   currently using — `web/remote/` has a viewport meta tag, roughly **ten** responsive utility
+   classes across all components, no web app manifest, and no service worker.
 
 **Dependency risk is separate and material.** Lem pins Harbor **v0.3.20**
 (`scripts/install.sh:31`). Harbor is at **v0.5.4** (20 Jul 2026). Lem is many minor versions
@@ -232,7 +246,10 @@ behind on a dependency it shells out to via `~/.lem/harbor/harbor.sh`
 (`server/app/drivers/harbor_wrapper.py:45`) and whose compose-file layout it *parses*
 (`server/app/catalog/scanner.py`). Harbor is Apache-2.0, so there is no licensing risk and
 Lem may fork it — but every Harbor refactor of its compose-file conventions is a potential
-silent break in Lem's catalog.
+silent break in Lem's catalog. Two mitigations are cheap and worth taking now: Harbor's
+`harbor eject` renders a standalone Compose config, which caps lock-in, and pinning to a
+recent tag rather than v0.3.20 would recover the ~40 services the pin is currently costing
+(§7 Risk 1).
 
 ### 2.4 The LM Studio development changes the pitch
 
@@ -285,6 +302,43 @@ mostly attract single-digit comment counts. **The pain is broad but shallow** �
 hit it, few are angry enough to organize around it. That argues against expecting the fix to
 go viral on its own, and against a "security-first" pitch as the acquisition message. It is a
 retention argument, not a headline.
+
+### 2.6 The precedent nobody talks about — Backyard AI already built this and retreated
+
+This is the most important thing in the competitive research, and it is not about a
+competitor's strength. It is about a gradient.
+
+On **28 February 2024**, Faraday.dev (later Backyard AI) shipped **Mobile Tethering**:
+
+> *"Tethering extends all the capabilities of Backyard AI's desktop experience to mobile, by
+> allowing you to utilize your computer's local resources remotely from a web browser."*
+> …*"100% free to use"*, *"Unlimited generations at zero cost."*
+> — [backyard.ai/blog/mobile-tethering](https://backyard.ai/blog/mobile-tethering)
+
+That is Lem's product. Shipped, free, in early 2024.
+
+As of today, [desktop.backyard.ai](https://desktop.backyard.ai/) states: **"The desktop app is
+deprecated and no longer supported"** — "Last Updated: about 1 year ago". Backyard now sells
+**hosted inference on their hardware** at [$12/mo Standard and $35/mo Pro](https://backyard.ai/plans),
+with the free tier capped at 300 messages/week.
+
+**They went from "use your own GPU from your phone, free and unlimited" to "rent our GPU."**
+
+Why this matters more than any feature comparison:
+
+1. **The economic gradient runs against local-first.** Free tethering to hardware the user
+   already owns generates no revenue, costs real support effort, and produces the worst
+   support burden in the product (every NAT, every router, every carrier). Hosted inference
+   monetizes immediately. Every company that has held both has drifted toward the latter —
+   Backyard did it, and Ollama is doing it now ([Ollama Cloud](https://ollama.com/cloud):
+   Free / $20 Pro / $100 Max / $25-per-seat Team, on the back of $88M raised).
+2. **This is the strongest argument for Lem being open source, and possibly its only durable
+   one.** Backyard's users could not continue the product when the company's incentives moved.
+   AGPL means Lem's users can. That is a real, differentiated promise — but it is a promise
+   about *survivability*, not about features, and it should be marketed as such.
+3. **It is also a warning about sustainability.** A well-funded startup found this product
+   unsustainable enough to abandon. Lem is one unpaid person. The plan must not depend on
+   revenue that Backyard, LM Studio, and Ollama have all concluded is elsewhere (§6).
 
 ---
 
@@ -463,6 +517,9 @@ worse than they look:
   Tunnel has been [free since 2021](https://blog.cloudflare.com/tunnel-for-everyone/).
   LM Link appears to be free. **You cannot charge for a commodity whose best-in-class
   substitutes are free.**
+- **The one company that tried monetizing around this abandoned it** (§2.6). Backyard AI gave
+  tethering away free, then deprecated the desktop app entirely and moved to selling hosted
+  inference. Treat that as the base rate, not as someone else's execution failure.
 - **Only the users with the worst networks need the relay** (§7 Risk 2) — so a
   relay-metered model charges exactly the users having the worst experience.
 
@@ -548,7 +605,32 @@ differentiation is "web-based instead of desktop" — not a product.
 Harbor to bind `127.0.0.1` by default — has sat **open since April 2026 with no maintainer
 response, no label, and no linked PR**. Harbor's maintainer ships prolifically on breadth
 (v0.5.4 added a 40-service integration suite) and has not prioritized the security posture.
-That is the window, and it is the only one.
+A third-party security disclosure ([#232](https://github.com/av/harbor/issues/232), 78
+findings) was closed within hours with no visible remediation plan. That is the window, and
+it is the only one.
+
+*But the same data raises a different alarm.* Harbor is **not** a well-resourced competitor —
+it is one person, exactly like Lem:
+
+| Harbor signal | Value | Source |
+|---|---|---|
+| Commits in the last 52 weeks by the owner | **980 of 998 — 98.2%** | `gh api repos/av/harbor/stats/participation` |
+| Open PRs, all from outside contributors | **5**, oldest opened **2025-05-21** and still unmerged | `gh api repos/av/harbor/pulls` |
+| Discord members | **~100** | Discord invite API |
+| Desktop app downloads, v0.5.4, first ~10 days | **321 across all platforms** | GitHub releases API |
+
+So the honest reading is two-sided. **Harbor is less likely to out-execute Lem than the star
+count implies** — it has the same bus factor of 1 and a community that is small and whose
+contributions stall for over a year. But that *raises* dependency risk correspondingly: Lem is
+building on a foundation with no revenue, no co-maintainers, unreliable packaging
+([#234](https://github.com/av/harbor/issues/234) install-script bug open since April;
+[#253](https://github.com/av/harbor/issues/253) Windows Defender flagging v0.5.4 — its
+single most-downloaded artifact), and a stale PyPI package.
+
+**Also correct the framing elsewhere in this document:** Harbor's *catalog* is ~130–140
+services by its own wiki (21 frontends / 24 backends / 92 satellites), not 89. The 89 figure
+is what Lem's scanner finds in a local `~/.lem/harbor` checkout of the pinned v0.3.20 —
+another sign the pin is costing real breadth.
 
 *Mitigations:* (a) Be genuinely excellent at the identity/pairing model — the one thing Harbor
 shows no sign of building. (b) Consider whether the right move is **contributing an
@@ -632,12 +714,22 @@ Tailscale and compare effort-to-working against finishing #6 + #12 + #15 + #16.
 
 - **Harbor version drift** — pinned v0.3.20 vs upstream v0.5.4; Lem parses Harbor's compose
   files, so upstream layout changes break the catalog silently.
-- **Open WebUI's licence** — BSD-3 plus a branding restriction, exempt only
-  [below 50 end users in a rolling 30 days](https://raw.githubusercontent.com/open-webui/open-webui/main/LICENSE).
-  Irrelevant for individuals; relevant the moment a hosted or team tier appears.
-- **Ollama could close this at will** — $88M raised, 8.9M developers, and no mobile story yet.
-  Their answer so far is Ollama Cloud (their GPUs), which is strategically opposite. That is
-  the opening; it may not stay open.
+- **Open WebUI's licence** — changed at **v0.6.6 (5 May 2025)** to BSD-3 plus a branding
+  clause, with a CLA now required for contributions. Removing or altering Open WebUI branding
+  is prohibited except
+  [below 50 end users in a rolling 30 days](https://raw.githubusercontent.com/open-webui/open-webui/main/LICENSE),
+  by written permission, or under an enterprise licence. Code up to v0.6.5 remains plain
+  BSD-3. Irrelevant while Lem embeds Open WebUI unmodified for individuals; **directly
+  constraining the moment a hosted or team tier appears**, which is precisely the scenario §6
+  identifies as the only real business.
+- **Ollama could close this at will** — $88M raised (disclosed 9 Jul 2026), 8.9M developers,
+  and no remote-to-your-own-machine story yet. Their answer is
+  [Ollama Cloud](https://ollama.com/cloud) — Free / $20 Pro / $100 Max / $25-per-seat Team,
+  running on *their* GPUs, which is strategically opposite. That is the opening; §2.6 explains
+  why the gradient makes it likely to stay open, and why that is not entirely good news.
+- **Stars are a bad proxy for users in this category.** LocalAI has 48.1k stars and a 3.2k
+  Discord; Pinokio has 7.8k stars and a **41.7k** Discord; Harbor has 3.1k stars and ~100.
+  Do not calibrate ambition — or threat — from star counts.
 
 ---
 
@@ -646,10 +738,10 @@ Tailscale and compare effort-to-working against finishing #6 + #12 + #15 + #16.
 | # | Thesis | Verdict | Strongest evidence |
 |---|---|---|---|
 | 1 | Install experience is the top adoption blocker | **Refined** | Real, and Lem is worse than its own dependency: `https://lem.gg/install` returns **404**, and under a pipe `${BASH_SOURCE[0]}` evaluates to `main`, so the script silently treats the user's CWD as the repo root and exits 1 telling them to `git clone`. But Harbor already ships a working piped installer — so fixing this achieves **parity, not advantage**. It is the entry fee, not the moat, and it is not the *top* priority: the security debt is, because that is a liability rather than a missed opportunity. |
-| 2 | The moat is the intersection of management and remote access | **Refuted as stated; refined** | [LM Studio shipped LM Link on 4 Jun 2026](https://lmstudio.ai/blog/locally-lm-link) — runtime + iPhone app + Tailscale transport — and **Harbor already has `harbor tunnel`, `harbor qr`, and a desktop GUI**. Both flanks of the intersection are occupied. The genuinely unoccupied position is narrower: **authenticated, identity-bound access to a multi-service catalog**. Harbor's tunnel warns *"⚠️ Ensure to configure authentication for the service"*; that gap is the whole opportunity. |
+| 2 | The moat is the intersection of management and remote access | **Refuted as stated; refined** | [LM Studio shipped LM Link on 4 Jun 2026](https://lmstudio.ai/blog/locally-lm-link) — runtime + iPhone app + Tailscale transport — and **Harbor already has `harbor tunnel`, `harbor qr`, and a desktop GUI**. Pinokio v8 added a phone-accessible "Home Server" on 8 Jul 2026. Both flanks of the intersection are occupied, and a third entrant arrived last month. The genuinely unoccupied position is narrower: **authenticated, identity-bound access to a multi-service catalog**. Harbor's tunnel warns *"⚠️ Ensure to configure authentication for the service"*, Pinokio's server is LAN-only, and LM Link reaches only LM Studio's own models. That three-way gap is the whole opportunity. |
 | 3 | The killer demo is mobile; go mobile-first PWA | **Confirmed as direction; refuted as differentiator** | LM Studio already ships the demo, free. Open WebUI is already a PWA. So do it — `web/remote/` has ~10 responsive utility classes, no manifest, and no service worker, which is indefensible for a product whose headline is phone access — but do not market it as the wedge, because it is table stakes as of June 2026. |
-| 4 | The 89-service catalog is an underexploited "app store" | **Confirmed as underexploited; refuted as Lem's asset** | It is **Harbor's** catalog — 89 service compose files and **252 cross-service integration files**, verified locally — and Harbor's own App already presents it. Lem's exploitable edge is not the catalog but **generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for the other 88. Fix that and Lem has something Harbor does not. |
-| 5 | Hosted signalling/relay is the natural revenue line | **Refuted on economics; keep as infrastructure** | Cloudflare TURN is [$0.05/GB after 1 TB free](https://developers.cloudflare.com/realtime/turn/) and LLM text is tiny, so there is almost no cost to mark up; meanwhile [Tailscale is free forever for 6 users](https://tailscale.com/pricing) and Cloudflare Tunnel has been free since 2021. Worse, relay users are precisely those with the worst networks. Run it free as onboarding infrastructure. The plausible business is a **team tier**, and that is blocked on #15/#16 and on bus factor. |
+| 4 | The 89-service catalog is an underexploited "app store" | **Confirmed as underexploited; refuted as Lem's asset** | It is **Harbor's** catalog, and it is bigger than 89 — Harbor's wiki lists ~137 services; 89 is merely what Lem's scanner finds in the pinned v0.3.20 checkout, alongside **252 cross-service integration files** (verified locally). Harbor's own desktop App already presents it. Lem's exploitable edge is not the catalog but **generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for every other. Fix that — and update the pin — and Lem has something Harbor does not. |
+| 5 | Hosted signalling/relay is the natural revenue line | **Refuted on economics; keep as infrastructure** | Cloudflare TURN is [$0.05/GB after 1 TB free](https://developers.cloudflare.com/realtime/turn/) and LLM text is tiny, so there is almost no cost to mark up; meanwhile [Tailscale is free forever for 6 users](https://tailscale.com/pricing) and Cloudflare Tunnel has been free since 2021. Worse, relay users are precisely those with the worst networks. Decisively: **Backyard AI gave exactly this away free in Feb 2024, then deprecated the whole desktop product and moved to selling hosted inference at $12–35/mo** (§2.6). Run the relay free as onboarding infrastructure. The plausible business is a **team tier**, blocked on #15/#16 and on bus factor. |
 
 ---
 
@@ -691,3 +783,11 @@ no disclosure obligation. That window closes the first time someone actually ins
 Second move, same week and nearly free: **correct `README.md:65-67`.** The claims of
 end-to-end encryption and ed25519 device authentication are false today (#17), and a project
 whose differentiation is trustworthiness cannot afford a README that is not.
+
+Third, when there is eventually something to say publicly, **lead with survivability, not
+features.** The Backyard AI precedent (§2.6) is the sharpest message this project has: the
+last product that let you reach your own GPU from your phone was proprietary, was free, and
+was switched off — and its users had no recourse. Lem's answer to "what happens when you lose
+interest?" is a licence and a self-hostable stack. That is a claim no competitor in §2.2 can
+make, it costs nothing to be true, and unlike "we are more secure" it is a reason to *choose*
+rather than merely a reason not to worry.
