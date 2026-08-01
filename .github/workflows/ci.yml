@@ -74,9 +74,12 @@ jobs:
           #
           # server raised to 50 by #27, which took the Docker/Harbor control
           # surface from 3% to 89% and the whole of app/ from 19.32% to 51.94%.
+          # Raised to 70 by the tunnel v3 protocol work, which took app/ from
+          # 51.94% to 73% (app/tunnel/ alone: http_frame 96%, http_proxy 90%,
+          # ws_frame 92%, message_dispatcher 88%).
           - name: server
             dir: server
-            cov_fail_under: 50
+            cov_fail_under: 70
           - name: cloud-signaling
             dir: cloud/signaling
             cov_fail_under: 65

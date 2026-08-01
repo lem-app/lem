@@ -125,10 +125,18 @@ class RelayClient:
 
         # Message dispatcher with HTTP and WebSocket proxies
         self.router = create_router_with_client_discovery(local_server_url)
-        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(local_server_url, router=self.router)
+        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(
+            local_server_url,
+            router=self.router,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
+        )
         self.ws_proxy: WSProxyHandler = WSProxyHandler(self.router, self._send_frame)
         self.message_dispatcher: MessageDispatcher = MessageDispatcher(
-            self.http_proxy, self.ws_proxy
+            self.http_proxy,
+            self.ws_proxy,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
         )
 
         # Connection state
@@ -258,6 +266,10 @@ class RelayClient:
             logger.info(f"Connected to relay server: {ws_url}")
 
             await self._set_state(RelayConnectionState.CONNECTED)
+
+            # HELLO is the first frame on a newly opened channel, before any
+            # other traffic (spec section 5.8).
+            await self.message_dispatcher.begin_negotiation()
 
             # Start message handling loop
             asyncio.create_task(self._handle_messages())
@@ -394,15 +406,24 @@ class RelayClient:
             data: Binary frame (HTTP_REQUEST, WS_CONNECT, WS_DATA, WS_CLOSE)
         """
         try:
-            # Dispatch message to appropriate handler (same as DataChannel)
-            response_data = await self.message_dispatcher.dispatch(data)
-
-            # Send response back if provided (HTTP responses only)
-            if response_data:
-                await self.send(response_data)
+            # v3 handlers emit their own frames through _send_frame; the
+            # dispatcher no longer returns a response blob to forward.
+            await self.message_dispatcher.dispatch(data)
 
         except Exception as e:
             logger.error(f"Error handling relay message: {e}")
+
+    async def _close_channel(self, code: int, reason: str) -> None:
+        """Close the relay connection after a peer-behaviour violation.
+
+        Args:
+            code: Close code (WebSocket space)
+            reason: Generic reason, logged locally
+        """
+        logger.error(f"Closing relay channel: {code} {reason}")
+        self.should_reconnect = False
+        if self.ws and not self.ws.closed:
+            await self.ws.close(code=code)
 
     async def _send_frame(self, data: bytes) -> None:
         """Send frame back over WebSocket (used by WebSocket proxy).

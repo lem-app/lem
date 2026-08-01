@@ -46,6 +46,14 @@ from .ws_proxy import WSProxyHandler
 
 logger = logging.getLogger(__name__)
 
+# Backpressure thresholds for the DataChannel's send buffer (spec section 5.6).
+# A streaming response is produced far faster than SCTP drains it; without a
+# wait the buffer grows without bound and the channel is torn down.
+SEND_HIGH_WATER = 1024 * 1024  # 1 MiB buffered: stop producing
+SEND_LOW_WATER = 256 * 1024  # 256 KiB buffered: resume
+# Never park a producer forever on a peer that has stopped reading.
+SEND_DRAIN_TIMEOUT = 30.0
+
 
 class ConnectionState(str, Enum):
     """WebRTC connection states."""
@@ -114,11 +122,25 @@ class TunnelAgent:
 
         # Message dispatcher with HTTP and WebSocket proxies
         self.router = create_router_with_client_discovery(local_server_url)
-        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(local_server_url, router=self.router)
+        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(
+            local_server_url,
+            router=self.router,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
+        )
         self.ws_proxy: WSProxyHandler = WSProxyHandler(self.router, self._send_frame)
         self.message_dispatcher: MessageDispatcher = MessageDispatcher(
-            self.http_proxy, self.ws_proxy
+            self.http_proxy,
+            self.ws_proxy,
+            send_frame=self._send_frame,
+            close_channel=self._close_channel,
         )
+
+        # Backpressure. SCTP's send buffer is finite: pushing a 30 MB response
+        # into it without waiting fills it and the channel dies. The event is
+        # set by the DataChannel's bufferedamountlow handler.
+        self._drain_event: asyncio.Event = asyncio.Event()
+        self._drain_event.set()
 
         # Connection state
         self.state: ConnectionState = ConnectionState.DISCONNECTED
@@ -264,15 +286,30 @@ class TunnelAgent:
         """
         self.data_channel = channel
 
+        # Ask the transport to tell us when its send buffer has drained.
+        channel.bufferedAmountLowThreshold = SEND_LOW_WATER
+
         @channel.on("open")
         def on_open() -> None:
             """Handle DataChannel open event."""
             logger.info(f"DataChannel '{channel.label}' opened")
+            self._drain_event.set()
+            # HELLO is the first frame on a newly opened channel, before any
+            # other traffic (spec section 5.8).
+            asyncio.create_task(self.message_dispatcher.begin_negotiation())
 
         @channel.on("close")
         def on_close() -> None:
             """Handle DataChannel close event."""
             logger.info(f"DataChannel '{channel.label}' closed")
+            # Never leave a producer parked on a channel that is gone.
+            self._drain_event.set()
+            self.message_dispatcher.reset()
+
+        @channel.on("bufferedamountlow")
+        def on_buffered_amount_low() -> None:
+            """Release producers waiting on the send buffer."""
+            self._drain_event.set()
 
         @channel.on("message")
         def on_message(message: str | bytes) -> None:
@@ -941,29 +978,70 @@ class TunnelAgent:
             data: Binary frame (HTTP_REQUEST, WS_CONNECT, WS_DATA, WS_CLOSE)
         """
         try:
-            # Dispatch message to appropriate handler
-            response_data = await self.message_dispatcher.dispatch(data)
-
-            # Send response back if provided (HTTP responses only)
-            if response_data and self.data_channel and self.data_channel.readyState == "open":
-                self.data_channel.send(response_data)
+            # v3 handlers emit their own frames through _send_frame; the
+            # dispatcher no longer returns a response blob to forward.
+            await self.message_dispatcher.dispatch(data)
 
         except Exception as e:
             logger.error(f"Error handling DataChannel message: {e}")
 
+    async def _await_send_capacity(self) -> None:
+        """Wait until the DataChannel's send buffer has room.
+
+        Without this a large response fills SCTP's send buffer and the channel
+        dies. ``bufferedAmountLowThreshold`` is set when the channel is created,
+        so the ``bufferedamountlow`` event releases the wait.
+        """
+        channel = self.data_channel
+        if channel is None or channel.readyState != "open":
+            return
+        if channel.bufferedAmount <= SEND_HIGH_WATER:
+            return
+
+        self._drain_event.clear()
+        # Re-check after clearing: the drain may have happened in between.
+        if channel.bufferedAmount <= SEND_LOW_WATER:
+            self._drain_event.set()
+            return
+
+        try:
+            await asyncio.wait_for(self._drain_event.wait(), timeout=SEND_DRAIN_TIMEOUT)
+        except TimeoutError:
+            logger.warning(
+                f"DataChannel send buffer stayed above {SEND_LOW_WATER} bytes for "
+                f"{SEND_DRAIN_TIMEOUT}s ({channel.bufferedAmount} buffered); sending anyway"
+            )
+
+    async def _close_channel(self, code: int, reason: str) -> None:
+        """Close the active channel after a peer-behaviour violation.
+
+        Args:
+            code: Close code (WebSocket space)
+            reason: Generic reason, logged locally
+        """
+        logger.error(f"Closing tunnel channel: {code} {reason}")
+        self._drain_event.set()
+        if self.connection_mode == "relay" and self.relay_client:
+            await self.relay_client.disconnect()
+            return
+        if self.data_channel:
+            self.data_channel.close()
+
     async def _send_frame(self, data: bytes) -> None:
-        """Send frame back over DataChannel or relay WebSocket (used by WebSocket proxy).
+        """Send frame back over DataChannel or relay WebSocket.
 
         Args:
             data: Binary frame to send
         """
         if self.connection_mode == "relay" and self.relay_client:
-            # Send via relay WebSocket
+            # Send via relay WebSocket. aiohttp's send_bytes already awaits the
+            # transport, so no extra backpressure handling is needed here.
             try:
                 await self.relay_client.send(data)
             except Exception as e:
                 logger.warning(f"Cannot send frame via relay: {e}")
         elif self.data_channel and self.data_channel.readyState == "open":
+            await self._await_send_capacity()
             # Send via WebRTC DataChannel
             self.data_channel.send(data)
         else:

@@ -27,13 +27,14 @@ import pytest
 
 from app.tunnel.http_frame import (
     FrameType,
-    HTTPRequestFrame,
-    deserialize_response,
+    HTTPRequestHeadFrame,
     peek_request_id,
-    serialize_request,
+    serialize_request_head,
 )
-from app.tunnel.http_proxy import GENERIC_PROXY_ERROR, HTTPProxyHandler
+from app.tunnel.http_proxy import GENERIC_PROXY_ERROR
 from app.tunnel.router import RequestRouter
+
+from .proxy_harness import authorized_handler, send_request
 
 
 class BoomRouter(RequestRouter):
@@ -65,14 +66,14 @@ def _request(request_id: int) -> bytes:
     Returns:
         Serialized request frame
     """
-    frame: HTTPRequestFrame = {
+    frame: HTTPRequestHeadFrame = {
         "request_id": request_id,
         "method": "GET",
         "path": "/v1/health",
-        "headers": {},
-        "body": "",
+        "headers": [],
+        "body_follows": False,
     }
-    return serialize_request(frame)
+    return serialize_request_head(frame)
 
 
 @pytest.mark.parametrize("request_id", [1, 42, 0x01020304, 0xFFFFFFFF])
@@ -85,7 +86,7 @@ def test_peek_request_id_reads_past_the_frame_type(request_id: int) -> None:
     # for every id whose top octet differs from the frame type byte.
     (wrong,) = struct.unpack(">I", data[:4])
     assert wrong != request_id
-    assert wrong >> 24 == FrameType.HTTP_REQUEST
+    assert wrong >> 24 == FrameType.HTTP_REQUEST_HEAD
 
 
 def test_peek_request_id_returns_none_when_too_short() -> None:
@@ -94,34 +95,22 @@ def test_peek_request_id_returns_none_when_too_short() -> None:
     assert peek_request_id(b"") is None
 
 
-async def test_proxy_error_frame_carries_the_requests_id() -> None:
+@pytest.mark.parametrize("request_id", [1, 0xFFFFFFFF])
+async def test_proxy_error_frame_carries_the_requests_id(request_id: int) -> None:
     """A proxy-level 500 is addressed to the request that caused it.
 
-    Fails on main: the error frame came back with request_id 0x01000000
-    (16777216) instead of 1, so the browser had no pending entry to resolve and
-    the caller waited out the full 30s timeout.
+    Fails against the old offset: the error frame came back with request_id
+    0x01000000 (16777216) instead of 1, so the browser had no pending entry to
+    resolve and the caller waited out the full 30s timeout.
     """
-    handler = HTTPProxyHandler(local_server_url="http://localhost:5142", router=BoomRouter())
-    handler.authorize_peer("device-verified")
+    handler, collector = authorized_handler("http://localhost:5142", router=BoomRouter())
     await handler.start()
     try:
-        response = deserialize_response(await handler.handle_request(_request(1)))
+        await send_request(handler, request_id, "GET", "/v1/health")
     finally:
         await handler.stop()
 
-    assert response["request_id"] == 1
-    assert response["status_code"] == 500
-    assert GENERIC_PROXY_ERROR in response["body"]
-
-
-async def test_proxy_error_frame_id_survives_a_high_request_id() -> None:
-    """Ids near the uint32 ceiling correlate too."""
-    handler = HTTPProxyHandler(local_server_url="http://localhost:5142", router=BoomRouter())
-    handler.authorize_peer("device-verified")
-    await handler.start()
-    try:
-        response = deserialize_response(await handler.handle_request(_request(0xFFFFFFFF)))
-    finally:
-        await handler.stop()
-
-    assert response["request_id"] == 0xFFFFFFFF
+    response = collector.response_for(request_id)
+    assert response.status_code == 500
+    assert GENERIC_PROXY_ERROR in response.body.decode()
+    assert response.final is True
