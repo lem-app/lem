@@ -147,9 +147,11 @@ export function ClientViewer({
     void fetchAppInfo()
   }, [isConnected, clientId, serviceId, proxyFetch])
 
-  // Open the service session, then build the frame URL. Strictly in that order:
-  // the worker answers 410 for a session it has not been told about, so a frame
-  // created first would race its own session registration.
+  // Register the session, wait for the worker to acknowledge it, and only then
+  // build the frame URL. Strictly in that order: a `postMessage` to the worker
+  // and a navigation into its scope are independent queues, so a frame created
+  // optimistically can have its first request answered 410 by a worker that has
+  // not been told about the session yet.
   useEffect(() => {
     if (bridge === null || appId === undefined) return
     if (appInfo?.status !== 'running') return
@@ -162,10 +164,20 @@ export function ClientViewer({
       return
     }
 
-    bridge.openSession(deviceId, appId)
-    setFrameSrc(path)
+    let cancelled = false
+    bridge
+      .openSession(deviceId, appId)
+      .then(() => {
+        if (!cancelled) setFrameSrc(path)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setErrorMessage(error instanceof Error ? error.message : String(error))
+        }
+      })
 
     return () => {
+      cancelled = true
       setFrameSrc(null)
       bridge.closeSession(deviceId, appId)
     }

@@ -509,6 +509,13 @@ export class LemAppServiceWorker {
       case 'LEM_SESSION_OPEN': {
         const key = sessionKey(message.deviceId, message.serviceId)
         if (key !== null) this.sessions.add(key)
+        // The page waits for this before it creates the iframe. Without the
+        // acknowledgement there is no ordering between "session registered" and
+        // "navigation dispatched", and the frame's very first request can be
+        // answered 410 by a worker that has not been told about it yet.
+        if (typeof message.ackId === 'number') {
+          this.bridgePort?.postMessage({ type: 'LEM_SESSION_ACK', ackId: message.ackId })
+        }
         return
       }
       case 'LEM_SESSION_CLOSE': {

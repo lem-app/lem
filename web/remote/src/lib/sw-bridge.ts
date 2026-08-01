@@ -39,6 +39,9 @@ export const SW_SCOPE = '/app/'
 /** How long `navigator.serviceWorker.ready` gets before we call it unavailable. */
 export const SW_READY_TIMEOUT_MS = 5000
 
+/** How long a session registration waits to be acknowledged. */
+export const SESSION_ACK_TIMEOUT_MS = 3000
+
 /** Segments that can appear in `/app/<deviceId>/<serviceId>/` unescaped. */
 const PATH_SEGMENT_RE = /^[A-Za-z0-9._-]{1,64}$/
 
@@ -65,7 +68,8 @@ export type ProxyFetch = (url: string, init?: RequestInit) => Promise<Response>
  * the tunnel, and the viewer's only business with it is session lifetime.
  */
 export interface SessionRegistrar {
-  openSession(deviceId: string, serviceId: string): void
+  /** Resolves once the worker has acknowledged the session. */
+  openSession(deviceId: string, serviceId: string): Promise<void>
   closeSession(deviceId: string, serviceId: string): void
 }
 
@@ -176,6 +180,9 @@ export class ServiceWorkerBridge {
   private readonly sessions = new Set<string>()
   /** Exchanges the worker can still cancel, keyed by its request id. */
   private readonly inFlight = new Map<number, AbortController>()
+  /** Session registrations awaiting the worker's acknowledgement. */
+  private readonly sessionAcks = new Map<number, () => void>()
+  private nextAckId = 1
   private disposed = false
 
   /** Exposed for tests: how many exchanges the page refused on device id. */
@@ -242,10 +249,36 @@ export class ServiceWorkerBridge {
     this.post({ type: up ? 'LEM_TUNNEL_UP' : 'LEM_TUNNEL_DOWN' })
   }
 
-  /** Open a service session. Must complete before the iframe is created. */
-  openSession(deviceId: string, serviceId: string): void {
+  /**
+   * Open a service session, and resolve once the worker has acknowledged it.
+   *
+   * The caller must await this before creating the iframe. `postMessage` to a
+   * worker and a navigation into its scope are two independent queues with no
+   * ordering between them, so a frame created optimistically can have its very
+   * first request answered 410 by a worker that has not been told about the
+   * session yet. The acknowledgement is the ordering.
+   *
+   * @throws if the worker does not answer within `SESSION_ACK_TIMEOUT_MS`
+   */
+  async openSession(deviceId: string, serviceId: string): Promise<void> {
     this.sessions.add(`${deviceId} ${serviceId}`)
-    this.post({ type: 'LEM_SESSION_OPEN', deviceId, serviceId })
+    const ackId = this.nextAckId
+    this.nextAckId += 1
+
+    const acknowledged = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.sessionAcks.delete(ackId)
+        reject(new Error('The Lem service worker did not acknowledge the session'))
+      }, SESSION_ACK_TIMEOUT_MS)
+      this.sessionAcks.set(ackId, () => {
+        clearTimeout(timer)
+        this.sessionAcks.delete(ackId)
+        resolve()
+      })
+    })
+
+    this.post({ type: 'LEM_SESSION_OPEN', deviceId, serviceId, ackId })
+    await acknowledged
   }
 
   /** Close a service session; the worker answers 410 for it afterwards. */
@@ -301,6 +334,8 @@ export class ServiceWorkerBridge {
     this.post({ type: this.tunnelUp ? 'LEM_TUNNEL_UP' : 'LEM_TUNNEL_DOWN' })
     for (const key of this.sessions) {
       const [deviceId, serviceId] = key.split(' ')
+      // No ackId: nobody is waiting on a replay, and the frames it serves are
+      // already on screen.
       this.post({ type: 'LEM_SESSION_OPEN', deviceId, serviceId })
     }
   }
@@ -311,6 +346,12 @@ export class ServiceWorkerBridge {
 
   private onWorkerMessage(event: MessageEvent): void {
     const data = event.data as { type?: unknown; reqId?: unknown } | null
+
+    if (data?.type === 'LEM_SESSION_ACK') {
+      const ackId = (data as { ackId?: unknown }).ackId
+      if (typeof ackId === 'number') this.sessionAcks.get(ackId)?.()
+      return
+    }
 
     if (data?.type === 'LEM_CANCEL' && typeof data.reqId === 'number') {
       // The frame walked away. Abort the exchange so the far side stops

@@ -65,7 +65,7 @@ describe('the same-origin Service Worker proxy', () => {
 
   beforeEach(async () => {
     harness = await createHarness({ deviceId: DEVICE_A })
-    harness.bridge.openSession(DEVICE_A, 'webui')
+    await harness.bridge.openSession(DEVICE_A, 'webui')
     await settle()
   })
 
@@ -215,8 +215,8 @@ describe('the same-origin Service Worker proxy', () => {
       // fake registry no longer lists it.
       const restarted = await harness.restartWorker()
       harness.clients.remove('frame-1')
-      harness.bridge.openSession(DEVICE_A, 'webui')
-      harness.bridge.openSession(DEVICE_A, 'ollama')
+      await harness.bridge.openSession(DEVICE_A, 'webui')
+      await harness.bridge.openSession(DEVICE_A, 'ollama')
       await settle()
 
       const result = await harness.dispatch(`${ORIGIN}/static/app.js`, {
@@ -232,7 +232,7 @@ describe('the same-origin Service Worker proxy', () => {
     })
 
     it('fails closed rather than guessing between two sessions (step 6)', async () => {
-      harness.bridge.openSession(DEVICE_A, 'ollama')
+      await harness.bridge.openSession(DEVICE_A, 'ollama')
       await settle()
 
       const result = await harness.dispatch(`${ORIGIN}/static/app.js`, { clientId: 'unknown' })
@@ -245,7 +245,7 @@ describe('the same-origin Service Worker proxy', () => {
 
   describe('two services in two tabs', () => {
     it('do not cross-talk, and never reach the single-session fallback', async () => {
-      harness.bridge.openSession(DEVICE_A, 'ollama')
+      await harness.bridge.openSession(DEVICE_A, 'ollama')
       await settle()
       harness.tunnel.serve((request) => ({
         status: 200,
@@ -358,7 +358,7 @@ describe('the same-origin Service Worker proxy', () => {
     it('refuses a stale prefix with 409 and puts no frame on the wire', async () => {
       serveOpenWebUI(harness)
       harness.bridge.setActiveDevice(DEVICE_B)
-      harness.bridge.openSession(DEVICE_B, 'webui')
+      await harness.bridge.openSession(DEVICE_B, 'webui')
       await settle()
 
       const before = harness.tunnel.sent.length
@@ -379,7 +379,7 @@ describe('the same-origin Service Worker proxy', () => {
       // prefix-less fetch from the surviving client.
       const store = persistentBindingStore()
       const session = await createHarness({ deviceId: DEVICE_A, bindingStore: store })
-      session.bridge.openSession(DEVICE_A, 'webui')
+      await session.bridge.openSession(DEVICE_A, 'webui')
       session.clients.add('worker-1', appUrl(DEVICE_A, 'webui'))
       session.tunnel.serve(() => ({ status: 200, chunks: ['ok'] }))
       await settle()
@@ -395,7 +395,7 @@ describe('the same-origin Service Worker proxy', () => {
       // is the one that resolves - which is the point of the criterion.
       session.clients.remove('worker-1')
       session.bridge.setActiveDevice(DEVICE_B)
-      session.bridge.openSession(DEVICE_B, 'webui')
+      await session.bridge.openSession(DEVICE_B, 'webui')
       await settle()
 
       const framesBefore = session.tunnel.sent.length

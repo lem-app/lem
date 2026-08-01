@@ -64,8 +64,19 @@ function fakeBridge(): SessionRegistrar & {
   return {
     opened,
     closed,
-    openSession: (deviceId, serviceId) => opened.push([deviceId, serviceId]),
+    openSession: (deviceId, serviceId) => {
+      opened.push([deviceId, serviceId])
+      return Promise.resolve()
+    },
     closeSession: (deviceId, serviceId) => closed.push([deviceId, serviceId]),
+  }
+}
+
+/** A worker that never acknowledges, as a wedged one would not. */
+function silentBridge(): SessionRegistrar {
+  return {
+    openSession: () => Promise.reject(new Error('The Lem service worker did not acknowledge')),
+    closeSession: () => undefined,
   }
 }
 
@@ -149,6 +160,24 @@ describe('ClientViewer iframe', () => {
 
     view.unmount()
     expect(bridge.closed).toEqual([['dev-7f3a', 'webui']])
+  })
+
+  it('renders no iframe until the worker acknowledges the session', async () => {
+    render(
+      <ClientViewer
+        serviceId="webui"
+        deviceId="dev-7f3a"
+        connectionState="connected"
+        dataChannelState="open"
+        onBack={() => undefined}
+        proxyFetch={proxyFetchReturning(service('http://localhost:3000/'))}
+        swStatus={READY}
+        bridge={silentBridge()}
+      />
+    )
+
+    expect(await screen.findByText(/did not acknowledge/)).toBeInTheDocument()
+    expect(document.querySelector('iframe')).toBeNull()
   })
 
   it('renders no iframe at all when the proxy is unavailable', async () => {
