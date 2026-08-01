@@ -71,9 +71,12 @@ jobs:
           #   server           19.32%  -> floor 17  (gap to 80: ~61 pts)
           #   cloud-signaling  67.05%  -> floor 65  (gap to 80: ~13 pts)
           #   cloud-relay       0.00%  -> floor  0  (no tests exist yet)
+          #
+          # server raised to 50 by #27, which took the Docker/Harbor control
+          # surface from 3% to 89% and the whole of app/ from 19.32% to 51.94%.
           - name: server
             dir: server
-            cov_fail_under: 17
+            cov_fail_under: 50
           - name: cloud-signaling
             dir: cloud/signaling
             cov_fail_under: 65
