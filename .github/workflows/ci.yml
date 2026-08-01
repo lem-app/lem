@@ -306,14 +306,59 @@ jobs:
           # anyone else's commit -- syntax validation wearing a DCO costume.
           # CONTRIBUTING.md requires the name and email to match the committer's
           # git configuration; this now actually enforces that.
-          commits="$(
-            gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
-              --jq '.[] | select((.parents | length) < 2)
-                        | [.sha,
-                           (.commit.author.name  | @base64),
-                           (.commit.author.email | @base64),
-                           (.commit.message      | @base64)] | @tsv'
-          )"
+          # The commit list comes over the network, so a transient API blip
+          # must never be reported as a DCO violation. This call previously had
+          # no retry, and `set -e` turned any single hiccup into a red required
+          # check -- observed once as a 34s failure with no output, passing in
+          # 4s on re-run. A required check that fails for reasons unrelated to
+          # the code erodes trust in every other gate.
+          #
+          # `set +e` around the call so a non-zero exit is inspected here
+          # instead of killing the step. Each attempt reassigns `commits`, so a
+          # partially-paginated response from a failed attempt is discarded
+          # rather than being checked as if it were the whole PR.
+          api_err="$(mktemp)"
+          attempts=4
+          delay=2
+          api_ok=0
+
+          for attempt in $(seq 1 "$attempts"); do
+            set +e
+            commits="$(
+              gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
+                --jq '.[] | select((.parents | length) < 2)
+                          | [.sha,
+                             (.commit.author.name  | @base64),
+                             (.commit.author.email | @base64),
+                             (.commit.message      | @base64)] | @tsv' \
+                2>"$api_err"
+            )"
+            rc=$?
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              api_ok=1
+              break
+            fi
+
+            echo "  GitHub API call failed (attempt ${attempt}/${attempts}, exit ${rc})."
+            sed 's/^/    /' "$api_err"
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "  Retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$(( delay * 2 ))
+            fi
+          done
+
+          # Exit 2, not 1. Exit 1 below means "a commit is not signed off" --
+          # a real DCO violation the contributor must fix. Exit 2 means "this
+          # gate could not run", which is nobody's fault and is fixed by a
+          # re-run. Keeping the two apart is the difference between a
+          # contributor amending commits and a contributor pressing retry.
+          if [ "$api_ok" -ne 1 ]; then
+            echo "::error title=DCO check could not run::Could not fetch the commit list for ${REPO}#${PR_NUMBER} after ${attempts} attempts. This is a GitHub API failure, NOT a DCO violation -- no commit has been judged either way. Re-run the job; if it persists, check the API status and this step's log for the error above."
+            exit 2
+          fi
 
           if [ -z "$commits" ]; then
             echo "No non-merge commits to check."
