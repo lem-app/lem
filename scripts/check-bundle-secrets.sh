@@ -506,6 +506,22 @@ verify_scanner_detects_canaries() {
     "$(printf '%s`;' "$crlf_tail")"
   )
 
+  # The same, split by MULTI-BYTE whitespace. Without these, deleting the UTF-8
+  # half of the strip passes the self-test: every separator above is ASCII, so
+  # `tr -d` alone would still reassemble all three. Found by mutating exactly
+  # that and watching 23/23 come back green. NBSP is two bytes, LINE SEPARATOR
+  # is three, so both widths are covered.
+  local nbsp_head nbsp_tail ls_head ls_tail
+  nbsp_head="$(rand_letters 1)$(rand_b64std 19)"
+  nbsp_tail="$(rand_b64std 19)$(rand_digits 1)"
+  ls_head="$(rand_letters 1)$(rand_b64std 19)"
+  ls_tail="$(rand_b64std 19)$(rand_digits 1)"
+  must_detect+=("${nbsp_head}${nbsp_tail}" "${ls_head}${ls_tail}")
+  lines+=(
+    "$(printf 'const lemCanaryNbsp = `%s%s%s`;' "$nbsp_head" $'\xc2\xa0' "$nbsp_tail")"
+    "$(printf 'const lemCanaryLsep = `%s%s%s`;' "$ls_head" $'\xe2\x80\xa8' "$ls_tail")"
+  )
+
   # --- keyword-adjacent, positive -----------------------------------------
   # One per alternative in KEYWORD_RE, each with a literal exactly at the
   # 16-char threshold. Deleting any alternative from the regex fails here.
