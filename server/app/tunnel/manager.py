@@ -105,8 +105,7 @@ class TunnelManager:
 
             # Start connection
             logger.info(
-                f"Starting TunnelAgent: device_id={auth_state.device_id}, "
-                f"signal_url={signal_url}"
+                f"Starting TunnelAgent: device_id={auth_state.device_id}, signal_url={signal_url}"
             )
 
             try:

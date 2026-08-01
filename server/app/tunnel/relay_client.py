@@ -69,9 +69,7 @@ class RelayClient:
 
         # Message dispatcher with HTTP and WebSocket proxies
         self.router = create_router_with_client_discovery(local_server_url)
-        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(
-            local_server_url, router=self.router
-        )
+        self.http_proxy: HTTPProxyHandler = HTTPProxyHandler(local_server_url, router=self.router)
         self.ws_proxy: WSProxyHandler = WSProxyHandler(self.router, self._send_frame)
         self.message_dispatcher: MessageDispatcher = MessageDispatcher(
             self.http_proxy, self.ws_proxy

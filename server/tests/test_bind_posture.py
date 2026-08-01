@@ -201,9 +201,7 @@ async def test_unauthenticated_request_is_refused_on_a_wildcard_bind(
     only thing standing between them and Docker.
     """
     async with httpx.AsyncClient(base_url=exposed_server) as client:
-        response = await client.post(
-            "/v1/tunnel/disable", headers={"X-Lem-Client": "attacker"}
-        )
+        response = await client.post("/v1/tunnel/disable", headers={"X-Lem-Client": "attacker"})
 
     assert response.status_code == 401
     assert response.json()["type"] == "https://lem.gg/errors/unauthorized"

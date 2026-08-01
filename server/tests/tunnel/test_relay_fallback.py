@@ -66,10 +66,7 @@ async def test_relay_client_connection() -> None:
 async def test_tunnel_agent_webrtc_timeout() -> None:
     """Test that TunnelAgent times out WebRTC and attempts reconnection."""
     # Create tunnel agent with very short timeout
-    agent = TunnelAgent(
-        local_server_url="http://localhost:5142",
-        relay_url="ws://localhost:8001"
-    )
+    agent = TunnelAgent(local_server_url="http://localhost:5142", relay_url="ws://localhost:8001")
 
     # Override timeout for faster test
     agent.webrtc_timeout = 1.0  # 1 second timeout
@@ -87,10 +84,7 @@ async def test_tunnel_agent_webrtc_timeout() -> None:
 
 def test_tunnel_agent_get_connection_mode() -> None:
     """Test that TunnelAgent.get_connection_mode() returns correct mode."""
-    agent = TunnelAgent(
-        local_server_url="http://localhost:5142",
-        relay_url="ws://localhost:8001"
-    )
+    agent = TunnelAgent(local_server_url="http://localhost:5142", relay_url="ws://localhost:8001")
 
     # Initially should be webrtc mode
     assert agent.get_connection_mode() == "webrtc"
