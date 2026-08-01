@@ -26,6 +26,8 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ArrowLeft, Activity, AlertCircle, Loader2 } from 'lucide-react'
+import { localApiUrl } from '../lib/env'
+import { toFramableUrl } from '../lib/framable-url'
 
 interface Client {
   id: string
@@ -80,7 +82,7 @@ export function ClientViewer({
 
         if (serviceId) {
           // Fetch service info
-          const response = await proxyFetch(`http://localhost:5142/v1/services/${serviceId}`)
+          const response = await proxyFetch(localApiUrl(`/v1/services/${serviceId}`))
 
           if (!response.ok) {
             throw new Error(`Failed to fetch service: ${response.status}`)
@@ -95,7 +97,7 @@ export function ClientViewer({
           })
         } else if (clientId) {
           // Fetch client info (legacy)
-          const response = await proxyFetch('http://localhost:5142/v1/clients')
+          const response = await proxyFetch(localApiUrl('/v1/clients'))
 
           if (!response.ok) {
             throw new Error(`Failed to fetch clients: ${response.status}`)
@@ -123,8 +125,10 @@ export function ClientViewer({
       }
     }
 
-    fetchAppInfo()
+    void fetchAppInfo()
   }, [isConnected, clientId, serviceId, proxyFetch])
+
+  const framableUrl = toFramableUrl(appInfo?.url)
 
   const getStatusBadge = () => {
     if (!isConnected || loading) {
@@ -266,23 +270,49 @@ export function ClientViewer({
             </Card>
           )}
 
-        {isConnected && !loading && appInfo && appInfo.status === 'running' && appInfo.url && (
+        {isConnected &&
+          !loading &&
+          appInfo &&
+          appInfo.status === 'running' &&
+          appInfo.url &&
+          framableUrl === null && (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>
+                <strong>Refusing to embed {appInfo.name}.</strong> The local server reported the
+                address <code className="break-all">{appInfo.url}</code>, which is not a loopback
+                http(s) URL. Only local addresses are embedded, so a compromised or misconfigured
+                server cannot point this dashboard at arbitrary content.
+              </AlertDescription>
+            </Alert>
+          )}
+
+        {isConnected && !loading && appInfo && appInfo.status === 'running' && framableUrl && (
           <Card>
             <CardHeader>
               <CardTitle>{serviceId ? 'Service' : 'Client'} Interface</CardTitle>
               <CardDescription>
-                Accessing <strong>{appInfo.name}</strong> at {appInfo.url}. WebSocket connections
+                Accessing <strong>{appInfo.name}</strong> at {framableUrl}. WebSocket connections
                 are automatically proxied.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              {/* App UI will be rendered here using iframe */}
+              {/*
+                `framableUrl` is allowlisted to loopback origins (see toFramableUrl),
+                which is what keeps `allow-same-origin` from being a sandbox escape:
+                the frame can never share this dashboard's origin. `allow-popups` and
+                `allow-top-navigation` stay off so the frame cannot open windows or
+                navigate the dashboard away, `allow=""` drops every powerful feature
+                (camera, mic, geolocation, ...), and no referrer leaks the app URL.
+              */}
               <div className="rounded-lg border bg-background">
                 <iframe
-                  src={appInfo.url}
+                  src={framableUrl}
                   title={appInfo.name}
                   className="h-[calc(100vh-300px)] w-full rounded-lg"
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                  sandbox="allow-scripts allow-same-origin allow-forms"
+                  referrerPolicy="no-referrer"
+                  allow=""
                 />
               </div>
 

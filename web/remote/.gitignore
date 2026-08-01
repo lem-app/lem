@@ -27,3 +27,6 @@ dist-ssr
 .env
 .env.local
 .env.production.local
+.env.production
+.env.*.local
+coverage
