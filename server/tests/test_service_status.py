@@ -341,6 +341,75 @@ class TestParseHostPort:
         assert status_mod._parse_host_port(ports, container_port) == expected
 
 
+class TestStrictHostPort:
+    """Spec section 3.6.1: tunnel routing resolves ports exactly, or not at all.
+
+    Naming a caller "authoritative" does not disable a guess that lives inside
+    it. The fallback regex returns the first host port it can find anywhere in
+    the Docker ``Ports`` string, whether or not it maps the container port the
+    catalog declares. That is fine for a link on the user's own dashboard and
+    unacceptable for an authenticated request over the tunnel, which would be
+    delivered to whatever else happens to be listening on that host port.
+    """
+
+    # A sidecar port is published; the catalog's container port (8080) is not.
+    MISMATCHED_PORTS = "0.0.0.0:9999->9090/tcp"
+
+    def test_strict_refuses_a_container_port_miss(self) -> None:
+        assert status_mod._parse_host_port(self.MISMATCHED_PORTS, 8080, strict=True) is None
+
+    def test_lenient_still_guesses_the_same_miss(self) -> None:
+        """The positive control: the fallback regex does read this string."""
+        assert status_mod._parse_host_port(self.MISMATCHED_PORTS, 8080) == 9999
+
+    def test_strict_refuses_an_unknown_container_port(self) -> None:
+        """You cannot match exactly against an unknown target."""
+        assert status_mod._parse_host_port("0.0.0.0:33891->33891/tcp", None, strict=True) is None
+        # Positive control: the same string does resolve leniently.
+        assert status_mod._parse_host_port("0.0.0.0:33891->33891/tcp", None) == 33891
+
+    def test_strict_still_accepts_an_exact_match(self) -> None:
+        assert status_mod._parse_host_port("0.0.0.0:33801->8080/tcp", 8080, strict=True) == 33801
+
+    def test_tunnel_gets_nothing_and_the_dashboard_gets_the_guess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same container, asserted separately for each caller.
+
+        This is the acceptance test of section 3.6.1: one container whose
+        published port does not map the catalog's container port resolves to
+        None for the tunnel and to the guessed port for the dashboard.
+        """
+        recorder = _DockerRecorder(
+            ps_json=_ps_line("harbor.webui", ports=self.MISMATCHED_PORTS),
+            images="ghcr.io/open-webui/open-webui:main",
+        )
+        monkeypatch.setattr(status_mod, "_run_docker", recorder)
+        monkeypatch.setattr(status_mod, "scan_harbor_services", lambda: dict.fromkeys(CATALOG_IDS))
+        monkeypatch.setattr(
+            status_mod, "get_service_definition", lambda sid: _definition(sid, container_port=8080)
+        )
+
+        # Tunnel routing: no address it can positively resolve, so no address.
+        assert status_mod.get_service_url("webui") is None
+
+    async def test_dashboard_display_keeps_the_lenient_guess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the same assertion, on the dashboard's path."""
+        recorder = _DockerRecorder(
+            ps_json=_ps_line("harbor.webui", ports=TestStrictHostPort.MISMATCHED_PORTS),
+            images="",
+        )
+        monkeypatch.setattr(status_mod, "_run_docker", recorder)
+        monkeypatch.setattr(status_mod, "scan_harbor_services", lambda: dict.fromkeys(CATALOG_IDS))
+        monkeypatch.setattr(
+            status_mod, "get_service_definition", lambda sid: _definition(sid, container_port=8080)
+        )
+
+        assert await status_mod.get_service_endpoint("webui") == "http://127.0.0.1:9999"
+
+
 class TestGetServiceUrl:
     """The synchronous lookup used by tunnel routing must never raise."""
 
