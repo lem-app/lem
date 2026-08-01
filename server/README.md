@@ -71,10 +71,10 @@ holder has nothing to spoof.
 
 So the credential is delivered at runtime and downgraded on arrival:
 
-| | |
-|---|---|
-| `POST /v1/auth/session` | Trades the root token for a session token. **Only** `~/.lem/api_token` is accepted - a session token cannot mint another one, so the expiry is real. Returns `{"token": "...", "expires_at": "..."}` with 201. |
-| `DELETE /v1/auth/session` | Revokes the session token presented. Always 204, so it is not an oracle for guessing live sessions. |
+|                           |                                                                                                                                                                                                                |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/auth/session`   | Trades the root token for a session token. **Only** `~/.lem/api_token` is accepted - a session token cannot mint another one, so the expiry is real. Returns `{"token": "...", "expires_at": "..."}` with 201. |
+| `DELETE /v1/auth/session` | Revokes the session token presented. Always 204, so it is not an oracle for guessing live sessions.                                                                                                            |
 
 - **Memory only.** Sessions live in a dict in this process (`app/sessions.py`).
   Nothing is written to disk or to SQLite, so **a server restart invalidates
@@ -88,8 +88,10 @@ So the credential is delivered at runtime and downgraded on arrival:
 The dashboard side: `web/local` prompts on 401, exchanges what the operator
 pastes, keeps only the session token (in `sessionStorage` by default,
 `localStorage` behind an explicit "remember on this device"), and retries the
-request that failed. `scripts/check-bundle-secrets.sh` builds the app and fails
-if any credential-shaped build variable reaches `dist/`.
+request that failed. A **Sign out** control calls `DELETE /v1/auth/session` and
+clears both storages, so the remembered-device opt-in is not one-way.
+`scripts/check-bundle-secrets.sh` builds the app and fails if any
+credential-shaped build variable reaches `dist/`.
 
 ### Proxies in front of the bind: `LEM_REQUIRE_TOKEN`
 
@@ -97,7 +99,7 @@ The posture check reads the address off the socket this process actually bound.
 It cannot see a second hop it is not part of. Put a reverse proxy, port
 forward, container port publish or SSH tunnel in front of a verified-loopback
 bind and the API becomes reachable off-host while the server correctly reports
-`loopback only` and does not require a token - it *is* bound to loopback; the
+`loopback only` and does not require a token - it _is_ bound to loopback; the
 exposure was added downstream. `web/local`'s own `pnpm run dev:lan` is exactly
 this shape: it publishes the Vite dev server on every interface while proxying
 `/v1/*` to loopback.
@@ -110,7 +112,7 @@ LEM_REQUIRE_TOKEN=true uv run lem-serve
 
 Every `/v1/*` request then needs a bearer token even though the bind is
 loopback-only, and the dashboard's credential prompt makes that usable from
-another machine. The flag can only ever *add* the requirement - there is no
+another machine. The flag can only ever _add_ the requirement - there is no
 value that switches the token off on a network-reachable bind. Accepted values
 are `1`, `true`, `yes`, `on` (case-insensitive); anything else is false, so a
 typo cannot silently claim protection that is not there.
@@ -177,6 +179,7 @@ uv run pytest --cov=app --cov-report=term-missing
 ## API Documentation
 
 Once the server is running, visit:
+
 - **Interactive docs**: http://localhost:5142/docs
 - **ReDoc**: http://localhost:5142/redoc
 

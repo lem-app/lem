@@ -58,7 +58,17 @@ export function CredentialPrompt(): ReactElement {
   // only place it lives, and it is wiped the moment the form is submitted.
   const inputRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => subscribeToCredentialPrompt(() => setOpen(true)), [])
+  useEffect(
+    () =>
+      subscribeToCredentialPrompt(() => {
+        setOpen(true)
+        // "Unchecked by default" means every prompt, not just the first. This
+        // component stays mounted across sign-out and re-prompt, so without
+        // this an earlier tick would silently carry into the next credential.
+        setRemember(false)
+      }),
+    []
+  )
 
   const handleOpenChange = useCallback((next: boolean): void => {
     if (next) {

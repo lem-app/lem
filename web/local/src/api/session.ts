@@ -59,6 +59,31 @@ function storageFor(remember: boolean): Storage | null {
   }
 }
 
+// Anything that wants to know whether a credential is currently held - today
+// only the sign-out control, which must not offer to sign out of nothing.
+type SessionListener = (token: string | null) => void
+const sessionListeners = new Set<SessionListener>()
+
+function notifySessionChanged(): void {
+  const token = readSessionToken()
+  for (const listener of sessionListeners) {
+    listener(token)
+  }
+}
+
+/**
+ * Watch for the stored session token appearing or disappearing.
+ *
+ * @param listener - Called with the new value on every change
+ * @returns Unsubscribe function
+ */
+export function subscribeToSessionToken(listener: SessionListener): () => void {
+  sessionListeners.add(listener)
+  return () => {
+    sessionListeners.delete(listener)
+  }
+}
+
 /**
  * Read the stored session token.
  *
@@ -72,6 +97,12 @@ export function readSessionToken(): string | null {
   )
 }
 
+/** Remove the token from both storages without announcing the change. */
+function removeStoredToken(): void {
+  storageFor(false)?.removeItem(SESSION_STORAGE_KEY)
+  storageFor(true)?.removeItem(SESSION_STORAGE_KEY)
+}
+
 /**
  * Persist a session token.
  *
@@ -81,14 +112,21 @@ export function readSessionToken(): string | null {
 export function storeSessionToken(token: string, remember: boolean): void {
   // Clear both first so toggling "remember" cannot leave a stale copy behind in
   // the other Storage, where readSessionToken would eventually find it again.
-  clearSessionToken()
+  removeStoredToken()
   storageFor(remember)?.setItem(SESSION_STORAGE_KEY, token)
+  notifySessionChanged()
 }
 
-/** Forget the stored session token, wherever it lives. */
+/**
+ * Forget the stored session token, wherever it lives.
+ *
+ * Both storages are cleared unconditionally, not just the one the current
+ * "remember" choice points at: someone who ticked the box and later did not
+ * would otherwise leave a working credential behind in localStorage.
+ */
 export function clearSessionToken(): void {
-  storageFor(false)?.removeItem(SESSION_STORAGE_KEY)
-  storageFor(true)?.removeItem(SESSION_STORAGE_KEY)
+  removeStoredToken()
+  notifySessionChanged()
 }
 
 /**
@@ -149,14 +187,14 @@ export async function exchangeRootToken(rootToken: string, remember: boolean): P
 /**
  * Revoke the stored session server-side and forget it locally.
  *
- * Not called from the UI yet - there is no sign-out affordance, because the
- * prompt is 401-driven rather than a session the operator manages. It is the
- * client half of DELETE /v1/auth/session, which exists so a session can be
- * killed rather than waited out; keeping it here saves re-deriving the shape.
+ * This is the off switch for "remember on this device". Without it that opt-in
+ * is one-way: tick the box on a borrowed machine and the credential sits in
+ * localStorage with no in-product way to get it out again.
  *
- * Failure is not surfaced: the local copy is dropped either way, and a session
- * the server has already forgotten (restart, expiry) is not an error worth
- * reporting to someone who just asked to sign out.
+ * The local copy is dropped FIRST and unconditionally. The revoke call is
+ * best-effort and its failure is deliberately not surfaced - a sign-out that
+ * leaves the credential in the browser because the server had already
+ * restarted, or the network was down, is the worst possible outcome.
  */
 export async function endSession(): Promise<void> {
   const token = readSessionToken()

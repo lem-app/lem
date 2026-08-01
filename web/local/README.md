@@ -77,10 +77,19 @@ local API has exactly one principal, the machine's operator:
    401s raise one prompt and one exchange between them.
 
 Storage is `sessionStorage` by default - tab-scoped, gone when the tab closes.
-"Remember on this device" (off by default) promotes it to `localStorage`, which
-survives restarts and is correspondingly readable by any later XSS on this
-origin. Sessions also die with the server process, which keeps them in memory
-only; you will be re-prompted after a server restart.
+"Remember on this device" (off by default, and re-cleared on every prompt)
+promotes it to `localStorage`, which survives restarts and is correspondingly
+readable by any later XSS on this origin. Sessions also die with the server
+process, which keeps them in memory only; you will be re-prompted after a server
+restart.
+
+**Sign out** appears in the header whenever a credential is held. It is the off
+switch for "remember on this device": it calls `DELETE /v1/auth/session` and
+clears **both** storages, so a token cannot be stranded in `localStorage` by
+someone who ticked the box once on a borrowed machine. The local copy is dropped
+before the server is contacted and regardless of whether that call succeeds - a
+sign-out that leaves the credential behind because the network was down would be
+the worst outcome.
 
 Nothing about this affects the common case: on a loopback bind the API requires
 no credential and the prompt never appears.

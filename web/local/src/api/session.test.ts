@@ -34,6 +34,7 @@ import {
   resolveCredentialRequest,
   storeSessionToken,
   subscribeToCredentialPrompt,
+  subscribeToSessionToken,
 } from './session'
 
 describe('session storage', () => {
@@ -119,6 +120,50 @@ describe('session storage', () => {
     await endSession()
 
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  // A sign-out that leaves the credential behind because the server was
+  // unreachable is the worst possible outcome, so the local copy goes first.
+  it('forgets the token even when the revoke call rejects', async () => {
+    storeSessionToken('to-revoke', true)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.reject(new Error('network down')))
+    )
+
+    await expect(endSession()).resolves.toBeUndefined()
+
+    expect(readSessionToken()).toBeNull()
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it('clears the remembered copy even when the tab-scoped one is what was read', async () => {
+    // Both populated: a browser left in this state by an older build must not
+    // keep a working credential in localStorage after sign-out.
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, 'tab')
+    window.localStorage.setItem(SESSION_STORAGE_KEY, 'remembered')
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve({ ok: true, status: 204 } as Response))
+    )
+
+    await endSession()
+
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it('announces the token appearing and disappearing', () => {
+    const seen: (string | null)[] = []
+    const unsubscribe = subscribeToSessionToken((token) => seen.push(token))
+
+    storeSessionToken('abc', false)
+    clearSessionToken()
+    unsubscribe()
+    storeSessionToken('after-unsubscribe', false)
+
+    expect(seen).toEqual(['abc', null])
   })
 })
 

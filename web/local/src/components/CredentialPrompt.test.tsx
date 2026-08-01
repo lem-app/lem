@@ -27,6 +27,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { CredentialPrompt } from './CredentialPrompt'
+import { SessionStatus } from './SessionStatus'
 import { getServices } from '../api/client'
 import { ApiError } from '../api/http'
 import { SESSION_STORAGE_KEY, resetCredentialState } from '../api/session'
@@ -108,6 +109,11 @@ function installFetch(options: { acceptRoot?: string } = {}): void {
           ? jsonResponse(201, { token: SESSION_TOKEN, expires_at: '2026-08-02T00:00:00+00:00' })
           : jsonResponse(401, UNAUTHORIZED)
       )
+    }
+
+    if (url.endsWith('/v1/auth/session') && method === 'DELETE') {
+      // The real endpoint answers 204 whether or not the token was known.
+      return Promise.resolve(jsonResponse(204, null))
     }
 
     // Every other /v1/* path needs a live session token.
@@ -313,5 +319,113 @@ describe('CredentialPrompt', () => {
 
     await expect(getServices()).resolves.toEqual(SERVICES)
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * Sign-out: the off switch for "remember on this device".
+ *
+ * Without it the opt-in is one-way - tick the box on a borrowed machine and the
+ * credential stays in localStorage with no in-product way to remove it.
+ */
+describe('SessionStatus', () => {
+  beforeEach(() => {
+    calls = []
+    resetCredentialState()
+    window.sessionStorage.clear()
+    window.localStorage.clear()
+    installFetch()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  function renderDashboard(): void {
+    render(
+      <>
+        <CredentialPrompt />
+        <SessionStatus />
+      </>
+    )
+  }
+
+  it('offers nothing to sign out of when no credential is held', () => {
+    renderDashboard()
+
+    expect(screen.queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument()
+  })
+
+  it('clears both storages on sign-out and prompts again on the next request', async () => {
+    renderDashboard()
+
+    // Take the remembered path, so the token lands in localStorage - the one
+    // that survives a tab close and needs an explicit way out.
+    const first = getServices()
+    await screen.findByRole('dialog')
+    await submitToken(ROOT_TOKEN, true)
+    await expect(first).resolves.toEqual(SERVICES)
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBe(SESSION_TOKEN)
+
+    await user().click(await screen.findByRole('button', { name: /sign out/i }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument()
+    })
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(
+      calls.some((call) => call.method === 'DELETE' && call.url.endsWith('/v1/auth/session'))
+    ).toBe(true)
+
+    // The credential really is gone: the next call has to ask for one again.
+    const second = getServices()
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    await submitToken(ROOT_TOKEN)
+    await expect(second).resolves.toEqual(SERVICES)
+  })
+
+  it('clears the credential even when the revoke call fails', async () => {
+    // The worst outcome would be a sign-out that leaves the token behind
+    // because the server had already restarted or the network was down.
+    window.localStorage.setItem(SESSION_STORAGE_KEY, SESSION_TOKEN)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.reject(new Error('network down')))
+    )
+    renderDashboard()
+
+    await user().click(await screen.findByRole('button', { name: /sign out/i }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument()
+    })
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it('re-prompts with "remember" unticked after a remembered session is signed out', async () => {
+    renderDashboard()
+
+    const first = getServices()
+    await screen.findByRole('dialog')
+    await submitToken(ROOT_TOKEN, true)
+    await expect(first).resolves.toEqual(SERVICES)
+
+    await user().click(await screen.findByRole('button', { name: /sign out/i }))
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument()
+    })
+
+    const second = getServices()
+    await screen.findByRole('dialog')
+
+    // The earlier tick must not carry into the next credential.
+    expect(screen.getByRole('checkbox', { name: /remember on this device/i })).not.toBeChecked()
+    await submitToken(ROOT_TOKEN)
+    await expect(second).resolves.toEqual(SERVICES)
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe(SESSION_TOKEN)
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
   })
 })
