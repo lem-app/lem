@@ -28,12 +28,17 @@ echo "→ Relay Server (port 8001)"
 (cd ../cloud/relay && uv run uvicorn app.main:app --host 0.0.0.0 --port 8001) &
 sleep 2
 
-# Start Lem local server
-# Binds to loopback by default: this API controls Docker on your machine.
-# Export LEM_HOST=0.0.0.0 to expose it on the LAN (then every /v1/* request
-# needs "Authorization: Bearer $(cat ~/.lem/api_token)").
-echo "→ Local Lem Server (port 5142)"
-(cd ../server && LEM_HOST="${LEM_HOST:-127.0.0.1}" uv run uvicorn app.main:app --reload --host "${LEM_HOST:-127.0.0.1}" --port 5142) &
+# Start Lem local server through Lem's own entrypoint.
+# lem-serve is the only place the bind address is chosen: it reads LEM_HOST /
+# LEM_PORT, binds the socket, then derives the API's auth posture from the
+# address it actually got. Never pass a separate --host: two independently
+# typed values is what let the server publish Docker to the LAN while logging
+# "loopback only".
+# Binds to loopback by default. Export LEM_HOST=0.0.0.0 to expose it on the LAN
+# (then every /v1/* request needs "Authorization: Bearer $(cat ~/.lem/api_token)"
+# and browser dashboards need their origin in LEM_ALLOWED_ORIGINS).
+echo "→ Local Lem Server (port ${LEM_PORT:-5142})"
+(cd ../server && LEM_HOST="${LEM_HOST:-127.0.0.1}" LEM_PORT="${LEM_PORT:-5142}" uv run lem-serve) &
 sleep 2
 
 # Start browser remote app

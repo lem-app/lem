@@ -44,6 +44,16 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || ''
 const CLIENT_HEADER = 'X-Lem-Client'
 const CLIENT_NAME = 'lem-dashboard'
 
+// On a loopback bind the server accepts requests without a token. When the
+// server is bound to the LAN (LEM_HOST), every /v1/* request needs the bearer
+// token from ~/.lem/api_token - a browser cannot read that file, so it has to
+// be handed to the dashboard at build/dev time via VITE_LEM_API_TOKEN.
+const API_TOKEN: string = import.meta.env.VITE_LEM_API_TOKEN || "";
+
+function authHeaders(): Record<string, string> {
+  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {};
+}
+
 class ApiError extends Error {
   status: number
   problemDetails?: ProblemDetails
@@ -65,6 +75,7 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
       headers: {
         'Content-Type': 'application/json',
         [CLIENT_HEADER]: CLIENT_NAME,
+        ...authHeaders(),
         ...options?.headers,
       },
     })

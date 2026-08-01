@@ -26,17 +26,28 @@ privileged surface. Two independent defenses guard it:
    the "simple request" attack where a malicious page POSTs to
    http://localhost:5142 with ``mode: 'no-cors'``.
 
-2. Bearer token (enforced when the server is not bound to loopback). The token
-   lives in ``~/.lem/api_token`` with mode 0600, so only the local user can read
-   it. On a loopback bind the token is accepted but not required - reaching the
-   socket at all already requires local access.
+2. Bearer token (enforced unless the server has *verified* that it listens on
+   loopback only). The token lives in ``~/.lem/api_token`` with mode 0600, so
+   only the local user can read it. On a verified loopback bind the token is
+   accepted but not required - reaching the socket at all already requires
+   local access.
+
+The second defense used to be derived from ``$LEM_HOST`` alone, which is a
+different value from the address uvicorn is actually told to bind. When the two
+diverged the server published a Docker control plane to the network while
+logging that it was loopback-only. The posture is now derived from
+``socket.getsockname()`` on the real listening socket (see
+:func:`verify_bind_posture`, called by ``app.serve``), and it fails closed: if
+the bound address cannot be verified, the token is required.
 """
 
 import ipaddress
 import logging
 import os
 import secrets
-from collections.abc import Callable, Sequence
+import socket
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
@@ -57,6 +68,10 @@ ALLOWED_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
 )
 
+# Extra browser origins, for the LAN opt-in: the built-in allowlist is
+# localhost-only, so a dashboard served from another host would be refused.
+ORIGINS_ENV_VAR = "LEM_ALLOWED_ORIGINS"
+
 # Methods that cannot change server state, and so need no CSRF proof.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -66,6 +81,10 @@ CLIENT_HEADER = "x-lem-client"
 # Default bind address. LAN exposure is opt-in via LEM_HOST.
 DEFAULT_HOST = "127.0.0.1"
 HOST_ENV_VAR = "LEM_HOST"
+
+# Default listen port.
+DEFAULT_PORT = 5142
+PORT_ENV_VAR = "LEM_PORT"
 
 # Bearer token for non-loopback binds.
 TOKEN_PATH = LEM_HOME / "api_token"
@@ -83,10 +102,62 @@ def get_bind_host() -> str:
     """
     Resolve the address the server binds to.
 
+    This is only a *request*: what the process ends up listening on is settled
+    by :func:`verify_bind_posture` once the socket exists.
+
     Returns:
         Value of $LEM_HOST, or 127.0.0.1 when unset/empty
     """
     return os.environ.get(HOST_ENV_VAR, "").strip() or DEFAULT_HOST
+
+
+def get_bind_port() -> int:
+    """
+    Resolve the port the server binds to.
+
+    Returns:
+        Value of $LEM_PORT, or 5142 when unset/empty/invalid
+    """
+    raw = os.environ.get(PORT_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Ignoring invalid {PORT_ENV_VAR}={raw!r}; using {DEFAULT_PORT}")
+        return DEFAULT_PORT
+
+
+def get_allowed_origins() -> tuple[str, ...]:
+    """
+    Build the browser origin allowlist, including the $LEM_ALLOWED_ORIGINS opt-in.
+
+    ``LEM_HOST`` lets the API be served on the LAN, but the built-in allowlist
+    only names localhost, so a dashboard loaded from another host would have
+    every state-changing request refused with ``origin-not-allowed``. This is
+    the knob that makes LAN mode usable. A wildcard is refused: it would turn
+    the Origin half of the CSRF check off entirely.
+
+    Returns:
+        Allowlisted origins, built-ins first, duplicates removed
+    """
+    raw = os.environ.get(ORIGINS_ENV_VAR, "")
+    extra: list[str] = []
+    for candidate in raw.split(","):
+        origin = candidate.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            logger.warning(f"Ignoring '*' in {ORIGINS_ENV_VAR}: a wildcard origin is not allowed")
+            continue
+        if not origin.startswith(("http://", "https://")):
+            logger.warning(f"Ignoring {ORIGINS_ENV_VAR} entry {origin!r}: must be a full origin")
+            continue
+        extra.append(origin)
+
+    if extra:
+        logger.info(f"{ORIGINS_ENV_VAR} adds {len(extra)} browser origin(s): {', '.join(extra)}")
+    return tuple(dict.fromkeys((*ALLOWED_ORIGINS, *extra)))
 
 
 def is_loopback_host(host: str) -> bool:
@@ -108,6 +179,173 @@ def is_loopback_host(host: str) -> bool:
     except ValueError:
         # Any other hostname could resolve anywhere - treat as remotely reachable.
         return False
+
+
+# ============================================================================
+# Bind posture (derived from the real listening socket)
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class BindPosture:
+    """What the process has actually established about the socket it listens on.
+
+    Attributes:
+        verified: True only when a real bound address was read successfully
+        loopback_only: True when every verified address stays on this machine
+        addresses: Human-readable bound addresses (empty when unverified)
+        reason: Why the posture is what it is, for logging
+    """
+
+    verified: bool
+    loopback_only: bool
+    addresses: tuple[str, ...]
+    reason: str
+
+    @property
+    def require_token(self) -> bool:
+        """Whether /v1/* must carry a bearer token.
+
+        Fails closed: anything other than a *verified* loopback bind requires
+        the token, including a bind we could not determine at all.
+        """
+        return not (self.verified and self.loopback_only)
+
+    def describe(self) -> str:
+        """Render the posture for a startup log line.
+
+        Returns:
+            One-line summary naming the verified address or the lack of one
+        """
+        if not self.verified:
+            return f"bind address NOT verified ({self.reason})"
+        where = ", ".join(self.addresses)
+        scope = "loopback only" if self.loopback_only else "network-reachable"
+        return f"verified listening on {where} ({scope})"
+
+
+# Startup default: nothing has been verified yet, so the token is required.
+UNVERIFIED_BIND = BindPosture(
+    verified=False,
+    loopback_only=False,
+    addresses=(),
+    reason=(
+        "the server was not started through Lem's own entrypoint, so it never "
+        "saw the listening socket - run 'uv run lem-serve' (or "
+        "'python -m app.serve')"
+    ),
+)
+
+_bind_posture: BindPosture = UNVERIFIED_BIND
+
+
+def get_bind_posture() -> BindPosture:
+    """
+    Return the current bind posture.
+
+    Returns:
+        The posture established at startup (unverified until then)
+    """
+    return _bind_posture
+
+
+def set_bind_posture(posture: BindPosture) -> BindPosture:
+    """
+    Install a bind posture.
+
+    Args:
+        posture: Posture to install
+
+    Returns:
+        The installed posture
+    """
+    global _bind_posture
+    _bind_posture = posture
+    return posture
+
+
+def reset_bind_posture() -> None:
+    """Restore the fail-closed default (used by tests)."""
+    set_bind_posture(UNVERIFIED_BIND)
+
+
+def token_required() -> bool:
+    """
+    Whether the bearer token is enforced right now.
+
+    Returns:
+        True unless a loopback-only bind has been positively verified
+    """
+    return _bind_posture.require_token
+
+
+def _sockname_host(sock: socket.socket) -> str | None:
+    """
+    Extract the host part of a socket's bound address.
+
+    Args:
+        sock: A bound socket
+
+    Returns:
+        Host as a string, or None if the family is not IP (so: undeterminable)
+    """
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return None
+    sockname = sock.getsockname()
+    if not isinstance(sockname, tuple) or len(sockname) < 2:
+        return None
+    host = sockname[0]
+    return host if isinstance(host, str) else None
+
+
+def verify_bind_posture(sockets: Iterable[socket.socket]) -> BindPosture:
+    """
+    Derive and install the security posture from the real listening sockets.
+
+    ``getsockname()`` is authoritative: it is what the kernel bound, not what
+    some environment variable asked for. Anything we cannot read is treated as
+    remotely reachable.
+
+    Args:
+        sockets: The sockets the server will accept connections on
+
+    Returns:
+        The installed posture
+    """
+    addresses: list[str] = []
+    loopback = True
+
+    for sock in sockets:
+        try:
+            host = _sockname_host(sock)
+        except OSError as e:
+            return set_bind_posture(
+                BindPosture(False, False, (), f"could not read the bound address: {e}")
+            )
+        if host is None:
+            return set_bind_posture(
+                BindPosture(False, False, (), f"unsupported socket family {sock.family!r}")
+            )
+        try:
+            port = int(sock.getsockname()[1])
+        except (OSError, IndexError, TypeError, ValueError) as e:
+            return set_bind_posture(
+                BindPosture(False, False, (), f"could not read the bound port: {e}")
+            )
+        addresses.append(f"{host}:{port}")
+        loopback = loopback and is_loopback_host(host)
+
+    if not addresses:
+        return set_bind_posture(BindPosture(False, False, (), "no listening socket was reported"))
+
+    return set_bind_posture(
+        BindPosture(
+            verified=True,
+            loopback_only=loopback,
+            addresses=tuple(addresses),
+            reason="read from the bound socket",
+        )
+    )
 
 
 # ============================================================================
@@ -217,6 +455,21 @@ def problem_response(status_code: int, error_type: str, title: str, detail: str)
     )
 
 
+def _as_provider(value: bool | Callable[[], bool]) -> Callable[[], bool]:
+    """
+    Normalize a fixed flag or a live callable into a callable.
+
+    Args:
+        value: A constant, or a function evaluated per request
+
+    Returns:
+        A zero-argument callable returning the flag
+    """
+    if isinstance(value, bool):
+        return lambda: value
+    return value
+
+
 class LocalApiSecurityMiddleware:
     """
     Enforce CSRF protection and (optionally) bearer-token auth on the local API.
@@ -227,7 +480,7 @@ class LocalApiSecurityMiddleware:
         app: ASGIApp,
         *,
         allowed_origins: Sequence[str] = ALLOWED_ORIGINS,
-        require_token: bool = False,
+        require_token: bool | Callable[[], bool] = token_required,
         token_provider: Callable[[], str | None] = get_api_token,
         protected_prefix: str = "/v1/",
     ) -> None:
@@ -235,18 +488,23 @@ class LocalApiSecurityMiddleware:
         Args:
             app: Downstream ASGI application
             allowed_origins: Origins accepted on state-changing requests
-            require_token: Require ``Authorization: Bearer`` on protected paths
+            require_token: Require ``Authorization: Bearer`` on protected paths.
+                Defaults to the live bind posture, which fails closed until a
+                loopback-only bind has been verified.
             token_provider: Returns the expected token (None disables the check)
             protected_prefix: Path prefix the token requirement applies to
         """
         self.app = app
         self.allowed_origins = frozenset(allowed_origins)
-        self.require_token = require_token
+        self.token_required = _as_provider(require_token)
         self.token_provider = token_provider
         self.protected_prefix = protected_prefix
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Reject unauthenticated or cross-site requests before they reach a route."""
+        # The local API serves no WebSocket routes today. If one is ever added,
+        # this passthrough would silently exempt it - the checks below read an
+        # HTTP method and path, so they need a WebSocket equivalent first.
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -274,7 +532,7 @@ class LocalApiSecurityMiddleware:
         Returns:
             A 401 problem response, or None if the request may proceed
         """
-        if not self.require_token or method == "OPTIONS":
+        if not self.token_required() or method == "OPTIONS":
             return None
         if not path.startswith(self.protected_prefix):
             return None

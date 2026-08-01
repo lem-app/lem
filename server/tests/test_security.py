@@ -26,8 +26,10 @@ from fastapi.testclient import TestClient
 from app import security
 from app.security import (
     ALLOWED_ORIGINS,
+    BindPosture,
     LocalApiSecurityMiddleware,
     ensure_api_token,
+    get_allowed_origins,
     get_api_token,
     get_bind_host,
     is_loopback_host,
@@ -35,6 +37,21 @@ from app.security import (
 
 TOKEN = "test-token-value"
 ALLOWED_ORIGIN = "http://localhost:5174"
+
+
+@pytest.fixture
+def verified_loopback() -> Generator[None, None, None]:
+    """Pretend startup verified a loopback-only bind."""
+    security.set_bind_posture(
+        BindPosture(
+            verified=True,
+            loopback_only=True,
+            addresses=("127.0.0.1:5142",),
+            reason="read from the bound socket",
+        )
+    )
+    yield
+    security.reset_bind_posture()
 
 
 def build_app(*, require_token: bool = False, token: str | None = TOKEN) -> FastAPI:
@@ -324,7 +341,9 @@ def test_get_api_token_reads_from_disk(token_file: Path) -> None:
 # ============================================================================
 
 
-def test_real_app_blocks_unauthenticated_state_change() -> None:
+def test_real_app_blocks_unauthenticated_state_change(
+    verified_loopback: None,
+) -> None:
     """The middleware is actually installed on the shipped app.
 
     /v1/tunnel/disable takes no request body, which is exactly what made it
@@ -340,3 +359,68 @@ def test_real_app_blocks_unauthenticated_state_change() -> None:
         client.post("/v1/tunnel/disable", headers={"X-Lem-Client": "lem-dashboard"}).status_code
         == 200
     )
+
+
+def test_real_app_fails_closed_when_the_bind_is_unverified() -> None:
+    """No verified loopback bind means the shipped app demands a token."""
+    from app.main import app as lem_app
+
+    security.reset_bind_posture()
+    client = TestClient(lem_app)
+
+    assert client.get("/v1/health").status_code in (401, 503)
+
+
+# ============================================================================
+# Browser origin allowlist (LEM_ALLOWED_ORIGINS)
+# ============================================================================
+
+
+def test_allowed_origins_defaults_to_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the opt-in, only the built-in localhost origins are accepted."""
+    monkeypatch.delenv("LEM_ALLOWED_ORIGINS", raising=False)
+
+    assert get_allowed_origins() == ALLOWED_ORIGINS
+
+
+def test_allowed_origins_extends_for_lan_dashboards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LEM_HOST ships a LAN opt-in; this is what makes the dashboard usable."""
+    monkeypatch.setenv("LEM_ALLOWED_ORIGINS", "http://192.168.1.10:5174, http://lem.local:5174/")
+
+    origins = get_allowed_origins()
+
+    assert origins[: len(ALLOWED_ORIGINS)] == ALLOWED_ORIGINS
+    assert "http://192.168.1.10:5174" in origins
+    assert "http://lem.local:5174" in origins
+
+
+@pytest.mark.parametrize("value", ["*", "192.168.1.10:5174", "  ", "not-a-url"])
+def test_allowed_origins_refuses_junk_and_wildcards(
+    value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wildcard would turn the Origin half of the CSRF check off."""
+    monkeypatch.setenv("LEM_ALLOWED_ORIGINS", value)
+
+    assert get_allowed_origins() == ALLOWED_ORIGINS
+
+
+def test_lan_origin_is_accepted_by_the_middleware() -> None:
+    """End to end: a LAN dashboard POST is no longer a silent 403."""
+    lan_origin = "http://192.168.1.10:5174"
+    app = FastAPI()
+    app.add_middleware(
+        LocalApiSecurityMiddleware,
+        allowed_origins=(*ALLOWED_ORIGINS, lan_origin),
+        require_token=False,
+    )
+
+    @app.post("/v1/ping")
+    async def write_ping() -> dict[str, str]:
+        return {"status": "ok"}
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/ping", headers={"X-Lem-Client": "lem-dashboard", "Origin": lan_origin}
+    )
+
+    assert response.status_code == 200

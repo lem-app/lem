@@ -51,12 +51,11 @@ from app.drivers.runners.ollama import (
 from app.jobs import JobStatus, get_job, get_recent_jobs
 from app.jobs.queue import init_job_queue, shutdown_job_queue
 from app.security import (
-    ALLOWED_ORIGINS,
     TOKEN_PATH,
     LocalApiSecurityMiddleware,
     ensure_api_token,
-    get_bind_host,
-    is_loopback_host,
+    get_allowed_origins,
+    get_bind_posture,
 )
 from app.services import (
     get_all_services_with_status,
@@ -84,11 +83,8 @@ logger = logging.getLogger(__name__)
 # Global TunnelManager instance
 tunnel_manager: TunnelManager | None = None
 
-# Where the server is bound (LEM_HOST, default loopback). A non-loopback bind
-# publishes a Docker control plane to the network, so it additionally requires a
-# bearer token on every /v1/* request.
-BIND_HOST = get_bind_host()
-LOOPBACK_ONLY = is_loopback_host(BIND_HOST)
+# Browser origins allowed to drive the API (built-ins plus $LEM_ALLOWED_ORIGINS).
+BROWSER_ORIGINS = get_allowed_origins()
 
 
 @asynccontextmanager
@@ -106,13 +102,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Startup: Ensure the API token exists (never log the token itself)
     ensure_api_token()
     logger.info(f"✓ API token available at {TOKEN_PATH}")
-    if LOOPBACK_ONLY:
-        logger.info(f"✓ Listening on {BIND_HOST} (loopback only)")
+
+    # Report what was actually verified about the listening socket and the
+    # enforcement decision that follows from it - never a claim we have not
+    # checked. app.serve installs this posture before the socket accepts.
+    posture = get_bind_posture()
+    enforcement = (
+        "bearer token REQUIRED on /v1/*"
+        if posture.require_token
+        else "bearer token accepted but not required on /v1/*"
+    )
+    if posture.verified and posture.loopback_only:
+        logger.info(f"✓ Lem local API {posture.describe()}; {enforcement}")
+    elif posture.verified:
+        logger.warning(
+            f"⚠ Lem local API {posture.describe()}: {enforcement} "
+            f"(token in {TOKEN_PATH})"
+        )
     else:
         logger.warning(
-            f"⚠ Bound to {BIND_HOST}: the Lem API is reachable from the network. "
-            f"Every /v1/* request now requires 'Authorization: Bearer <token>' "
-            f"using the token in {TOKEN_PATH}."
+            f"⚠ Lem local API {posture.describe()}. Failing closed: {enforcement} "
+            f"(token in {TOKEN_PATH})"
         )
 
     # Startup: Initialize job queue
@@ -156,18 +166,19 @@ app = FastAPI(
 )
 
 # Access control. Added first so the CORS middleware wraps it and can still
-# attach CORS headers to rejections.
+# attach CORS headers to rejections. require_token is deliberately left at its
+# default: it reads the live, verified bind posture on every request instead of
+# a value frozen from an environment variable at import time.
 app.add_middleware(
     LocalApiSecurityMiddleware,
-    allowed_origins=ALLOWED_ORIGINS,
-    require_token=not LOOPBACK_ONLY,
+    allowed_origins=BROWSER_ORIGINS,
 )
 
 # Configure CORS for local development.
-# The allowlist is shared with the CSRF middleware (app.security.ALLOWED_ORIGINS).
+# The allowlist is shared with the CSRF middleware so the two cannot drift.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),
+    allow_origins=list(BROWSER_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
