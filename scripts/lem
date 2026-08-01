@@ -79,19 +79,49 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 LOCK_HELD=""
 
-lock_acquire() {
-  local waited=0 holder announced=0 blank=0
+# >>> lock-reclaim: keep this block byte-identical in scripts/install.sh and scripts/lem >>>
+# Take the lock directory $1 away from the gone holder $2 ("" when it left no
+# readable pid). Returns 0 only if it removed the directory.
+#
+# NOT "re-read the pid, then rm -rf": those are two operations, and in the gap
+# another reclaimer can delete the directory and recreate it with its own live
+# pid -- which the rm -rf would then destroy, leaving two runs both believing
+# they hold the lock. mkdir of the claim marker is the atomic test-and-set, and
+# the marker lives *inside* the lock directory, so it disappears with it:
+# whoever wins the claim is provably looking at the same directory instance it
+# read, and a pid that still matches proves nothing was swapped underneath.
+#
+# Losing the claim, or finding a different pid, means someone else is dealing
+# with it. Either way this never assumes it holds the lock afterwards -- only a
+# later mkdir of the lock directory itself decides that.
+lock_reclaim() {
+  local dir="$1" holder="$2"
 
-  mkdir -p "${LEM_LOCK_DIR%/*}" 2>/dev/null || true
+  mkdir "$dir/claim" 2>/dev/null || return 1
+
+  if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$holder" ]; then
+    rm -rf "$dir"
+    return 0
+  fi
+
+  rmdir "$dir/claim" 2>/dev/null || true
+  return 1
+}
+# <<< lock-reclaim <<<
+
+lock_acquire() {
+  local dir="$LEM_LOCK_DIR" waited=0 holder announced=0 blank=0
+
+  mkdir -p "${dir%/*}" 2>/dev/null || true
 
   while [ "$waited" -lt "$LOCK_TIMEOUT" ]; do
-    if mkdir "$LEM_LOCK_DIR" 2>/dev/null; then
-      printf '%s\n' "$$" >"$LEM_LOCK_DIR/pid"
-      LOCK_HELD="$LEM_LOCK_DIR"
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid"
+      LOCK_HELD="$dir"
       return 0
     fi
 
-    holder="$(cat "$LEM_LOCK_DIR/pid" 2>/dev/null || true)"
+    holder="$(cat "$dir/pid" 2>/dev/null || true)"
     case "$holder" in
       ''|*[!0-9]*) holder="" ;;
     esac
@@ -100,11 +130,12 @@ lock_acquire() {
 
     if [ -z "$holder" ]; then
       # No readable pid: a leftover from a crash, or a winner that has not
-      # written its pid yet. Reclaim only on the second sighting, so the
-      # second case resolves itself.
+      # written its pid yet. Act only on the second sighting, so the second
+      # case resolves itself rather than being reclaimed out from under a run
+      # that is about to hold the lock.
       blank=$((blank + 1))
       if [ "$blank" -ge 2 ]; then
-        rm -rf "$LEM_LOCK_DIR"
+        lock_reclaim "$dir" "" || true
         blank=0
       fi
       continue
@@ -112,11 +143,7 @@ lock_acquire() {
     blank=0
 
     if ! kill -0 "$holder" 2>/dev/null; then
-      # Re-read before reclaiming: if another run got there first the pid has
-      # changed, and this one waits for it like any other holder.
-      if [ "$(cat "$LEM_LOCK_DIR/pid" 2>/dev/null || true)" = "$holder" ]; then
-        rm -rf "$LEM_LOCK_DIR"
-      fi
+      lock_reclaim "$dir" "$holder" || true
       continue
     fi
 

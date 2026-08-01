@@ -45,10 +45,13 @@
 #
 #   Nothing is installed as root. No sudo. Everything lands under $HOME.
 #
-#   `--uninstall` removes what this installer put there, by name, and only
-#   after ~/.lem/config/install.env proves this installer created it. It never
-#   rm -rf's a directory it does not recognise, and anything else living in the
-#   prefix is reported and left behind.
+#   `--uninstall` removes only files Lem created, and only after
+#   ~/.lem/config/install.env proves this installer created the prefix. It
+#   never rm -rf's a directory whose contents it does not own -- not the
+#   prefix, and not data/, logs/, config/, bin/ or run/ inside it, which are
+#   ordinary names a user's own directory may already carry. Anything
+#   unrecognised keeps itself and every directory above it, is listed, and
+#   makes the uninstall exit 2 so a script notices the prefix survived.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -81,23 +84,45 @@ readonly SOURCE_MARKERS=("server/pyproject.toml" "scripts/install.sh" "scripts/l
 # nothing more than the variable pointing there.
 readonly INSTALL_MARKER="config/install.env"
 
-# Everything the installer and the server create inside $LEM_HOME. Uninstall
-# removes these by name and then rmdir's the prefix, so anything else in there
-# is reported and left alone rather than swept away with the rest.
-readonly LEM_HOME_ENTRIES=(
-  "api_token"
-  "bin"
-  "config"
-  "data"
-  "harbor"
-  "harbor.previous"
-  "lem.db"
-  "lem.db-shm"
-  "lem.db-wal"
-  "logs"
-  "run"
-  "src"
-  "src.previous"
+# What Lem owns inside $LEM_HOME, and how each is removed. The rule uninstall
+# has to satisfy is "no file Lem did not create is ever deleted", and a name is
+# not enough to decide that: data/, logs/, config/ and bin/ are ordinary names,
+# and `mkdir -p` merges into whatever was already there. So a prefix that
+# already had a data/ of its own must keep what is in it.
+#
+#   file:PATH  exactly this file (or symlink), by name
+#   tree:PATH  a directory the installer replaces wholesale on every run, so
+#              everything inside came from Lem's own tarball or from Lem and
+#              Harbor at runtime; removed as a unit. assert_adoptable() refuses
+#              to adopt a pre-existing src/ or harbor/, which is what makes
+#              that claim true rather than assumed.
+#   dir:PATH   a directory Lem creates but whose contents it does not own:
+#              rmdir only, so it survives -- along with every directory above
+#              it -- if anything unrecognised is inside.
+#
+# Order matters: files and trees are listed before the directories that hold
+# them, so each rmdir runs after its owned children are gone.
+readonly LEM_OWNED=(
+  "file:api_token"
+  "file:lem.db"
+  "file:lem.db-shm"
+  "file:lem.db-wal"
+  "tree:harbor"
+  "tree:harbor.previous"
+  "tree:src"
+  "tree:src.previous"
+  "file:bin/lem"
+  "file:bin/lem-server"
+  "file:config/install.env"
+  "file:config/server.env"
+  "file:logs/lem.log"
+  "file:run/lem.pid"
+  "tree:run/lock"
+  "dir:bin"
+  "dir:config"
+  "dir:data"
+  "dir:logs"
+  "dir:run"
 )
 
 # Overridable so the test suite can point the WSL probe at a fixture.
@@ -215,6 +240,30 @@ validate_lem_home() {
   fi
 }
 
+# install_source() and install_harbor() both stage into a temp directory and
+# then swap, deleting whatever was under src/ or harbor/ first. That is right
+# for a tree Lem put down and destructive for anything else, so a pre-existing
+# directory under either name is refused rather than adopted. This is also what
+# lets --uninstall treat those two as Lem-owned trees (LEM_OWNED, "tree:"):
+# nothing a user created can be inside them, because the installer would not
+# have started.
+assert_adoptable() {
+  local dir="$LEM_HOME/src"
+
+  if [ -d "$dir" ] && [ ! -L "$dir" ] && ! is_source_tree "$dir"; then
+    die "$dir already exists and is not a Lem source tree.
+    Installing would replace it, so this refuses to touch it. Move it aside,
+    or pick another prefix with LEM_HOME."
+  fi
+
+  dir="$LEM_HOME/harbor"
+  if [ -e "$dir" ] && [ ! -f "$dir/harbor.sh" ]; then
+    die "$dir already exists and is not a Harbor checkout.
+    Installing would replace it, so this refuses to touch it. Move it aside,
+    or pick another prefix with LEM_HOME."
+  fi
+}
+
 # Physical path of $1, or $1 unchanged when it is not a directory. Used to
 # compare two spellings of the same place (trailing slash, symlink, ..).
 resolve_dir() {
@@ -262,6 +311,36 @@ is_lem_install() {
 
 LOCK_TIMEOUT=180
 
+# >>> lock-reclaim: keep this block byte-identical in scripts/install.sh and scripts/lem >>>
+# Take the lock directory $1 away from the gone holder $2 ("" when it left no
+# readable pid). Returns 0 only if it removed the directory.
+#
+# NOT "re-read the pid, then rm -rf": those are two operations, and in the gap
+# another reclaimer can delete the directory and recreate it with its own live
+# pid -- which the rm -rf would then destroy, leaving two runs both believing
+# they hold the lock. mkdir of the claim marker is the atomic test-and-set, and
+# the marker lives *inside* the lock directory, so it disappears with it:
+# whoever wins the claim is provably looking at the same directory instance it
+# read, and a pid that still matches proves nothing was swapped underneath.
+#
+# Losing the claim, or finding a different pid, means someone else is dealing
+# with it. Either way this never assumes it holds the lock afterwards -- only a
+# later mkdir of the lock directory itself decides that.
+lock_reclaim() {
+  local dir="$1" holder="$2"
+
+  mkdir "$dir/claim" 2>/dev/null || return 1
+
+  if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$holder" ]; then
+    rm -rf "$dir"
+    return 0
+  fi
+
+  rmdir "$dir/claim" 2>/dev/null || true
+  return 1
+}
+# <<< lock-reclaim <<<
+
 lock_acquire() {
   local dir="$LEM_HOME/run/lock" waited=0 holder announced=0 blank=0
 
@@ -284,12 +363,13 @@ lock_acquire() {
     waited=$((waited + 1))
 
     if [ -z "$holder" ]; then
-      # No readable pid: either a leftover from a crash, or a winner that
-      # has not written its pid yet (a window of microseconds). Reclaim only
-      # after seeing it twice, so the second case resolves itself.
+      # No readable pid: either a leftover from a crash, or a winner that has
+      # not written its pid yet (a window of microseconds). Act only on the
+      # second sighting, so the second case resolves itself rather than being
+      # reclaimed out from under a run that is about to hold the lock.
       blank=$((blank + 1))
       if [ "$blank" -ge 2 ]; then
-        rm -rf "$dir"
+        lock_reclaim "$dir" "" || true
         blank=0
       fi
       continue
@@ -297,11 +377,7 @@ lock_acquire() {
     blank=0
 
     if ! kill -0 "$holder" 2>/dev/null; then
-      # Re-read before reclaiming: if another run got there first the pid has
-      # changed, and this one simply waits for it like any other holder.
-      if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$holder" ]; then
-        rm -rf "$dir"
-      fi
+      lock_reclaim "$dir" "$holder" || true
       continue
     fi
 
@@ -1292,33 +1368,62 @@ uninstall() {
     fi
   done
 
-  # 5. Remove what we installed, by name.
+  # 5. Remove what we own, file by file.
+  local status=0
   if [ "$installed" -eq 1 ]; then
-    remove_install_prefix
+    remove_install_prefix || status=$?
   fi
 
   printf '\n'
-  success "Lem is uninstalled."
+  if [ "$status" -eq 0 ]; then
+    success "Lem is uninstalled."
+  else
+    warn "Lem is uninstalled, but $LEM_HOME was kept -- see above."
+  fi
   detail "Docker containers and images created through Harbor are untouched."
   detail "Review them with: docker ps -a"
+  return "$status"
 }
 
-# Remove the entries this installer and the server create, then the prefix
-# itself if that emptied it. Deliberately not `rm -rf $LEM_HOME`: a directory
-# that also holds something we did not create keeps it, and says so.
-remove_install_prefix() {
-  local entry left
+# Everything still inside the prefix, one path per line. The trailing slash is
+# load-bearing: it makes find follow a $LEM_HOME that is itself a symlink,
+# which otherwise reported an empty list and printed "holds things Lem did not
+# install" about a directory that was in fact empty.
+prefix_leftovers() {
+  find "$LEM_HOME/" -mindepth 1 2>/dev/null
+}
 
-  for entry in "${LEM_HOME_ENTRIES[@]}"; do
-    # src/ may be a symlink into a git checkout: rm removes the link, never
-    # the checkout behind it. -L as well as -e, or a dangling one is missed.
-    if [ -e "$LEM_HOME/$entry" ] || [ -L "$LEM_HOME/$entry" ]; then
-      run rm -rf "$LEM_HOME/$entry"
-    fi
+# Remove what Lem owns, per LEM_OWNED, then the prefix itself if that emptied
+# it. Deliberately not `rm -rf` on any directory whose contents Lem does not
+# own: a file we did not create keeps itself, and every directory above it.
+#
+# Returns 2 when the prefix survived because something foreign is in it, so a
+# scripted uninstall notices that $LEM_HOME is still on disk.
+remove_install_prefix() {
+  local spec kind target left shown=0 total=0
+
+  for spec in "${LEM_OWNED[@]}"; do
+    kind="${spec%%:*}"
+    target="$LEM_HOME/${spec#*:}"
+    case "$kind" in
+      file|tree)
+        # -L as well as -e, or a dangling symlink is missed. rm removes the
+        # link itself, never the checkout behind it (src/ is often one).
+        if [ -e "$target" ] || [ -L "$target" ]; then
+          run rm -rf "$target"
+        fi
+        ;;
+      dir)
+        # rmdir, never rm -rf: whatever else is in here is not ours to delete.
+        if [ -d "$target" ] && [ ! -L "$target" ]; then
+          run rmdir "$target" 2>/dev/null || true
+        fi
+        ;;
+    esac
   done
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    detail "[dry-run] rmdir $LEM_HOME (only if it is now empty)"
+    detail "[dry-run] rmdir $LEM_HOME (only if nothing but Lem's files were in it)"
     return 0
   fi
 
@@ -1328,10 +1433,28 @@ remove_install_prefix() {
   fi
 
   success "Removed Lem's files from $LEM_HOME"
-  warn "$LEM_HOME also holds things Lem did not install; leaving it in place:"
-  find "$LEM_HOME" -mindepth 1 -maxdepth 1 2>/dev/null | while read -r left; do
-    detail "  ${left##*/}"
-  done
+
+  left="$(prefix_leftovers)"
+  if [ -z "$left" ]; then
+    # Empty, but not removable: a symlinked prefix (rmdir refuses those
+    # whatever they point at), or a permission problem. Nothing was kept.
+    warn "$LEM_HOME is empty but could not be removed; left in place."
+    return 0
+  fi
+
+  warn "$LEM_HOME was kept: it still holds files Lem did not create."
+  total="$(printf '%s\n' "$left" | wc -l | tr -d ' ')"
+  while IFS= read -r target; do
+    shown=$((shown + 1))
+    if [ "$shown" -gt 20 ]; then
+      detail "  ... and $((total - 20)) more"
+      break
+    fi
+    detail "  ${target#"$LEM_HOME"/}"
+  done <<EOF
+$left
+EOF
+  return 2
 }
 
 # Stop a nohup-launched server using the PID file the CLI writes. Never pkill:
@@ -1398,7 +1521,8 @@ main() {
   parse_args "$@"
 
   if [ "$MODE" = "uninstall" ]; then
-    uninstall
+    # Exit 2 when the prefix survived because something foreign is in it.
+    uninstall || return $?
     return 0
   fi
 
@@ -1414,6 +1538,7 @@ main() {
   require_cmd curl
   require_cmd tar
   check_docker
+  assert_adoptable
 
   run mkdir -p "$LEM_HOME/data" "$LEM_HOME/logs" "$LEM_HOME/config" "$LEM_HOME/run"
 

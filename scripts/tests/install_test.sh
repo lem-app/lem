@@ -21,8 +21,17 @@
 #
 # No bats, no fixtures directory: the installer is sourced with
 # LEM_INSTALL_SH_SOURCE_ONLY=1 (which suppresses main) and its functions are
-# called directly against temporary directories. Nothing here touches $HOME,
-# starts a server, or reaches the network.
+# called directly against temporary directories.
+#
+# The uninstall cases additionally run the REAL entrypoint
+# (`bash install.sh --uninstall --yes`) as a subprocess, because a bug that
+# only shows up through argument parsing and main() is invisible to a
+# sourced-function test -- that is exactly how the nested-foreign-file case
+# below was missed once. Those runs use `env -i` with HOME (and XDG_CONFIG_HOME
+# and ZDOTDIR) pointing inside the temp directory and a stub PATH that shadows
+# systemctl and launchctl, so nothing outside it can be reached.
+#
+# Nothing here touches the real $HOME, starts a server, or reaches the network.
 #
 # The end-to-end install/re-install/uninstall run is a separate, manual
 # exercise -- see the PR that introduced this file for the transcript.
@@ -610,6 +619,9 @@ make_fake_install() {
   printf 'token\n' >"$root/api_token"
   printf 'db\n' >"$root/lem.db"
   printf '#!/bin/sh\n' >"$root/bin/lem-server"
+  printf '#!/bin/sh\n' >"$root/bin/lem"
+  printf 'LEM_PORT=5142\n' >"$root/config/server.env"
+  printf 'started\n' >"$root/logs/lem.log"
 }
 
 real="$WORK/realinstall"
@@ -672,7 +684,7 @@ assert_false $status "--uninstall on a plain file exits non-zero"
 assert_file_test -f "$WORK/prefix-is-a-file" "and the file is still there"
 
 # ===========================================================================
-section "uninstall removes what it installed, by name"
+section "uninstall removes only files Lem created"
 # ===========================================================================
 
 make_fake_install "$WORK/mixed"
@@ -680,20 +692,137 @@ printf 'not ours\n' >"$WORK/mixed/somebody-elses-notes.txt"
 mkdir -p "$WORK/mixed/their_dir"
 
 out="$(run_uninstall_isolated "$WORK/mixed" 2>&1)"; status=$?
-assert_true $status "--uninstall on a real install succeeds"
+assert_eq "2" "$status" "--uninstall exits 2 when it had to keep the prefix"
 assert_not_file_test -e "$WORK/mixed/api_token" "the API token is removed"
 assert_not_file_test -e "$WORK/mixed/lem.db" "the database is removed"
 assert_not_file_test -e "$WORK/mixed/bin" "bin/ is removed"
 assert_not_file_test -e "$WORK/mixed/config" "config/ is removed"
 assert_file_test -f "$WORK/mixed/somebody-elses-notes.txt" "an unrecognised file is kept"
 assert_file_test -d "$WORK/mixed/their_dir" "an unrecognised directory is kept"
-assert_contains "$out" "did not install" "and the leftovers are reported"
+assert_contains "$out" "files Lem did not create" "and the leftovers are reported"
 
 # With nothing unrecognised in it, the prefix itself goes.
 make_fake_install "$WORK/clean"
 run_uninstall_isolated "$WORK/clean" >/dev/null 2>&1
 assert_true $? "--uninstall on a clean install succeeds"
 assert_not_file_test -e "$WORK/clean" "and the prefix is gone"
+
+# ===========================================================================
+section "uninstall keeps foreign files NESTED inside Lem's own directories"
+# ===========================================================================
+
+# The bug this closes: removal used to be `rm -rf` per manifest *name*, so a
+# genuine, correctly-marked install whose prefix already carried an unrelated
+# data/ or logs/ lost the contents. `data`, `logs`, `config`, `bin` and `run`
+# are ordinary names and `mkdir -p` merges into whatever is already there.
+#
+# Driven through the REAL entrypoint (`bash install.sh --uninstall --yes`),
+# not the sourced functions: that is how this was found, and a sourced-function
+# test whose foreign files sat only at the top level did not catch it.
+mkdir -p "$WORK/stubbin"
+for stub in systemctl launchctl; do
+  printf '#!/bin/sh\nexit 0\n' >"$WORK/stubbin/$stub"
+  chmod 755 "$WORK/stubbin/$stub"
+done
+
+# env -i, a stub PATH shadowing systemctl/launchctl, and a HOME inside $WORK:
+# the real script runs, but nothing outside $WORK can be reached.
+run_real_uninstall() {
+  env -i \
+    PATH="$WORK/stubbin:/usr/bin:/bin" \
+    HOME="$WORK/fakehome" \
+    XDG_CONFIG_HOME="$WORK/fakehome/.config" \
+    ZDOTDIR="$WORK/fakehome" \
+    NO_COLOR=1 \
+    LEM_HOME="$1" \
+    bash "$INSTALL_SH" --uninstall --yes 2>&1
+}
+
+nested="$WORK/legit_nested"
+make_fake_install "$nested"
+printf 'REAL SCRIPT precious data\n' >"$nested/data/precious.txt"
+printf 'their log\n' >"$nested/logs/their.log"
+printf 'their config\n' >"$nested/config/their.conf"
+mkdir -p "$nested/bin/theirtool"
+printf 'their tool\n' >"$nested/bin/theirtool/run.sh"
+
+out="$(run_real_uninstall "$nested")"; status=$?
+assert_eq "2" "$status" "the real --uninstall exits 2, not 0, when foreign files survive"
+assert_file_test -f "$nested/data/precious.txt" "a foreign file inside data/ survives"
+assert_eq "REAL SCRIPT precious data" "$(cat "$nested/data/precious.txt")" "byte-for-byte"
+assert_file_test -f "$nested/logs/their.log" "a foreign file inside logs/ survives"
+assert_file_test -f "$nested/config/their.conf" "a foreign file inside config/ survives"
+assert_file_test -f "$nested/bin/theirtool/run.sh" "a foreign file inside bin/ survives"
+assert_file_test -d "$nested" "and the prefix itself survives"
+assert_contains "$out" "data/precious.txt" "the survivors are listed by path"
+
+# Lem's own files still go, at every level.
+assert_not_file_test -e "$nested/api_token" "the API token is still removed"
+assert_not_file_test -e "$nested/lem.db" "the database is still removed"
+assert_not_file_test -e "$nested/harbor" "harbor/ is still removed"
+assert_not_file_test -e "$nested/config/install.env" "config/install.env is still removed"
+assert_not_file_test -e "$nested/config/server.env" "config/server.env is still removed"
+assert_not_file_test -e "$nested/logs/lem.log" "logs/lem.log is still removed"
+assert_not_file_test -e "$nested/bin/lem-server" "bin/lem-server is still removed"
+assert_not_file_test -e "$nested/bin/lem" "bin/lem is still removed"
+
+# The real entrypoint on a clean install: prefix gone, exit 0.
+make_fake_install "$WORK/clean_real"
+run_real_uninstall "$WORK/clean_real" >/dev/null 2>&1
+assert_true $? "the real --uninstall on a clean install exits 0"
+assert_not_file_test -e "$WORK/clean_real" "and the prefix is gone"
+
+# The real entrypoint on a foreign directory: refuses, touches nothing.
+foreign_real="$WORK/foreign_real"
+mkdir -p "$foreign_real/.ssh"
+printf 'PRIVATE KEY DATA\n' >"$foreign_real/.ssh/id_rsa"
+out="$(run_real_uninstall "$foreign_real")"; status=$?
+assert_false $status "the real --uninstall refuses a directory with no marker"
+assert_eq "PRIVATE KEY DATA" "$(cat "$foreign_real/.ssh/id_rsa")" "and the key is untouched"
+
+# A symlinked prefix: rmdir always refuses a symlink, so the leftover report
+# used to claim "holds things Lem did not install" and then list nothing.
+make_fake_install "$WORK/symtarget"
+ln -s "$WORK/symtarget" "$WORK/symprefix"
+out="$(run_real_uninstall "$WORK/symprefix")"; status=$?
+assert_true $status "a symlinked prefix uninstalls cleanly"
+assert_not_contains "$out" "files Lem did not create" "without claiming there are leftovers"
+assert_eq "" "$(find "$WORK/symtarget/" -mindepth 1 2>/dev/null)" "the target really is empty"
+
+# ===========================================================================
+section "the installer refuses to adopt a src/ or harbor/ it did not create"
+# ===========================================================================
+
+# install_source() and install_harbor() replace those trees wholesale, so
+# adopting a user's directory of the same name destroys it at INSTALL time --
+# before --uninstall ever gets a say. Refusing is also what makes "everything
+# under src/ and harbor/ is Lem's" true, which is what lets uninstall remove
+# them as units.
+adopt="$WORK/adopt"
+mkdir -p "$adopt/harbor"
+printf 'their harbor notes\n' >"$adopt/harbor/notes.txt"
+
+out="$( (LEM_HOME="$adopt"; assert_adoptable) 2>&1 )"; status=$?
+assert_false $status "a pre-existing harbor/ that is not Harbor is refused"
+assert_contains "$out" "Move it aside" "and the refusal says what to do"
+assert_file_test -f "$adopt/harbor/notes.txt" "and nothing was touched"
+
+printf '#!/bin/sh\n' >"$adopt/harbor/harbor.sh"
+(LEM_HOME="$adopt"; assert_adoptable) >/dev/null 2>&1
+assert_true $? "a real Harbor checkout is adopted"
+
+mkdir -p "$adopt/src/theirs"
+(LEM_HOME="$adopt"; assert_adoptable) >/dev/null 2>&1
+assert_false $? "a pre-existing src/ that is not a Lem tree is refused"
+
+make_fake_checkout "$adopt/src"
+(LEM_HOME="$adopt"; assert_adoptable) >/dev/null 2>&1
+assert_true $? "a real Lem source tree is adopted"
+
+rm -rf "$adopt/src"
+ln -s "$WORK/checkout" "$adopt/src"
+(LEM_HOME="$adopt"; assert_adoptable) >/dev/null 2>&1
+assert_true $? "a symlinked src/ (what --source writes) is fine"
 
 # ===========================================================================
 section "the start lock"
@@ -728,6 +857,65 @@ printf '%s\n' "$dead" >"$LEM_HOME/run/lock/pid"
 (LOCK_TIMEOUT=10; LOCK_DIR=""; lock_acquire) >/dev/null 2>&1
 assert_true $? "a lock whose holder is gone is reclaimed"
 rm -rf "$LEM_HOME/run/lock"
+
+# ===========================================================================
+section "the dead-holder reclaim is atomic"
+# ===========================================================================
+
+# "Re-read the pid, then rm -rf" is two operations. Another reclaimer can
+# delete the directory and recreate it with its own live pid in that gap, and
+# the rm -rf then destroys *its* lock -- leaving two runs both believing they
+# hold one. These drive that exact interleaving by hand, deterministically,
+# rather than hoping a timing test loses the race.
+reclaim="$WORK/reclaim/lock"
+
+mkdir -p "$reclaim"
+printf '%s\n' "$dead" >"$reclaim/pid"
+lock_reclaim "$reclaim" "$dead"
+assert_true $? "a lock still held by the gone pid is reclaimed"
+assert_not_file_test -e "$reclaim" "and the directory is removed"
+
+# The race: by the time this reclaimer acts, someone else has already
+# reclaimed and relocked, so the directory now carries a live pid.
+mkdir -p "$reclaim"
+printf '%s\n' "$$" >"$reclaim/pid"
+lock_reclaim "$reclaim" "$dead"
+assert_false $? "a lock relocked in the meantime is NOT reclaimed"
+assert_file_test -e "$reclaim" "the new holder's lock survives"
+assert_eq "$$" "$(cat "$reclaim/pid" 2>/dev/null)" "with its pid untouched"
+assert_not_file_test -e "$reclaim/claim" "and no claim marker is left behind"
+
+# Two reclaimers at the same instant: the claim marker lets exactly one act.
+printf '%s\n' "$dead" >"$reclaim/pid"
+mkdir "$reclaim/claim"
+lock_reclaim "$reclaim" "$dead"
+assert_false $? "a reclaim already claimed by another run is declined"
+assert_file_test -e "$reclaim" "and the directory is left to the claimant"
+rm -rf "$WORK/reclaim"
+
+# A holder that died between mkdir and writing its pid leaves no pid at all.
+mkdir -p "$reclaim"
+lock_reclaim "$reclaim" ""
+assert_true $? "a lock with no pid at all is reclaimable"
+assert_not_file_test -e "$reclaim" "and is removed"
+rm -rf "$WORK/reclaim"
+
+# ---------------------------------------------------------------------------
+# install.sh has to stay self-contained -- under `curl | bash` there is nothing
+# on disk to source -- so the reclaim exists in both scripts. The fence turns
+# that copy from a drift risk into an enforced invariant.
+extract_reclaim() {
+  sed -n '/^# >>> lock-reclaim/,/^# <<< lock-reclaim/p' "$1"
+}
+reclaim_install="$(extract_reclaim "$INSTALL_SH")"
+reclaim_cli="$(extract_reclaim "$LEM_CLI")"
+
+[ -n "$reclaim_install" ]
+assert_true $? "install.sh carries the fenced reclaim block"
+[ -n "$reclaim_cli" ]
+assert_true $? "the CLI carries it too"
+assert_eq "$reclaim_install" "$reclaim_cli" \
+  "the reclaim block is byte-identical in both scripts"
 
 # ===========================================================================
 section "the CLI refuses to guess"
