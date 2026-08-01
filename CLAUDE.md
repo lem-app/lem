@@ -15,7 +15,7 @@
 uv sync
 uv add fastapi
 uv run pytest
-uv run uvicorn app.main:app
+uv run lem-serve                 # local server (NOT uvicorn app.main:app)
 
 # ❌ Never use
 pip install fastapi
@@ -358,7 +358,7 @@ Before submitting code:
 # Python (server/)
 uv sync                          # Install deps
 uv add fastapi                   # Add dependency
-uv run uvicorn app.main:app      # Run server
+uv run lem-serve                 # Run local server (binds + verifies posture)
 uv run pytest                    # Run tests
 uv run mypy server/              # Type check
 uv run ruff format server/       # Format
