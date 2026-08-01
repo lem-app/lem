@@ -1,8 +1,7 @@
 # Lem API Reference
 
-**Scope**: every HTTP and WebSocket endpoint in this repository as it exists on `main`, plus the
-changes PR [#25](https://github.com/lem-app/lem/pull/25) makes to authentication. Each entry
-names the file and line it comes from.
+**Scope**: every HTTP and WebSocket endpoint in this repository as it exists on `main`. Each
+entry names the file and line it comes from.
 
 | Service | Base URL (default) | Endpoints |
 |---|---|---|
@@ -84,27 +83,17 @@ unconditionally, so a claim about their error shape is vacuous rather than demon
 
 ## 2. Local server authentication
 
-### On `main` today
-
-**None.** Every `/v1/*` endpoint is unauthenticated. The README's Quick Start binds the server
-with `--host 0.0.0.0`, which exposes Docker control to the whole LAN. This is
-[#7](https://github.com/lem-app/lem/issues/7).
-
-CORS allows six fixed origins (`main.py:141-154`):
-`http://localhost:5173`, `http://127.0.0.1:5173`, `http://localhost:5174`,
-`http://127.0.0.1:5174`, `http://localhost:3000`, `http://127.0.0.1:3000`, with
-`allow_credentials=True` and `allow_methods=["*"]`.
-
-### After PR [#25](https://github.com/lem-app/lem/pull/25) (`fix/local-api-security`)
-
-Two independent controls, both in `server/app/security.py`:
+PR [#25](https://github.com/lem-app/lem/pull/25) is merged; what follows is `main`. Two
+independent controls, both in `server/app/security.py`:
 
 | Control | Rule |
 |---|---|
 | **CSRF header** (always on) | Every state-changing request must send `X-Lem-Client: <anything>`. Any `Origin` header it does send must be in the allowlist (the same tuple the CORS config uses, so the two cannot drift). Safe methods — `GET`, `HEAD`, `OPTIONS` — are exempt. A browser cannot attach a custom header cross-origin without passing a CORS preflight, which is what stops a hostile page from POSTing to `http://localhost:5142`. |
-| **Bearer token** (conditional) | Required on `/v1/*` whenever the bind address is not loopback. Generated on first start at `~/.lem/api_token`, mode 0600. On a loopback bind the token is accepted but not required. |
+| **Bearer token** (conditional, fails closed) | Required on `/v1/*` unless the process has *positively verified*, by reading the bound socket, that it listens on loopback only (`security.py:206-212`, `:301-354`). Generated on first start at `~/.lem/api_token`, mode 0600. Start the server any way other than `lem-serve` and the socket is never inspected, so the posture stays unverified and the token is required. |
 
-Bind address comes from `LEM_HOST`, defaulting to `127.0.0.1`. Example:
+The posture is derived from the socket the process actually bound, not from `$LEM_HOST` — the
+decoupling reported in [#29](https://github.com/lem-app/lem/issues/29) is fixed. Origins can be
+extended with `LEM_ALLOWED_ORIGINS` (`security.py:131-160`); `*` is refused.
 
 ```bash
 curl -H "X-Lem-Client: curl" \
@@ -112,9 +101,14 @@ curl -H "X-Lem-Client: curl" \
      http://127.0.0.1:5142/v1/services
 ```
 
-The tunnel presents the local server's own credentials rather than the remote peer's when
-proxying to the local API (`server/app/tunnel/http_proxy.py` on that branch), so remote access
-continues to work.
+**Two limits worth knowing.** The tunnel presents the local server's own credentials rather
+than the remote peer's when proxying to the local API, so a peer is gated by
+`server/app/tunnel/peer_auth.py` — a registration check against the signaling server, not
+ed25519 proof of possession, and it takes the signaling server's word for who sent an offer
+([#29](https://github.com/lem-app/lem/issues/29)). And the posture cannot see a hop this
+process is not part of: a reverse proxy or published container port in front of a
+verified-loopback bind exposes it while the server still correctly reports loopback-only and
+requires no token.
 
 ---
 
@@ -374,6 +368,12 @@ Sequence: `POST {signaling_url}/auth/register` → JWT → get-or-create the loc
 Ed25519 keypair (`auth.py:151-164`) → `POST {signaling_url}/devices/register` →
 persist `AuthState` → `TunnelManager.start()`.
 
+The keypair is generated and its public half uploaded, but nothing signs with it: the
+registration request carries no `challenge` or `signature` (`auth.py:168-171`), and
+`app/crypto.py`'s `load_keypair_from_b64` and `public_key_from_b64` have no call sites. Against
+a signaling server on current `main` that request is a 422 and this endpoint returns 503 —
+[#17](https://github.com/lem-app/lem/issues/17).
+
 Response `{"status": "ok", "device_id": "local-server-1a2b3c4d", "tunnel_status": "connecting"}`.
 `tunnel_status` ∈ `connecting` | `failed` | `offline`.
 400 (email taken, string detail) · 503 (signaling unreachable or device registration failed).
@@ -399,17 +399,26 @@ or `{"authenticated": false, "tunnel_status": "offline"}`. Always 200.
 
 ## 12. Cloud signaling (`cloud/signaling/`, default `:8000`)
 
-> **This section documents `main`. PR [#45](https://github.com/lem-app/lem/pull/45)
-> (`fix/cloud-authz`, open) changes it breakingly.** Under #45: `/signal` gains an ed25519
-> challenge/response that must be answered before `connected` arrives; device registration
-> becomes two-step (`POST /devices/challenge` then `POST /devices/register` with a signature
-> over the nonce, and `pubkey` must be base64 of 32 raw ed25519 bytes, so the browser's literal
-> `'browser-key'` becomes a 422); `connect-request` no longer accepts a client-chosen
-> `relay_session_id` and answers with a new `connect-request-sent` message carrying a
-> server-minted session id plus a per-side, single-use, 120 s relay grant; and the relay refuses
-> account tokens outright. There is still **no refresh-token concept and no refresh endpoint**
-> — the 24 h access token in the JSON body below is unchanged by #45. Client-side impact is
-> enumerated in [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.1.
+> **PR [#45](https://github.com/lem-app/lem/pull/45) (`fix/cloud-authz`) is merged and this
+> contract is what is on `main`.** It was a breaking change: `/signal` has an ed25519
+> challenge/response that must be answered before `connected` arrives; device registration is
+> two-step (`POST /devices/challenge` then `POST /devices/register` with a signature over the
+> nonce, and `pubkey` must be base64 of 32 raw ed25519 bytes, so the browser's literal
+> `'browser-key'` is a 422); `connect-request` no longer accepts a client-chosen
+> `relay_session_id` and answers with a `connect-request-sent` message carrying a server-minted
+> session id plus a per-side, single-use, 120 s relay grant; and the relay refuses account
+> tokens outright. There is still **no refresh-token concept and no refresh endpoint** — the
+> 24 h access token in the JSON body below is unchanged.
+>
+> **No Lem client speaks this contract yet.** The local server still posts
+> `{device_id, pubkey}` with no challenge or signature (`server/app/api/v1/auth.py:168-171`,
+> `:282-285`), the remote dashboard still sends `pubkey: 'browser-key'`
+> (`web/remote/src/api/auth.ts:126,136`), and both WebSocket clients send `auth` and never
+> await the challenge (`server/app/tunnel/webrtc_client.py:459-465`,
+> `web/remote/src/lib/webrtc.ts:429-440`). Until that is fixed, device registration and
+> signaling connect fail against a current deployment —
+> [#17](https://github.com/lem-app/lem/issues/17). Client-side impact is enumerated in
+> [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.1.
 
 ### `GET /health`
 `app/api/health.py:27-34`. `{"status": "ok", "timestamp": "<ISO-8601 UTC>"}`. 200.
@@ -428,16 +437,34 @@ Tokens are HS256, 24 h expiry, signed with `settings.secret_key`
 (`core/config.py`). The default secret `dev-secret-key-change-in-production` is rejected only
 when `ENV=production` — [#18](https://github.com/lem-app/lem/issues/18).
 
+### `POST /devices/challenge`
+`app/api/devices.py:93-115`. `Authorization: Bearer <jwt>` required.
+Body `{"device_id": str}`. Returns a single-use, TTL-bounded nonce to sign:
+
+```json
+{ "device_id": "device-123", "challenge": "base64…",
+  "context": "lem-device-register-v1", "expires_in": 120 }
+```
+
 ### `POST /devices/register`
-`app/api/devices.py:62-162`. `Authorization: Bearer <jwt>` required.
-Body `{"device_id": str, "pubkey": str}`. Idempotent UPSERT that refreshes `last_seen`.
+`app/api/devices.py:118-249`. `Authorization: Bearer <jwt>` required.
+Body `{"device_id": str, "pubkey": str, "challenge": str, "signature": str}` — all four are
+required (`models/schemas.py:82-93`). `pubkey` must be base64 of the 32 raw ed25519 public key
+bytes; anything else is a 422. The signature is verified over
+`<context> ":" <device_id> ":" <challenge>` before anything is written
+(`app/api/devices.py:151-169`), so the stored key is backed by proof of possession rather than
+being an opaque string. The challenge is redeemed whether or not the signature verifies. Once
+verified, the write is an idempotent UPSERT that refreshes `last_seen`.
 
 ```json
 { "id": "local-server-1a2b3c4d", "user_id": 1, "pubkey": "base64…",
   "created_at": "…", "last_seen": "…" }
 ```
 
-200 · 401 invalid token · 403 `Device ID belongs to another user` · 500 if the row vanishes.
+200 · 401 invalid token, or `Invalid device challenge signature` when the challenge is missing,
+expired, already redeemed, or the signature does not verify · 403 `Device ID belongs to another
+user` · 422 malformed `pubkey`, or a body missing any of the four fields · 500 if the row
+vanishes.
 
 ### `GET /devices/`
 `app/api/devices.py:165-203`. Bearer required. Array of the caller's devices. 200 · 401.
@@ -446,12 +473,21 @@ Note the **trailing slash** — the route is registered as `"/"` under `prefix="
 ### `WS /signal`
 `app/api/signal.py:150-349`.
 
-Authentication, either:
-- query parameters `?token=…&device_id=…` (deprecated — lands in access logs), or
-- the first text frame `{"type": "auth", "token": "…", "device_id": "…"}` within 10 s.
+Authentication is a three-step handshake. **There is no `?token=` query parameter** — it was
+removed because uvicorn's access log and nginx's default log format both record the query
+string, so every documented deployment wrote credentials to a plaintext log. A request carrying
+one is refused with `reason: "unsupported-client"`.
 
-The device must belong to the token's user (`signal.py:106-147`); otherwise the socket closes
-with 1008.
+1. Client sends `{"type": "auth", "token": "…", "device_id": "…"}` as the first text frame,
+   within 10 s. The token must be account-scoped, and the device must belong to the token's
+   user (`signal.py:256-281`); otherwise `reason: "auth-failed"` and a 1008 close.
+2. Server answers `{"type": "challenge", "device_id": "…", "challenge": "<b64>",
+   "context": "lem-signaling-connect-v1"}`.
+3. Client answers `{"type": "auth-response", "signature": "<b64 ed25519 signature>"}` over
+   `<context> ":" <device_id> ":" <challenge>`. The signature is verified against the device's
+   registered pubkey (`signal.py:395-411`); a failure is
+   `reason: "device-key-verification-failed"` and a 1008 close. The challenge is fresh per
+   connection and never reusable.
 
 On success the server sends:
 
@@ -465,19 +501,21 @@ Thereafter every client frame must be JSON with `type` and `target_device_id`, a
 
 | Client `type` | Server behaviour |
 |---|---|
-| `connect-request` | Rewritten to `connect-request-received` with `from_device_id`, `preferred_transport`, `relay_session_id`, and `relay_url` from settings; delivered to the target (`signal.py:279-288`). |
-| `connect-ack` | Rewritten to `connect-ack-received` with `from_device_id`, `transport`, `relay_session_id`, `status` (`signal.py:290-299`). |
-| anything else (`offer`, `answer`, `ice-candidate`, …) | `sender_device_id` is added and the message is forwarded verbatim (`signal.py:301-306`). |
+| `connect-request` | The server mints the relay session; any client-supplied `relay_session_id` is ignored. The target gets `connect-request-received` with `from_device_id`, `preferred_transport`, `relay_session_id`, `relay_url`, `relay_token`, `relay_token_expires_in`; the sender then gets the mirror-image `connect-request-sent` with its own grant (`signal.py:544-571`). Each side's `relay_token` is single-use and names only that side. |
+| `connect-ack` | Rewritten to `connect-ack-received` with `from_device_id`, `transport`, `relay_session_id`, `status` (`signal.py:496-500`). |
+| anything else (`offer`, `answer`, `ice-candidate`, …) | `sender_device_id` is added and the message is forwarded verbatim (`signal.py:502-509`). |
 
 Server → sender replies: `{"type": "ack", "message": "Message delivered to …"}` on success, or
-`{"type": "error", "message": "…"}` when the target is not connected, the JSON is invalid, the
-message is oversized, or `type`/`target_device_id` is missing.
+an `{"type": "error"}` frame carrying a machine-readable `reason` and an explicit `retryable`
+boolean when the target is not reachable, the JSON is invalid, the message is oversized, or
+`type`/`target_device_id` is missing. Branch on `reason`, never on `message`.
 
-Schemas for the relay-coordination messages: `models/schemas.py:80-136`.
+Schemas for the relay-coordination messages: `models/schemas.py`.
 
-**Authorization gap**: `target_device_id` is never checked against the sender's account
-(`signal.py:275`, `:306`). Any authenticated user can push messages at any online device —
-[#16](https://github.com/lem-app/lem/issues/16).
+**`target_device_id` must be a device the sender's account owns** (`signal.py:480-485`).
+Naming anything else returns the same `target-unavailable` error given for a device that does
+not exist and for one of your own that is offline, so the endpoint cannot be used to probe who
+is online. This closed [#16](https://github.com/lem-app/lem/issues/16).
 
 ---
 
@@ -495,22 +533,34 @@ Schemas for the relay-coordination messages: `models/schemas.py:80-136`.
 ### `WS /relay/{session_id}`
 `app/api/relay.py:32-121`.
 
-Authentication, either `?token=<jwt>` or a first `{"type": "auth", "token": "…"}` frame within
-10 s. The token only has to *decode* (`core/security.py:43-56`).
+Authentication is a first `{"type": "auth", "token": "<grant>"}` frame within 10 s. **There is
+no `?token=` query parameter** — removed for the same access-log reason as `/signal`; a request
+carrying one is refused with `reason: "unsupported-client"`.
 
-The first socket to arrive for a `session_id` becomes "client", the second "server"
-(`core/session_manager.py:48-67`). Once both are present, frames are forwarded verbatim in both
-directions until either closes (`session_manager.py:77-120`). Sessions idle out after
-`session_timeout` (300 s default).
+The `<grant>` is **not** an account access token. It is the `relay_token` the signaling server
+minted in `connect-request-sent` / `connect-request-received`, and it must carry
+`scope: "relay-session"` — an account token is rejected outright
+(`core/security.py:114-131`). The grant names the session id, the bearer device, its one
+permitted peer, the owning account, a unique `jti`, and a mandatory short `exp` (120 s
+default). A `jti` is redeemable **once**, and stays spent for the grant's whole validity window.
+
+The relay enforces that both connections in a session carry the same `user_id` and the same
+`{device_id, peer_device_id}` pair, that no device occupies both slots, and that a third
+connection is refused (`core/session_manager.py:125-170`). This closed
+[#15](https://github.com/lem-app/lem/issues/15): a `session_id` is now bound to one account and
+one device pair, and is server-minted and unguessable rather than derived client-side.
+
+Once both sides are present, frames are forwarded verbatim in both directions until either
+closes (`session_manager.py:186-224`). Sessions idle out after `session_timeout` (300 s
+default).
 
 The payload is Lem's binary tunnel framing (`docs/tunnel-proxy-spec.md` §4) and is **not**
-inspected by the relay. It is also **not** end-to-end encrypted: the local server sends frames
-to the relay in plaintext (`server/app/tunnel/relay_client.py:141-154`). The protection is TLS
-to the relay, nothing more.
-
-**Authorization gap**: nothing binds a `session_id` to an account. Any valid token joins any
-session and can read or inject the peers' traffic —
-[#15](https://github.com/lem-app/lem/issues/15).
+inspected by the relay. It is, however, **not end-to-end encrypted**: the local server sends
+frames to the relay in plaintext (`server/app/tunnel/relay_client.py:139-152`), the relay
+terminates TLS, forwards them in the clear and meters their size
+(`session_manager.py:209-218`, `:288-297`). The protection on this path is TLS to the relay,
+nothing more, and the relay operator is trusted with the traffic. End-to-end encryption here is
+roadmap, not shipped — [#12](https://github.com/lem-app/lem/issues/12).
 
 ---
 

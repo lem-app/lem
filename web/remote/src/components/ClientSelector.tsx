@@ -135,7 +135,7 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
         <CardHeader>
           <CardTitle>Available Clients</CardTitle>
           <CardDescription>
-            Select a client application to access through the secure tunnel
+            Select a client application to access through the tunnel
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -205,9 +205,10 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
           {/* Info Box */}
           <div className="rounded-lg border bg-muted/50 p-4">
             <p className="text-xs text-muted-foreground">
-              <strong>Note:</strong> All connections are routed through the secure WebRTC tunnel.
-              HTTP requests and WebSocket connections are automatically proxied to your local
-              device.
+              <strong>Note:</strong> HTTP requests and WebSocket connections are automatically
+              proxied to your local device over the tunnel. A direct WebRTC connection is encrypted
+              between the two peers; if it falls back to the relay, the relay terminates encryption
+              and can see this traffic.
             </p>
           </div>
         </CardContent>

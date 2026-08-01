@@ -386,7 +386,9 @@ export function ClientViewer({
               <div className="mt-4 rounded-lg bg-muted p-3">
                 <p className="text-xs text-muted-foreground">
                   <strong>Note:</strong> All HTTP requests and WebSocket connections are
-                  automatically routed through the secure WebRTC tunnel to your local device.
+                  automatically routed to your local device over the tunnel. A direct WebRTC
+                  connection is encrypted between the two peers; if it falls back to the relay, the
+                  relay terminates encryption and can see this traffic.
                 </p>
               </div>
             </CardContent>
