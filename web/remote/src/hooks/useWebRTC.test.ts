@@ -30,7 +30,7 @@ import {
 
 const HOOK_OPTIONS = {
   signalUrl: 'ws://signal.test/signal',
-  token: 'jwt-token',
+  authenticated: true,
   deviceId: 'browser-1',
   targetDeviceId: 'device-1',
   relayUrl: 'ws://relay.test',

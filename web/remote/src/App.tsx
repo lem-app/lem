@@ -34,6 +34,7 @@ import { ServicesCatalog } from './components/ServicesCatalog'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { config, configError } from './lib/env'
+import { readToken } from './lib/session'
 
 // The browser's device id used to be minted here and kept in localStorage,
 // separately from the (fake) `'browser-key'` it registered. It now comes from
@@ -84,7 +85,10 @@ interface DashboardProps {
 }
 
 function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactElement {
-  const { isAuthenticated, token, login, logout, isLoading, error: authError } = useAuth()
+  // No `token` here, deliberately: anything this component holds is reachable
+  // from the DOM through React's fiber expandos, and ClientViewer's iframe is
+  // a child of this tree. See useAuth's module comment and #82.
+  const { isAuthenticated, login, logout, isLoading, error: authError } = useAuth()
   const [targetDeviceId, setTargetDeviceId] = useState<string | null>(null)
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null)
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null)
@@ -106,7 +110,7 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
     proxyFetch,
   } = useWebRTC({
     signalUrl,
-    token: token ?? '',
+    authenticated: isAuthenticated,
     deviceId: browserDeviceId ?? '',
     targetDeviceId: targetDeviceId ?? '',
     autoConnect: false,
@@ -166,9 +170,14 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
   // is whatever the key store says it is, so it always matches the key that
   // signs for it.
   useEffect(() => {
-    if (!isAuthenticated || !token) return
+    if (!isAuthenticated) return
 
     let cancelled = false
+    // Read at the point of use, so the token is a local in this closure rather
+    // than a value this component holds - see #82.
+    const token = readToken()
+    if (token === null) return
+
     registerDevice(token)
       .then((deviceId) => {
         if (!cancelled) {
@@ -187,7 +196,7 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
     return () => {
       cancelled = true
     }
-  }, [isAuthenticated, token])
+  }, [isAuthenticated])
 
   // Not authenticated - show login
   if (!isAuthenticated) {
@@ -217,7 +226,7 @@ function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactEl
               </AlertDescription>
             </Alert>
           )}
-          <DeviceSelector onSelectDevice={handleDeviceSelect} token={token ?? ''} />
+          <DeviceSelector onSelectDevice={handleDeviceSelect} />
         </div>
       </div>
     )

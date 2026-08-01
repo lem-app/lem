@@ -43,7 +43,7 @@ function newManager(
 ) {
   return new WebRTCConnectionManager({
     signalUrl: SIGNAL_URL,
-    token: 'test-token',
+    getToken: () => 'test-token',
     deviceId: 'browser-1',
     targetDeviceId: 'device-1',
     // Real WebCrypto signing is exercised in `api/device-key.test.ts`; here we

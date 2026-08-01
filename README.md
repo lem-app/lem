@@ -173,14 +173,17 @@ DOM and its storage. What we do about it:
   refresh cookie that removes that cost is
   [#79](https://github.com/lem-app/lem/issues/79).
 
-  **This does not put the token out of a framed service's reach, and you should
-  not read it as though it does.** The dashboard is a React app, so while you
-  are signed in the token is held in the rendered component tree, which is
-  reachable from the DOM by same-origin code — including code running in a
-  framed service. Keeping it out of storage removed the durable copy; it did
-  not remove the page copy. That is tracked as
-  [#82](https://github.com/lem-app/lem/issues/82). Until it is closed, "only
-  launch services you trust" is doing the work here.
+  It is also kept out of the **rendered page**. React stores component props
+  and hook state on fiber nodes attached to DOM elements, so a token held in a
+  component would be readable by a framed service walking `parent.document` —
+  storage custody alone would have moved the exposure rather than removed it.
+  Components receive `isAuthenticated`, never the token; code that needs the
+  value reads it from module scope at the point of use
+  ([#82](https://github.com/lem-app/lem/issues/82)).
+
+  **None of this makes a hostile framed service safe.** It is same-origin with
+  the dashboard and can act as the dashboard in other ways. Per-service origins
+  is still the boundary; "only launch services you trust" still applies.
 - Upstream `Content-Security-Policy`, `X-Frame-Options` and
   `Strict-Transport-Security` are stripped and replaced, so a framed app cannot
   pin *your dashboard's* origin to HTTPS-only or break the proxy.

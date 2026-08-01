@@ -1716,13 +1716,19 @@ The same-origin SW design makes this worse in one specific way and better in ano
 - **Worse**: the framed app now genuinely shares an origin with the dashboard. It can read
   `localStorage`, where the dashboard used to keep the signaling JWT. A hostile or compromised
   local service could exfiltrate the token that authorises tunnelling to the user's machine.
-  **Narrowed, not closed, in Phase 6**: the token is held in a module-scoped variable in
-  `web/remote/src/lib/session.ts` and written to no browser store, a legacy persisted token is
-  purged on load, and `lib/token-persistence.test.ts` asserts it is unreachable from any global
-  root. **The framed app can still reach it through the React render tree** — `useAuth()` puts it
-  in component state and it is passed as a prop, so it lives in fiber nodes hanging off the DOM,
-  in the same subtree that hosts the iframe. Getting it out of storage did not get it out of the
-  page; [#82](https://github.com/lem-app/lem/issues/82) is the remainder. *(The line citations that
+  **Closed in Phase 6, in two halves.** *Storage*: the token is held in a module-scoped variable
+  in `web/remote/src/lib/session.ts`, written to no browser store, with a legacy persisted token
+  purged on load; `lib/token-persistence.test.ts` asserts it is unreachable from any global root.
+  *Render tree*: `useAuth()` returns `isAuthenticated` and never the token, and no component takes
+  it as a prop — React keeps props and hook state on fiber nodes attached to the DOM, so a token
+  in a component would have been readable by a framed service through `parent.document`.
+  `lib/fiber-reachability.test.tsx` asserts that, with the pre-fix arrangement as a positive
+  control ([#82](https://github.com/lem-app/lem/issues/82)).
+
+  > **The first half alone would have relocated the exposure, not removed it** — and the storage
+  > sweep stayed green the whole time the render tree was leaking, which is why the two need
+  > separate assertions. Verified by reverting: putting the token back into `useAuth`'s state
+  > leaves `token-persistence.test.ts` at 30/30 and fails `fiber-reachability.test.tsx`. *(The line citations that
   stood here — `hooks/useAuth.ts:33`, `:44`, `:70`, `:92` — were already stale when Phase 6
   began: [#68](https://github.com/lem-app/lem/pull/68) and #70 had moved custody into
   `lib/session.ts`. Recorded because a `file:line` that has drifted is the failure mode this

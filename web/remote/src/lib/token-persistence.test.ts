@@ -106,16 +106,29 @@
  *
  * ## What this file does NOT cover at all: the React render tree
  *
- * **The token is reachable from the rendered DOM**, and no assertion here
- * contradicts that. `useAuth()` puts it in component state and `App.tsx` passes
- * it as a prop, so it sits in React fiber nodes hanging off DOM elements as
- * `__reactFiber$…` expandos - in the same subtree that hosts the framed
- * service's iframe. Same-origin code in that frame can walk
- * `parent.document` to it.
+ * Nothing here says anything about React. That mattered more than it sounds:
+ * this file was **green for an entire review round while the token was
+ * trivially readable by a framed service**, because React does not keep
+ * component state on a global - it keeps it on fiber nodes attached to DOM
+ * elements as `__reactFiber$…` expandos, which a same-origin frame reaches
+ * through `parent.document`. Getting the token out of browser storage did not
+ * get it out of the page.
  *
- * Getting the token out of *browser storage* did not get it out of *the page*.
- * That is tracked as [#82](https://github.com/lem-app/lem/issues/82), and the
- * fiber-reachability sweep that settles it lives in `fiber-reachability.test.ts`.
+ * That was [#82](https://github.com/lem-app/lem/issues/82), and it is fixed:
+ * `useAuth()` returns `isAuthenticated` and never the token. The assertion that
+ * holds it fixed is a **separate sweep** in `fiber-reachability.test.tsx`,
+ * rooted at the DOM rather than at `globalThis`.
+ *
+ * ### Do not merge these two files, or root them at the same place
+ *
+ * They look like near-duplicates - two walks, two needles, two sets of positive
+ * controls - and they are not. **A storage sweep is structurally incapable of
+ * catching a render-tree exposure**, and this repository has the demonstration
+ * rather than the theory: with the token put back into `useAuth`'s React state,
+ * this file stays at 30/30 while `fiber-reachability.test.tsx` fails three
+ * assertions. That contrast *is* the coverage. Combining them, or re-rooting
+ * this walk at `document` to "cover both", collapses two independent questions
+ * into one and silently reopens the gap that took a full review round to find.
  *
  * ## How both halves avoid proving nothing
  *
@@ -782,7 +795,10 @@ describe('the signaling JWT is not persisted anywhere (spec 8.4 req 1)', () => {
     })
 
     expect(result.current.isAuthenticated).toBe(true)
-    expect(result.current.token).toBe(token)
+    // The hook exposes no token to assert on - that is the #82 fix. Confirm the
+    // login really took by asking the session module, which is where it lives.
+    const { readToken } = await import('./session')
+    expect(readToken()).toBe(token)
   }
 
   it('leaves no trace of the token on any surface after a real login', async () => {
@@ -825,7 +841,8 @@ describe('the signaling JWT is not persisted anywhere (spec 8.4 req 1)', () => {
     const { result } = renderHook(() => useAuthAfterReload())
 
     expect(result.current.isAuthenticated).toBe(false)
-    expect(result.current.token).toBeNull()
+    const { readToken } = await import('./session')
+    expect(readToken()).toBeNull()
     expect(probe.findings(NEEDLE)).toEqual([])
   })
 

@@ -530,11 +530,14 @@ Frame routing on receipt reads byte 0 and dispatches to the HTTP proxy or the WS
 identically for both transports (`useWebRTC.ts:123-146` and `:206-222`).
 
 Security note relevant to the tunnel spec: the signaling JWT is held in a **module-scoped
-variable** in `lib/session.ts` and is written to no browser store — but it is **still reachable by
-a framed service through the React render tree**, because `useAuth()` puts it in component state
-and `App.tsx` passes it as a prop, so it sits in fiber nodes on the DOM subtree that hosts the
-iframe ([#82](https://github.com/lem-app/lem/issues/82)). Storage custody and render-tree custody
-are two problems and only the first is done. It used to live in `localStorage`, which
+variable** in `lib/session.ts`, written to no browser store, and **kept out of the React render
+tree** — `useAuth()` returns `isAuthenticated`, never the token, and no component takes it as a
+prop. Both halves are needed: React keeps props and hook state on fiber nodes attached to DOM
+elements, so a token in a component is readable by a framed service walking `parent.document`,
+and storage custody alone would have relocated the exposure rather than removed it
+([#82](https://github.com/lem-app/lem/issues/82)). Transport objects take a `getToken` callback
+rather than the value, so the credential stays behind a closure. It used to live in `localStorage`,
+which
 Phase 4 turned from a defensible choice into a live exposure — the framed app at
 `/app/<deviceId>/<serviceId>/` is genuinely same-origin with the dashboard and can read Web
 Storage directly ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §8.4 requirement 1, landed in

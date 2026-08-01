@@ -646,10 +646,10 @@ http.server.HTTPServer(('127.0.0.1', 39999), H).serve_forever()
 
 **C. The JWT is in no browser store, and a reload logs you out.**
 
-> **Scope, so this section is not over-read.** It checks that the token is out of *storage*. It
-> does **not** show the token is beyond a framed service's reach — it is not, because the React
-> render tree still holds it ([#82](https://github.com/lem-app/lem/issues/82)). Step 5 makes that
-> visible on purpose rather than leaving a tester with a false all-clear.
+> **Scope, so this section is not over-read.** Steps 1-4 check *storage*; step 5 checks the
+> *render tree*, which is a separate exposure and was live until
+> [#82](https://github.com/lem-app/lem/issues/82). Neither makes a hostile framed service safe —
+> it is same-origin with the dashboard and per-service origins remains the boundary.
 
 1. On B at `http://localhost:5173` (a secure context, so the proxy works), log in and frame any
    service.
@@ -669,12 +669,13 @@ http.server.HTTPServer(('127.0.0.1', 39999), H).serve_forever()
    fiberKey ? 'fiber reachable: ' + fiberKey : 'no fiber found'
    ```
 
-   **Expected while [#82](https://github.com/lem-app/lem/issues/82) is open:** a key is found, and
-   walking `host[fiberKey].return` upwards reaches props and hook state holding the token.
-   **Expected once #82 is closed:** the fiber is still there — React always attaches it — but no
-   token appears in any `memoizedProps` or `memoizedState` along that chain, because components
-   receive `isAuthenticated` and callbacks rather than the token itself. The automated form of
-   this check is `web/remote/src/lib/fiber-reachability.test.ts`.
+   **Expected:** a fiber key is found on some element under `#root` — React always attaches
+   these, and their presence is not the defect. Now walk `.return` upwards from it and inspect
+   `memoizedProps` and `memoizedState` at each step. **Expected: no token anywhere along the
+   chain**, because components receive `isAuthenticated` and callbacks rather than the value.
+   Finding one means [#82](https://github.com/lem-app/lem/issues/82) has regressed. The automated
+   form of this check, including a positive control that reproduces the pre-fix arrangement, is
+   `web/remote/src/lib/fiber-reachability.test.tsx`.
 
 **In-suite for Phase 6, and therefore not repeated above:** the degradation reason table and its
 precedence (`sw-bridge.test.ts`), the degraded UI and the absence of an iframe fallback

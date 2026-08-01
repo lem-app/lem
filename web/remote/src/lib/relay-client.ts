@@ -152,7 +152,13 @@ const WS_TRY_AGAIN_LATER = 1013
 export interface RelayClientConfig {
   relayUrl: string
   sessionId: string
-  token: string
+  /**
+   * Supplies the session token at the moment it is sent. A callback, not the
+   * value, for the same reason as `WebRTCConfig.getToken`: this client is held
+   * in a React ref and would otherwise carry the credential on a fiber node
+   * reachable from the DOM (#82).
+   */
+  getToken: () => string
   onStateChange?: (state: ConnectionState) => void
   onMessage?: (message: ArrayBuffer) => void
   onError?: (error: Error) => void
@@ -174,7 +180,7 @@ interface RelayControlMessage {
 export class RelayClient {
   private relayUrl: string
   private sessionId: string
-  private token: string
+  private getToken: () => string
 
   private ws: WebSocket | null = null
   private state: ConnectionState = 'disconnected'
@@ -197,7 +203,7 @@ export class RelayClient {
   constructor(config: RelayClientConfig) {
     this.relayUrl = config.relayUrl
     this.sessionId = config.sessionId
-    this.token = config.token
+    this.getToken = config.getToken
     this.onStateChange = config.onStateChange
     this.onMessage = config.onMessage
     this.onError = config.onError
@@ -339,7 +345,7 @@ export class RelayClient {
 
       ws.onopen = () => {
         console.log('[RelayClient] Socket open, sending auth message')
-        ws.send(JSON.stringify({ type: 'auth', token: this.token }))
+        ws.send(JSON.stringify({ type: 'auth', token: this.getToken() }))
         graceTimer = window.setTimeout(markConnected, AUTH_GRACE_MS)
       }
 
