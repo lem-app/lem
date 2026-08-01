@@ -15,11 +15,16 @@
 
 """Tests for tunnel datapath hardening (SSRF, header forwarding, frame caps)."""
 
+import asyncio
 import json
 import struct
+from collections.abc import AsyncGenerator
 
 import pytest
+import uvicorn
+from fastapi import FastAPI
 
+from app.security import ALLOWED_ORIGINS, LocalApiSecurityMiddleware
 from app.tunnel.http_frame import (
     MAX_BODY_BYTES,
     MAX_HEADERS_BYTES,
@@ -36,6 +41,7 @@ from app.tunnel.http_proxy import (
     filter_request_headers,
     validate_path,
 )
+from app.tunnel.router import RequestRouter
 from app.tunnel.ws_proxy import MAX_WS_CONNECTIONS
 
 LOCAL_SERVER = "http://localhost:5142"
@@ -282,3 +288,98 @@ def test_frames_within_the_cap_still_round_trip() -> None:
 def test_ws_connection_cap_is_bounded() -> None:
     """Connection IDs are peer-chosen, so the socket map must be bounded."""
     assert 0 < MAX_WS_CONNECTIONS <= 256
+
+
+# ============================================================================
+# End to end: the tunnel still reaches a CSRF-protected local API
+# ============================================================================
+
+
+@pytest.fixture
+async def protected_api() -> AsyncGenerator[str, None]:
+    """Run a CSRF-protected API on an ephemeral port.
+
+    Yields:
+        Base URL of the running server
+    """
+    api = FastAPI()
+    api.add_middleware(
+        LocalApiSecurityMiddleware,
+        allowed_origins=ALLOWED_ORIGINS,
+        require_token=False,
+    )
+
+    @api.post("/v1/tunnel/disable")
+    async def disable() -> dict[str, str]:
+        return {"status": "ok", "mode": "offline"}
+
+    server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=0, log_level="error"))
+    task = asyncio.create_task(server.serve())
+    for _ in range(200):
+        if server.started:
+            break
+        await asyncio.sleep(0.02)
+    else:  # pragma: no cover - only on a broken event loop
+        raise AssertionError("Test server did not start")
+
+    port: int = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        await task
+
+
+def _peer_frame(path: str) -> bytes:
+    """Build a request frame carrying hostile peer-supplied headers.
+
+    Args:
+        path: Request path chosen by the peer
+
+    Returns:
+        Serialized request frame
+    """
+    return serialize_request(
+        {
+            "request_id": 99,
+            "method": "POST",
+            "path": path,
+            "headers": {
+                "Host": "evil.example.com",
+                "Origin": "https://evil.example.com",
+                "Content-Length": "999999",
+                "X-Lem-Client": "spoofed",
+            },
+            "body": "",
+        }
+    )
+
+
+async def test_tunnel_request_reaches_protected_api(protected_api: str) -> None:
+    """Remote access keeps working: the proxy presents its own credentials."""
+    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    await handler.start()
+    try:
+        response = deserialize_response(
+            await handler.handle_request(_peer_frame("/v1/tunnel/disable"))
+        )
+    finally:
+        await handler.stop()
+
+    assert response["status_code"] == 200
+    assert json.loads(response["body"]) == {"status": "ok", "mode": "offline"}
+
+
+async def test_tunnel_ssrf_attempt_never_leaves_the_target(protected_api: str) -> None:
+    """The exploit is answered locally with 400 instead of being forwarded."""
+    handler = HTTPProxyHandler(local_server_url=protected_api, router=RequestRouter(protected_api))
+    await handler.start()
+    try:
+        frame = _peer_frame("@evil.example.com/v1/tunnel/disable")
+        response = deserialize_response(await handler.handle_request(frame))
+    finally:
+        await handler.stop()
+
+    assert response["status_code"] == 400
+    assert response["request_id"] == 99
+    assert json.loads(response["body"]) == {"error": "Invalid request path"}
