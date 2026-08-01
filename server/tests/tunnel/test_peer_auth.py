@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from app.db import AuthState
 from app.security import ALLOWED_ORIGINS, LocalApiSecurityMiddleware
@@ -148,6 +148,92 @@ async def test_unreachable_device_registry_fails_closed() -> None:
 
     assert decision.authorized is False
     assert "could not load" in decision.reason
+
+
+# ============================================================================
+# The device list actually comes from the signaling server
+# ============================================================================
+
+
+@pytest.fixture
+async def fake_signaling() -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
+    """Serve a stand-in signaling /devices/ endpoint.
+
+    Yields:
+        Base URL and a mutable control dict (``status``, ``devices``, ``calls``)
+    """
+    control: dict[str, Any] = {"status": 200, "devices": [{"id": REGISTERED_PEER}], "calls": 0}
+    api = FastAPI()
+
+    @api.get("/devices/")
+    async def devices(response: Response) -> list[dict[str, str]]:
+        control["calls"] += 1
+        response.status_code = int(control["status"])
+        return list(control["devices"])
+
+    server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=0, log_level="error"))
+    task = asyncio.create_task(server.serve())
+    for _ in range(200):
+        if server.started:
+            break
+        await asyncio.sleep(0.02)
+    else:  # pragma: no cover - only on a broken event loop
+        raise AssertionError("Fake signaling server did not start")
+
+    port: int = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}", control
+    finally:
+        server.should_exit = True
+        await task
+
+
+async def test_device_list_is_fetched_from_signaling_and_cached(
+    fake_signaling: tuple[str, dict[str, Any]],
+) -> None:
+    """The account's devices come over the wire, and are not re-fetched per offer."""
+    base, control = fake_signaling
+    auth = AuthState("user@example.com", "jwt-token", OWN_DEVICE, base)
+    verifier = RegisteredDeviceVerifier()
+
+    with patch("app.tunnel.peer_auth.get_auth_state", return_value=auth):
+        first = await verifier.verify(PeerIdentity(REGISTERED_PEER))
+        second = await verifier.verify(PeerIdentity(UNKNOWN_PEER))
+        own = await verifier.verify(PeerIdentity(OWN_DEVICE))
+
+    assert first.authorized is True
+    assert second.authorized is False
+    assert own.authorized is True, "this machine's own device belongs to its account"
+    assert control["calls"] == 1, "the device list should be cached across offers"
+
+
+async def test_signaling_error_response_denies(
+    fake_signaling: tuple[str, dict[str, Any]],
+) -> None:
+    """An expired JWT (401) must not be read as 'no devices, allow anyway'."""
+    base, control = fake_signaling
+    control["status"] = 401
+    auth = AuthState("user@example.com", "stale-jwt", OWN_DEVICE, base)
+
+    with patch("app.tunnel.peer_auth.get_auth_state", return_value=auth):
+        decision = await RegisteredDeviceVerifier().verify(PeerIdentity(REGISTERED_PEER))
+
+    assert decision.authorized is False
+    assert "HTTP 401" in decision.reason
+
+
+async def test_malformed_device_list_denies(
+    fake_signaling: tuple[str, dict[str, Any]],
+) -> None:
+    """Junk from the registry is not permission either."""
+    base, control = fake_signaling
+    control["devices"] = [{"not_an_id": "x"}]
+    auth = AuthState("user@example.com", "jwt-token", OWN_DEVICE, base)
+
+    with patch("app.tunnel.peer_auth.get_auth_state", return_value=auth):
+        decision = await RegisteredDeviceVerifier().verify(PeerIdentity(REGISTERED_PEER))
+
+    assert decision.authorized is False
 
 
 # ============================================================================
