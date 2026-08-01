@@ -25,6 +25,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { config } from '../lib/env'
 
 type LoginProps = {
   onLogin: (credentials: UserLogin) => Promise<void>
@@ -33,13 +34,17 @@ type LoginProps = {
 }
 
 export function Login({ onLogin, isLoading, error }: LoginProps): ReactElement {
-  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+  const apiBaseUrl = config?.apiBaseUrl ?? '(not configured)'
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  // Not `async`: React would float the returned promise, and a failed login
+  // then shows up as an unhandled rejection instead of the `error` prop.
+  const handleSubmit = (e: React.FormEvent): void => {
     e.preventDefault()
-    await onLogin({ email, password })
+    onLogin({ email, password }).catch((err: unknown) => {
+      console.error('[Login] Login failed:', err)
+    })
   }
 
   return (
@@ -92,9 +97,11 @@ export function Login({ onLogin, isLoading, error }: LoginProps): ReactElement {
             <AlertDescription className="space-y-1">
               <p>
                 <strong>Note:</strong> This connects to the signaling server at{' '}
-                <code className="rounded bg-muted px-1 py-0.5 text-sm">{API_BASE_URL}</code>
+                <code className="rounded bg-muted px-1 py-0.5 text-sm">{apiBaseUrl}</code>
               </p>
-              <p className="text-sm">Ensure your local Lem server and signaling server are running.</p>
+              <p className="text-sm">
+                Ensure your local Lem server and signaling server are running.
+              </p>
             </AlertDescription>
           </Alert>
         </CardContent>

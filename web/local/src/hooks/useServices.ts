@@ -14,81 +14,68 @@
 // Public License for more details.
 
 // Hook for services data and operations
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getServices,
   installService,
   startService,
   stopService,
   removeService,
-  type ApiError,
-} from "../api/client";
+} from '../api/client'
 
-const POLL_INTERVAL = 5000; // 5 seconds
+const POLL_INTERVAL = 5000 // 5 seconds
 
 export function useServices() {
   return useQuery({
-    queryKey: ["services"],
+    queryKey: ['services'],
     queryFn: getServices,
     refetchInterval: POLL_INTERVAL,
     refetchIntervalInBackground: true,
-  });
+  })
 }
 
 export function useInstallService() {
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
 
   return useMutation({
     mutationFn: (serviceId: string) => installService(serviceId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["services"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ['services'] })
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
     },
-    onError: (error: ApiError) => {
-      throw error;
-    },
-  });
+  })
 }
 
 export function useStartService() {
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
 
   return useMutation({
     mutationFn: (serviceId: string) => startService(serviceId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["services"] });
+      void queryClient.invalidateQueries({ queryKey: ['services'] })
     },
-    onError: (error: ApiError) => {
-      throw error;
-    },
-  });
+  })
 }
 
 export function useStopService() {
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
 
   return useMutation({
     mutationFn: (serviceId: string) => stopService(serviceId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["services"] });
+      void queryClient.invalidateQueries({ queryKey: ['services'] })
     },
-    onError: (error: ApiError) => {
-      throw error;
-    },
-  });
+  })
 }
 
 export function useRemoveService() {
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
 
   return useMutation({
     mutationFn: (serviceId: string) => removeService(serviceId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["services"] });
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ['services'] })
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
     },
-    onError: (error: ApiError) => {
-      throw error;
-    },
-  });
+  })
 }

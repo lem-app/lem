@@ -17,40 +17,42 @@
  * ModelPull component - pull models for a runner.
  */
 
-import type { ReactElement } from 'react';
-import { useState } from 'react';
-import { useRunnerModels, usePullModel } from '../hooks/useModels';
-import { ApiError } from '../api/client';
-import toast from 'react-hot-toast';
-import type { Model } from '../api/types';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Badge } from '@/components/ui/badge';
-import { Separator } from '@/components/ui/separator';
+import type { ReactElement } from 'react'
+import { useState } from 'react'
+import { useRunnerModels, usePullModel } from '../hooks/useModels'
+import { ApiError } from '../api/client'
+import toast from 'react-hot-toast'
+import type { Model } from '../api/types'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Badge } from '@/components/ui/badge'
+import { Separator } from '@/components/ui/separator'
 
 type ModelPullProps = {
-  runnerId: string;
-  runnerName: string;
+  runnerId: string
+  runnerName: string
 }
 
 type ModelItemProps = {
-  model: Model;
+  model: Model
 }
 
 function ModelItem({ model }: ModelItemProps): ReactElement {
-  const getStatusVariant = (status: string): 'default' | 'success' | 'secondary' | 'destructive' => {
+  const getStatusVariant = (
+    status: string
+  ): 'default' | 'success' | 'secondary' | 'destructive' => {
     switch (status) {
       case 'ready':
-        return 'success';
+        return 'success'
       case 'pulling':
-        return 'default';
+        return 'default'
       case 'error':
-        return 'destructive';
+        return 'destructive'
       default:
-        return 'secondary';
+        return 'secondary'
     }
-  };
+  }
 
   return (
     <div className="flex items-center justify-between rounded-lg border border-border bg-muted p-4 transition-all hover:border-border/80">
@@ -62,34 +64,38 @@ function ModelItem({ model }: ModelItemProps): ReactElement {
         {model.status}
       </Badge>
     </div>
-  );
+  )
 }
 
 export function ModelPull({ runnerId, runnerName }: ModelPullProps): ReactElement {
-  const [modelRef, setModelRef] = useState('');
-  const { data: models, isLoading } = useRunnerModels(runnerId);
-  const pullMutation = usePullModel();
+  const [modelRef, setModelRef] = useState('')
+  const { data: models, isLoading } = useRunnerModels(runnerId)
+  const pullMutation = usePullModel()
 
-  const handlePull = async (e: React.FormEvent): Promise<void> => {
-    e.preventDefault();
+  // Not `async`: React would float the returned promise from onSubmit.
+  const handlePull = (e: React.FormEvent): void => {
+    e.preventDefault()
+    void pullModel()
+  }
 
+  const pullModel = async (): Promise<void> => {
     if (!modelRef.trim()) {
-      toast.error('Please enter a model reference');
-      return;
+      toast.error('Please enter a model reference')
+      return
     }
 
     try {
-      await pullMutation.mutateAsync({ runnerId, modelRef: modelRef.trim() });
-      toast.success(`Pulling model: ${modelRef}`);
-      setModelRef(''); // Clear input on success
+      await pullMutation.mutateAsync({ runnerId, modelRef: modelRef.trim() })
+      toast.success(`Pulling model: ${modelRef}`)
+      setModelRef('') // Clear input on success
     } catch (error) {
       if (error instanceof ApiError) {
-        toast.error(`Failed to pull model: ${error.message}`);
+        toast.error(`Failed to pull model: ${error.message}`)
       } else {
-        toast.error('Failed to pull model');
+        toast.error('Failed to pull model')
       }
     }
-  };
+  }
 
   return (
     <Card>
@@ -137,5 +143,5 @@ export function ModelPull({ runnerId, runnerName }: ModelPullProps): ReactElemen
         </div>
       </CardContent>
     </Card>
-  );
+  )
 }

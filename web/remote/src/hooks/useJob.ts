@@ -19,8 +19,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { Job } from '../api/types'
+import { localApiUrl } from '../lib/env'
 
-const LOCAL_API = 'http://localhost:5142'
 const FAST_POLL_INTERVAL = 1000 // 1 second while job active
 
 interface UseJobOptions {
@@ -51,7 +51,7 @@ export function useJob(options: UseJobOptions): UseJobResult {
     if (!jobId) return null
 
     try {
-      const response = await proxyFetch(`${LOCAL_API}/v1/jobs/${jobId}`)
+      const response = await proxyFetch(localApiUrl(`/v1/jobs/${jobId}`))
 
       if (!mountedRef.current) return null
 
@@ -91,14 +91,14 @@ export function useJob(options: UseJobOptions): UseJobResult {
     }
 
     setIsLoading(true)
-    fetchJob().finally(() => {
+    void fetchJob().finally(() => {
       if (mountedRef.current) {
         setIsLoading(false)
       }
     })
 
     // Start polling
-    intervalRef.current = window.setInterval(fetchJob, FAST_POLL_INTERVAL)
+    intervalRef.current = window.setInterval(() => void fetchJob(), FAST_POLL_INTERVAL)
 
     return () => {
       mountedRef.current = false

@@ -30,8 +30,8 @@ import { ClientViewer } from './components/ClientViewer'
 import { ClientSelector } from './components/ClientSelector'
 import { ServicesCatalog } from './components/ServicesCatalog'
 import { Button } from '@/components/ui/button'
-
-const SIGNAL_URL = import.meta.env.VITE_SIGNAL_URL || 'ws://localhost:8000/signal'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { config, configError } from './lib/env'
 
 // Generate a UUID v4-like string (fallback for non-secure contexts)
 function generateUUID(): string {
@@ -60,7 +60,48 @@ function getBrowserDeviceId(): string {
 
 type ViewMode = 'clients' | 'services'
 
+/**
+ * Rendered instead of the app when `lib/env.ts` rejects the build's endpoint
+ * configuration. Failing visibly beats a dashboard that quietly dials localhost.
+ */
+function ConfigurationError({ message }: { message: string }): ReactElement {
+  return (
+    <div className="flex min-h-screen items-center justify-center p-6">
+      <Alert variant="destructive" className="max-w-2xl">
+        <AlertDescription className="space-y-2">
+          <p className="font-semibold">Lem Remote Access is misconfigured</p>
+          <p className="text-sm">{message}</p>
+          <p className="text-sm">
+            Set the required <code>VITE_*</code> variables and rebuild. See{' '}
+            <code>web/remote/.env.production.example</code>.
+          </p>
+        </AlertDescription>
+      </Alert>
+    </div>
+  )
+}
+
 function App(): ReactElement {
+  if (configError !== null || config === null) {
+    return <ConfigurationError message={configError ?? 'Configuration could not be resolved.'} />
+  }
+
+  return (
+    <Dashboard
+      signalUrl={config.signalUrl}
+      relayUrl={config.relayUrl}
+      iceServers={config.iceServers}
+    />
+  )
+}
+
+interface DashboardProps {
+  signalUrl: string
+  relayUrl: string
+  iceServers: RTCIceServer[]
+}
+
+function Dashboard({ signalUrl, relayUrl, iceServers }: DashboardProps): ReactElement {
   const { isAuthenticated, token, login, logout, isLoading, error: authError } = useAuth()
   const [targetDeviceId, setTargetDeviceId] = useState<string | null>(null)
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null)
@@ -78,12 +119,15 @@ function App(): ReactElement {
     disconnect,
     proxyFetch,
   } = useWebRTC({
-    signalUrl: SIGNAL_URL,
-    token: token || '',
+    signalUrl,
+    token: token ?? '',
     deviceId: browserDeviceId,
-    targetDeviceId: targetDeviceId || '',
+    targetDeviceId: targetDeviceId ?? '',
     autoConnect: false,
-    relayUrl: import.meta.env.VITE_RELAY_URL || 'ws://localhost:8001',
+    relayUrl,
+    // `config.iceServers` is built once at module load, so this reference is
+    // stable across renders (useWebRTC keys an effect on it).
+    iceServers,
   })
 
   const handleDeviceSelect = (deviceId: string) => {
@@ -111,14 +155,19 @@ function App(): ReactElement {
     setSelectedServiceId(null)
   }
 
-  const handleLogin = async (credentials: Parameters<typeof login>[0]) => {
-    await login(credentials)
+  const handleLogin = async (credentials: Parameters<typeof login>[0]): Promise<void> => {
+    try {
+      await login(credentials)
+    } catch {
+      // Already surfaced through `authError`; rethrowing here would only
+      // produce an unhandled rejection from the form's submit handler.
+    }
   }
 
   // Register browser device when authenticated
   useEffect(() => {
     if (isAuthenticated && token) {
-      registerDevice(browserDeviceId, token).catch((err) => {
+      registerDevice(browserDeviceId, token).catch((err: unknown) => {
         console.error('Failed to register browser device:', err)
       })
     }
@@ -143,7 +192,7 @@ function App(): ReactElement {
         </header>
 
         <div className="container mx-auto">
-          <DeviceSelector onSelectDevice={handleDeviceSelect} token={token || ''} />
+          <DeviceSelector onSelectDevice={handleDeviceSelect} token={token ?? ''} />
         </div>
       </div>
     )
@@ -199,6 +248,7 @@ function App(): ReactElement {
           connectionState={connectionState}
           dataChannelState={dataChannelState}
           connectionMode={connectionMode}
+          signalUrl={signalUrl}
           error={webrtcError}
           onConnect={connect}
           onDisconnect={disconnect}

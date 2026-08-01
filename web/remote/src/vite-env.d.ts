@@ -16,8 +16,23 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
+  /** Signaling server HTTP base URL, e.g. `https://signal.lem.gg`. */
   readonly VITE_API_BASE_URL?: string
+  /** Signaling server WebSocket URL, e.g. `wss://signal.lem.gg/signal`. */
   readonly VITE_SIGNAL_URL?: string
+  /** Relay server WebSocket base URL, e.g. `wss://relay.lem.gg`. */
+  readonly VITE_RELAY_URL?: string
+  /**
+   * Local Lem server as addressed from the far side of the tunnel.
+   * Defaults to `http://localhost:5142`.
+   */
+  readonly VITE_LOCAL_API_URL?: string
+  /**
+   * Opt-in STUN/TURN servers, comma-separated (e.g.
+   * `stun:stun.example.org:3478,turns:turn.example.org:5349`).
+   * Empty by default: Lem does not talk to third-party STUN servers unasked.
+   */
+  readonly VITE_ICE_SERVERS?: string
 }
 
 interface ImportMeta {

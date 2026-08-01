@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Activity, AlertCircle, ExternalLink, Loader2 } from 'lucide-react'
+import { localApiUrl } from '../lib/env'
 
 interface Client {
   id: string
@@ -50,7 +51,7 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
         setLoading(true)
         setError(null)
 
-        const response = await proxyFetch('http://localhost:5142/v1/clients')
+        const response = await proxyFetch(localApiUrl('/v1/clients'))
 
         if (!response.ok) {
           throw new Error(`Failed to fetch clients: ${response.status}`)
@@ -66,7 +67,7 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
       }
     }
 
-    fetchClients()
+    void fetchClients()
   }, [proxyFetch])
 
   const handleSelectClient = (client: Client) => {
@@ -111,7 +112,9 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
         <Card>
           <CardHeader>
             <CardTitle>No Clients Available</CardTitle>
-            <CardDescription>No client applications are configured on the local device.</CardDescription>
+            <CardDescription>
+              No client applications are configured on the local device.
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <p className="text-sm text-muted-foreground">
@@ -131,13 +134,17 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
       <Card>
         <CardHeader>
           <CardTitle>Available Clients</CardTitle>
-          <CardDescription>Select a client application to access through the secure tunnel</CardDescription>
+          <CardDescription>
+            Select a client application to access through the secure tunnel
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           {/* Running Clients */}
           {runningClients.length > 0 && (
             <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-foreground">Running ({runningClients.length})</h3>
+              <h3 className="text-sm font-semibold text-foreground">
+                Running ({runningClients.length})
+              </h3>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {runningClients.map((client) => (
                   <Card
@@ -169,7 +176,9 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
           {/* Stopped Clients */}
           {stoppedClients.length > 0 && (
             <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-muted-foreground">Stopped ({stoppedClients.length})</h3>
+              <h3 className="text-sm font-semibold text-muted-foreground">
+                Stopped ({stoppedClients.length})
+              </h3>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {stoppedClients.map((client) => (
                   <Card key={client.id} className="opacity-60">
@@ -183,7 +192,9 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
                       </div>
                     </CardHeader>
                     <CardContent>
-                      <p className="text-xs text-muted-foreground">Start this client to access it remotely</p>
+                      <p className="text-xs text-muted-foreground">
+                        Start this client to access it remotely
+                      </p>
                     </CardContent>
                   </Card>
                 ))}
@@ -194,8 +205,9 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
           {/* Info Box */}
           <div className="rounded-lg border bg-muted/50 p-4">
             <p className="text-xs text-muted-foreground">
-              <strong>Note:</strong> All connections are routed through the secure WebRTC tunnel. HTTP requests and
-              WebSocket connections are automatically proxied to your local device.
+              <strong>Note:</strong> All connections are routed through the secure WebRTC tunnel.
+              HTTP requests and WebSocket connections are automatically proxied to your local
+              device.
             </p>
           </div>
         </CardContent>

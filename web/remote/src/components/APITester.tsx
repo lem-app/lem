@@ -22,18 +22,21 @@ import type { ReactElement } from 'react'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { LOCAL_API_BASE_URL, localApiUrl } from '../lib/env'
 
 type APITesterProps = {
   proxyFetch: (url: string, init?: RequestInit) => Promise<Response>
   isConnected: boolean
 }
 
+const TEST_ENDPOINTS = ['/v1/health', '/v1/runners', '/v1/clients'] as const
+
 export function APITester({ proxyFetch, isConnected }: APITesterProps): ReactElement {
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const testHealthEndpoint = async () => {
+  const testEndpoint = async (path: string): Promise<void> => {
     if (!isConnected) {
       setError('Not connected to local server')
       return
@@ -44,50 +47,8 @@ export function APITester({ proxyFetch, isConnected }: APITesterProps): ReactEle
     setResult(null)
 
     try {
-      const response = await proxyFetch('http://localhost:5142/v1/health')
-      const data = await response.json()
-      setResult(JSON.stringify(data, null, 2))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const testRunnersEndpoint = async () => {
-    if (!isConnected) {
-      setError('Not connected to local server')
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-    setResult(null)
-
-    try {
-      const response = await proxyFetch('http://localhost:5142/v1/runners')
-      const data = await response.json()
-      setResult(JSON.stringify(data, null, 2))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const testClientsEndpoint = async () => {
-    if (!isConnected) {
-      setError('Not connected to local server')
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-    setResult(null)
-
-    try {
-      const response = await proxyFetch('http://localhost:5142/v1/clients')
-      const data = await response.json()
+      const response = await proxyFetch(localApiUrl(path))
+      const data: unknown = await response.json()
       setResult(JSON.stringify(data, null, 2))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -103,25 +64,25 @@ export function APITester({ proxyFetch, isConnected }: APITesterProps): ReactEle
           <CardTitle>API Tester</CardTitle>
           <CardDescription>
             Test HTTP proxying over the WebRTC DataChannel. These requests are sent to your local
-            Lem server at <code className="rounded bg-muted px-1 py-0.5 text-sm">http://localhost:5142</code>
+            Lem server at{' '}
+            <code className="rounded bg-muted px-1 py-0.5 text-sm">{LOCAL_API_BASE_URL}</code>
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap gap-3">
-            <Button onClick={testHealthEndpoint} disabled={!isConnected || loading} size="sm">
-              Test /v1/health
-            </Button>
-            <Button onClick={testRunnersEndpoint} disabled={!isConnected || loading} size="sm">
-              Test /v1/runners
-            </Button>
-            <Button onClick={testClientsEndpoint} disabled={!isConnected || loading} size="sm">
-              Test /v1/clients
-            </Button>
+            {TEST_ENDPOINTS.map((path) => (
+              <Button
+                key={path}
+                onClick={() => void testEndpoint(path)}
+                disabled={!isConnected || loading}
+                size="sm"
+              >
+                Test {path}
+              </Button>
+            ))}
           </div>
 
-          {loading && (
-            <div className="py-3 text-center text-sm text-primary">Loading...</div>
-          )}
+          {loading && <div className="py-3 text-center text-sm text-primary">Loading...</div>}
 
           {error && (
             <Alert variant="destructive">
