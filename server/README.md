@@ -90,8 +90,8 @@ pastes, keeps only the session token (in `sessionStorage` by default,
 `localStorage` behind an explicit "remember on this device"), and retries the
 request that failed. A **Sign out** control calls `DELETE /v1/auth/session` and
 clears both storages, so the remembered-device opt-in is not one-way.
-`scripts/check-bundle-secrets.sh` builds the app and fails if any
-credential-shaped build variable reaches `dist/`.
+`scripts/check-bundle-secrets.sh` builds both web apps and fails on either a
+forbidden build-variable name or a credential-shaped literal in the output.
 
 ### Proxies in front of the bind: `LEM_REQUIRE_TOKEN`
 

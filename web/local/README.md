@@ -62,8 +62,10 @@ operating an unauthenticated Docker control plane.
 The dashboard holds **no compiled-in credential**. A `VITE_*` variable cannot
 carry one: Vite inlines those as plaintext string literals into
 `dist/assets/*.js`, so the token would ship to every browser that loads the
-page. `scripts/check-bundle-secrets.sh` builds this app in CI and fails if any
-credential-shaped build variable reaches `dist/`.
+page. `scripts/check-bundle-secrets.sh` builds both web apps in CI and fails on
+either a forbidden build-variable name or a credential-shaped literal in the
+output. It self-tests on every run against planted canaries, and its report
+says what it checked rather than claiming the bundle is provably secret-free.
 
 Instead the flow is 401-driven. It is not a login page and not a route - Lem's
 local API has exactly one principal, the machine's operator:

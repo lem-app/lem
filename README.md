@@ -111,7 +111,9 @@ curl -H "X-Lem-Client: curl" \
   memory only. Nothing is compiled into the bundle - a build-time `VITE_*`
   variable would be inlined as a plaintext literal into `dist/assets/*.js`,
   handing the credential to everyone who can load the page.
-  `scripts/check-bundle-secrets.sh` enforces that in CI.
+  `scripts/check-bundle-secrets.sh` builds both web apps in CI and scans them
+  for forbidden build-variable names *and* for credential-shaped literals,
+  proving on every run that its own rules still fire.
 - **`LEM_REQUIRE_TOKEN=true`** forces the bearer requirement on even for a
   verified loopback bind. Use it whenever something in front of the socket
   republishes the API: a reverse proxy, a published container port, an SSH
