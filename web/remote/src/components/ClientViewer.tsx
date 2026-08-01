@@ -325,6 +325,21 @@ export function ClientViewer({
 
         {isConnected &&
           !loading &&
+          !errorMessage &&
+          appInfo?.status === 'running' &&
+          swStatus.state === 'pending' && (
+            <Card>
+              <CardContent className="flex items-center justify-center py-12">
+                <div className="flex flex-col items-center gap-3">
+                  <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                  <p className="text-sm text-muted-foreground">Preparing the secure app proxy...</p>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+        {isConnected &&
+          !loading &&
           appInfo &&
           appInfo.status === 'running' &&
           swStatus.state === 'unavailable' && (
