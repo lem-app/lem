@@ -14,12 +14,12 @@
 // Public License for more details.
 
 // Lem Local Dashboard v0.1
-import type { ReactElement } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Toaster } from "react-hot-toast";
-import { ServicesList } from "./components/ServicesList";
-import { ModelPull } from "./components/ModelPull";
-import { RemoteAccess } from "./components/RemoteAccess";
+import type { ReactElement } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Toaster } from 'react-hot-toast'
+import { ServicesList } from './components/ServicesList'
+import { ModelPull } from './components/ModelPull'
+import { RemoteAccess } from './components/RemoteAccess'
 
 // Create a client for React Query
 const queryClient = new QueryClient({
@@ -29,7 +29,7 @@ const queryClient = new QueryClient({
       retry: 1,
     },
   },
-});
+})
 
 function App(): ReactElement {
   return (
@@ -38,9 +38,7 @@ function App(): ReactElement {
         <header className="border-b bg-card px-6 py-4">
           <div className="text-center">
             <h1 className="text-2xl font-bold">Lem Dashboard</h1>
-            <p className="text-sm text-muted-foreground">
-              Local AI Infrastructure Manager
-            </p>
+            <p className="text-sm text-muted-foreground">Local AI Infrastructure Manager</p>
           </div>
         </header>
 
@@ -58,31 +56,26 @@ function App(): ReactElement {
           </section>
         </main>
 
+        {/*
+          react-hot-toast renders outside the component tree, so it is styled
+          through className rather than Tailwind utilities on a JSX element.
+          These are theme tokens, not the hardcoded hex colours that used to be
+          here and ignored light/dark entirely.
+        */}
         <Toaster
           position="bottom-right"
           toastOptions={{
             duration: 4000,
-            style: {
-              background: "#363636",
-              color: "#fff",
-            },
-            success: {
-              iconTheme: {
-                primary: "#4ade80",
-                secondary: "#fff",
-              },
-            },
+            className: '!bg-card !text-card-foreground !border !border-border !shadow-lg',
+            success: { className: '!bg-card !text-card-foreground !border !border-border' },
             error: {
-              iconTheme: {
-                primary: "#ef4444",
-                secondary: "#fff",
-              },
+              className: '!bg-destructive !text-destructive-foreground !border !border-destructive',
             },
           }}
         />
       </div>
     </QueryClientProvider>
-  );
+  )
 }
 
-export default App;
+export default App
