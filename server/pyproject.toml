@@ -65,10 +65,10 @@ pythonpath = ["."]
 # Installed by a plain `uv sync` (PEP 735). Keep all dev tooling here so
 # contributors get pytest/mypy/ruff without extra flags.
 dev = [
-    "pytest>=7.4.0",
+    "pytest>=9.1.1",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
-    "mypy>=1.18.2",
+    "mypy>=2.3.0",
     "ruff>=0.14.2",
     "types-pyyaml>=6.0.12.20250915",
 ]
