@@ -265,6 +265,10 @@ jobs:
   # This is that review, automated. Its own job rather than a step in the `web`
   # matrix: the check spans both apps plus the repo's env templates, and it is
   # the kind of gate that should be nameable in branch protection on its own.
+  #
+  # The script builds BOTH web apps itself, so both lockfiles are installed
+  # here. It also self-tests: every run re-scans a copy of the build output
+  # with planted credential canaries and fails if its own rules miss them.
   # --------------------------------------------------------------------------
   bundle-secrets:
     name: bundle-secrets
@@ -285,13 +289,21 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: web/local/pnpm-lock.yaml
+          # Both lockfiles: a change to either invalidates the cache, because
+          # this job builds both apps.
+          cache-dependency-path: |
+            web/local/pnpm-lock.yaml
+            web/remote/pnpm-lock.yaml
 
-      - name: Install dependencies
+      - name: Install web/local dependencies
         working-directory: web/local
         run: pnpm install --frozen-lockfile
 
-      - name: Check the built bundle carries no credential
+      - name: Install web/remote dependencies
+        working-directory: web/remote
+        run: pnpm install --frozen-lockfile
+
+      - name: Scan the built bundles for credentials
         run: ./scripts/check-bundle-secrets.sh
 
   # --------------------------------------------------------------------------
