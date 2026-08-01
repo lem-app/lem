@@ -39,7 +39,13 @@ from yarl import URL
 
 from app.security import CLIENT_HEADER, get_api_token
 
-from .http_frame import HTTPRequestFrame, HTTPResponseFrame, deserialize_request, serialize_response
+from .http_frame import (
+    HTTPRequestFrame,
+    HTTPResponseFrame,
+    deserialize_request,
+    peek_request_id,
+    serialize_response,
+)
 from .peer_auth import UNVERIFIED_PEER_LABEL, unverified_peers_allowed
 from .router import RequestRouter, create_router_with_client_discovery
 
@@ -306,15 +312,17 @@ class HTTPProxyHandler:
                 "body": error_body(GENERIC_PROXY_ERROR),
             }
 
-            # Try to extract request_id for proper correlation
-            try:
-                import struct
-
-                if len(data) >= 4:
-                    (request_id,) = struct.unpack(">I", data[:4])
-                    error_frame["request_id"] = request_id
-            except Exception:
-                pass
+            # Try to extract request_id for proper correlation.
+            #
+            # Byte 0 is the frame type, so the id lives at bytes 1..4. Reading
+            # data[:4] (as this did) pulled the type byte into the top octet:
+            # request_id 1 came back as 0x01000000, the peer found no pending
+            # request for it, dropped the frame, and the real request sat in the
+            # browser's map until its 30s timeout. Every proxy-level 500 was
+            # reported to the user as a 30-second hang.
+            request_id = peek_request_id(data)
+            if request_id is not None:
+                error_frame["request_id"] = request_id
 
             return serialize_response(error_frame)
 

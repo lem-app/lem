@@ -66,6 +66,25 @@ class FrameType(IntEnum):
     WS_CLOSE = 0x12
 
 
+def peek_request_id(data: bytes) -> int | None:
+    """Read the request_id every HTTP-family frame carries at bytes 1..4.
+
+    Byte 0 is the frame type, so a reader that wants only the correlation id -
+    an error path that could not deserialize the rest of the frame, say - must
+    skip it. Reading ``data[:4]`` instead yields the frame type in the top
+    octet (request_id 1 becomes 0x01000000).
+
+    Args:
+        data: Raw frame bytes
+
+    Returns:
+        The request_id, or None if the frame is too short to carry one
+    """
+    if len(data) < 5:
+        return None
+    return int(struct.unpack(">I", data[1:5])[0])
+
+
 class HTTPRequestFrame(TypedDict):
     """HTTP request frame."""
 
