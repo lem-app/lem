@@ -150,7 +150,12 @@ def test_session_refuses_a_grant_from_another_user() -> None:
     """
     session = RelaySession("s", user_id=1, device_pair=frozenset({"a", "b"}))
     intruder = SessionGrant(
-        session_id="s", device_id="a", peer_device_id="b", user_id=999, jti="x"
+        session_id="s",
+        device_id="a",
+        peer_device_id="b",
+        user_id=999,
+        jti="x",
+        expires_at=9999999999.0,
     )
     with pytest.raises(JoinRejectedError, match="does not match"):
         session.join(intruder, websocket=None)  # type: ignore[arg-type]
@@ -160,7 +165,12 @@ def test_session_refuses_a_grant_for_another_device_pair() -> None:
     """A grant naming different devices cannot be redirected into a session."""
     session = RelaySession("s", user_id=1, device_pair=frozenset({"a", "b"}))
     wrong_pair = SessionGrant(
-        session_id="s", device_id="a", peer_device_id="c", user_id=1, jti="x"
+        session_id="s",
+        device_id="a",
+        peer_device_id="c",
+        user_id=1,
+        jti="x",
+        expires_at=9999999999.0,
     )
     with pytest.raises(JoinRejectedError, match="does not match"):
         session.join(wrong_pair, websocket=None)  # type: ignore[arg-type]

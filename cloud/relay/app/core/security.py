@@ -39,9 +39,18 @@ from .config import settings
 # Without this an ordinary login token would still be accepted here.
 RELAY_GRANT_SCOPE = "relay-session"
 
+# The scope the signaling service stamps on account access tokens. Named here
+# only so the vocabulary is shared: the relay has no account-scoped surface at
+# all and must never accept one.
+ACCOUNT_TOKEN_SCOPE = "account"
+
 
 class InvalidGrantError(ValueError):
     """Raised when a presented token is not a valid grant for this session."""
+
+
+class TokenScopeError(JWTError):
+    """Raised when a token verifies but was minted for a different purpose."""
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,10 @@ class SessionGrant:
     peer_device_id: str
     user_id: int
     jti: str
+    # Unix timestamp the grant stops being valid. The relay remembers a spent
+    # jti until this moment, so single use lasts the grant's whole lifetime and
+    # not merely as long as the session object it first opened.
+    expires_at: float
 
     @property
     def device_pair(self) -> frozenset[str]:
@@ -64,16 +77,22 @@ class SessionGrant:
         return frozenset((self.device_id, self.peer_device_id))
 
 
-def decode_access_token(token: str) -> dict[str, Any]:
-    """Decode and verify a JWT.
+def decode_token(token: str, *, expected_scope: str) -> dict[str, Any]:
+    """Decode a JWT and require it to carry exactly the scope asked for.
+
+    This is the only decoding primitive in the service. There is deliberately
+    no way to obtain a verified payload without having named the scope it must
+    have, so a token minted for one purpose can never satisfy another.
 
     Args:
         token: JWT token to decode.
+        expected_scope: The scope claim the caller requires.
 
     Returns:
         Decoded token payload.
 
     Raises:
+        TokenScopeError: If the token carries a different scope, or none.
         JWTError: If token is invalid, expired, or carries no expiry.
     """
     payload: dict[str, Any] = jwt.decode(
@@ -85,6 +104,10 @@ def decode_access_token(token: str) -> dict[str, Any]:
         # {"require": ["exp"]} is silently ignored here.
         options={"require_exp": True},
     )
+
+    scope = payload.get("scope")
+    if scope != expected_scope:
+        raise TokenScopeError(f"Token has scope {scope!r}, but {expected_scope!r} is required here")
     return payload
 
 
@@ -102,12 +125,12 @@ def decode_session_grant(token: str, session_id: str) -> SessionGrant:
         InvalidGrantError: If the token is not a valid grant for this session.
     """
     try:
-        payload = decode_access_token(token)
+        # Positive validation: the grant scope is *required*, so an account
+        # token, an unscoped legacy token and any future third scope are all
+        # refused by the same check rather than by an enumeration of wrongs.
+        payload = decode_token(token, expected_scope=RELAY_GRANT_SCOPE)
     except JWTError as exc:
         raise InvalidGrantError(f"Token rejected: {exc}") from exc
-
-    if payload.get("scope") != RELAY_GRANT_SCOPE:
-        raise InvalidGrantError("Token is not a relay session grant")
 
     claimed_session = payload.get("sid")
     if not isinstance(claimed_session, str) or claimed_session != session_id:
@@ -119,6 +142,9 @@ def decode_session_grant(token: str, session_id: str) -> SessionGrant:
     peer_device_id = payload.get("peer_device_id")
     user_id = payload.get("user_id")
     jti = payload.get("jti")
+    # require_exp above guarantees this is present; jose normalizes it to a
+    # numeric claim, so a bool would be an int here and is excluded explicitly.
+    expires_at = payload.get("exp")
 
     if not isinstance(device_id, str) or not device_id:
         raise InvalidGrantError("Grant is missing device_id")
@@ -128,6 +154,8 @@ def decode_session_grant(token: str, session_id: str) -> SessionGrant:
         raise InvalidGrantError("Grant is missing user_id")
     if not isinstance(jti, str) or not jti:
         raise InvalidGrantError("Grant is missing jti")
+    if not isinstance(expires_at, int | float) or isinstance(expires_at, bool):
+        raise InvalidGrantError("Grant is missing exp")
     if device_id == peer_device_id:
         raise InvalidGrantError("Grant names the same device on both sides")
 
@@ -137,4 +165,5 @@ def decode_session_grant(token: str, session_id: str) -> SessionGrant:
         peer_device_id=peer_device_id,
         user_id=user_id,
         jti=jti,
+        expires_at=float(expires_at),
     )

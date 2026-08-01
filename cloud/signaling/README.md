@@ -141,9 +141,15 @@ curl http://localhost:8000/devices/ \
 
 ### Connect
 
-The handshake has three steps. Credentials may come from query parameters
-(deprecated: they end up in logs) or from a first `auth` message, but the
-ed25519 challenge/response is always required.
+The handshake has three steps. Credentials come from the first `auth` message
+only, and the ed25519 challenge/response is always required.
+
+There is **no `?token=` query parameter**. It was removed: uvicorn's access log
+and nginx's default log format both record the query string, so every
+documented deployment wrote credentials into a plaintext, typically-retained
+log file. A request carrying `?token=` is refused with
+`reason: "unsupported-client"` and a message telling the operator to update the
+client, rather than failing generically or hanging.
 
 ```
 client -> {"type":"auth","token":"<JWT>","device_id":"<DEVICE_ID>"}
@@ -156,6 +162,31 @@ server -> {"type":"connected","device_id":"<DEVICE_ID>","ice_servers":[...]}
 The signed message has the same shape as registration, with `context` =
 `lem-signaling-connect-v1`. The challenge is fresh per connection and never
 reusable. A failure at any step produces an `error` frame and a 1008 close.
+
+The `token` must be an **account access token** — one minted by `/auth/login`
+or `/auth/register`, carrying `scope: "account"`. A relay session grant is
+signed with the same key and carries the same `user_id`, but is refused here
+and at every other account-scoped endpoint.
+
+### Error frames
+
+Every `{"type": "error"}` frame carries a machine-readable `reason` and an
+explicit `retryable` boolean, so a client can tell a transient condition from a
+permanent one **from the frame itself** rather than from a close code that
+arrives separately and may not arrive at all if the socket drops.
+
+| `reason` | `retryable` | Meaning |
+| --- | --- | --- |
+| `auth-failed` | false | Token missing, malformed, expired, not account-scoped, or the device is not yours |
+| `device-key-verification-failed` | false | The ed25519 signature over the challenge did not verify |
+| `protocol-error` | false | Bad handshake frame, bad JSON, or an oversized message |
+| `unsupported-client` | false | Client used the removed `?token=` path |
+| `same-device` | false | A relay session needs two distinct devices |
+| `target-unavailable` | **true** | Target does not exist, is not yours, or is offline |
+| `internal-error` | **true** | Server-side failure handling the message |
+
+Branch on `retryable` (or on `reason`), never on `message` — the wording may
+change.
 
 ### Message Format
 
@@ -199,9 +230,9 @@ The server will route the message to the target device and send an acknowledgmen
 
 **Every message is routed only to a device the authenticated user owns.**
 Naming any other device answers `{"type":"error","message":"Target device is
-not available"}` — the same answer given for a device that does not exist and
-for one of your own that is offline, so the endpoint cannot be used to probe
-who is online.
+not available","reason":"target-unavailable","retryable":true}` — the same
+answer given for a device that does not exist and for one of your own that is
+offline, so the endpoint cannot be used to probe who is online.
 
 ### Relay Coordination
 
@@ -267,6 +298,9 @@ is not accepted by the relay.
 - Passwords hashed with bcrypt; inputs over bcrypt's 72-byte limit are
   rejected rather than silently truncated
 - JWT tokens for authentication (HS256), algorithm pinned, `exp` required
+- Every token carries a `scope` claim and every consumer requires the scope it
+  needs, so a relay session grant can never stand in for an account token
+- Credentials are never accepted from a URL, so they never reach an access log
 - Token expiration: 24 hours
 - `SECRET_KEY` and `CORS_ORIGINS` are mandatory; the published example keys
   and wildcard CORS are refused outright

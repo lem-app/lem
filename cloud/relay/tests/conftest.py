@@ -31,6 +31,7 @@ os.environ.setdefault("CORS_ORIGINS", "http://localhost:5173")
 
 import time  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 from datetime import UTC, datetime, timedelta  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -75,6 +76,28 @@ def client() -> Iterator[TestClient]:
     """
     with TestClient(app) as test_client:
         yield test_client
+
+
+@contextmanager
+def relay_connect(
+    client: TestClient, session_id: str, grant: str
+) -> Iterator[WebSocketTestSession]:
+    """Open a relay socket and present a grant in the auth message.
+
+    The ``?token=`` query path is gone, so every test drives the same
+    first-message handshake a real client now has to use.
+
+    Args:
+        client: Test client.
+        session_id: Session to connect to.
+        grant: Grant to present.
+
+    Yields:
+        The connected WebSocket test session.
+    """
+    with client.websocket_connect(f"/relay/{session_id}") as websocket:
+        websocket.send_json({"type": "auth", "token": grant})
+        yield websocket
 
 
 def expect_closed(websocket: WebSocketTestSession) -> list[Any]:

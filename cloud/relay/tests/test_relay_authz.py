@@ -33,6 +33,7 @@ from tests.conftest import (
     expect_closed,
     make_account_token,
     make_grant,
+    relay_connect,
     wait_until,
 )
 
@@ -52,7 +53,7 @@ def assert_rejected(client: TestClient, session_id: str, token: str) -> None:
         session_id: Session id to attempt.
         token: Token to present.
     """
-    with client.websocket_connect(f"/relay/{session_id}?token={token}") as websocket:
+    with relay_connect(client, session_id, token) as websocket:
         # The server replies with an error frame and then closes.
         expect_closed(websocket)
 

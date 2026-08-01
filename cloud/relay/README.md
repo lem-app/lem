@@ -45,9 +45,14 @@ curl http://localhost:8001/health
 
 Connect to: `ws://localhost:8001/relay/{session_id}`
 
-Authenticate with either:
-- a `?token={grant}` query parameter (deprecated: grants end up in logs), or
-- a first text frame `{"type": "auth", "token": "{grant}"}`
+Authenticate with a first text frame `{"type": "auth", "token": "{grant}"}`.
+
+There is **no `?token=` query parameter**. It was removed: uvicorn's access log
+and nginx's default log format both record the query string, so every
+documented deployment wrote credentials into a plaintext, typically-retained
+log file. A request carrying `?token=` is refused with
+`reason: "unsupported-client"` and a message telling the operator to update the
+client, rather than failing generically or hanging.
 
 The `{grant}` is **not an account access token**. It is the `relay_token` the
 signaling server returned in `connect-request-sent` (to the requester) or
@@ -61,12 +66,39 @@ rejected. The grant carries:
 | `device_id` | The device permitted to present this grant. |
 | `peer_device_id` | The only device permitted on the other side. |
 | `user_id` | The account owning both devices. |
-| `jti` | Unique id; a grant is redeemable once per session. |
+| `jti` | Unique id; a grant is redeemable **once**, for its whole validity window. |
 | `exp` | Required. Short-lived (120s by default). |
 
 The relay enforces that both connections in a session carry the same
 `user_id` and the same `{device_id, peer_device_id}` pair, that no device
 occupies both slots, and that a third connection is refused outright.
+
+Redemption of a `jti` is tracked by the session **manager**, not by the session
+object, so a grant stays spent for its full TTL. Tearing the session down does
+not make the same grant usable again.
+
+### Error frames
+
+Every `{"type": "error"}` frame carries a machine-readable `reason` and an
+explicit `retryable` boolean, so a client can tell a transient condition from a
+permanent one **from the frame itself** rather than from a close code that
+arrives separately and may not arrive at all if the socket drops.
+
+| `reason` | `retryable` | Close | Meaning |
+| --- | --- | --- | --- |
+| `auth-failed` | false | 1008 | Grant missing, malformed, expired, wrongly scoped, or for another session |
+| `grant-already-used` | false | 1008 | This `jti` has been redeemed |
+| `session-mismatch` | false | 1008 | Grant names another account or device pair |
+| `session-full` | false | 1008 | Both slots occupied |
+| `device-already-connected` | false | 1008 | This device already holds a slot |
+| `session-closed` | false | 1008 | Session torn down mid-admission |
+| `protocol-error` | false | 1008/1009 | Bad first frame, bad JSON, oversized frame |
+| `unsupported-client` | false | 1008 | Client used the removed `?token=` path |
+| `relay-at-capacity` | **true** | 1013 | No room for another session right now |
+| `account-session-limit` | **true** | 1013 | This account is at its concurrent-session cap |
+
+Branch on `retryable` (or on `reason`), never on `message` — the wording may
+change.
 
 Both sides must connect within `PAIR_TIMEOUT` (30s by default); the first to
 arrive buffers up to `MAX_PREPAIR_BUFFER_BYTES` while it waits and is
@@ -89,10 +121,12 @@ GRANT_A="<relay_token from connect-request-sent>"
 GRANT_B="<relay_token from connect-request-received>"
 
 # Terminal 1 (requesting device)
-wscat -c "ws://localhost:8001/relay/$SESSION?token=$GRANT_A"
+wscat -c "ws://localhost:8001/relay/$SESSION"
+# then paste: {"type":"auth","token":"<GRANT_A>"}
 
 # Terminal 2 (target device)
-wscat -c "ws://localhost:8001/relay/$SESSION?token=$GRANT_B"
+wscat -c "ws://localhost:8001/relay/$SESSION"
+# then paste: {"type":"auth","token":"<GRANT_B>"}
 ```
 
 Note that the tunnel carries **binary** frames; wscat's text input is only

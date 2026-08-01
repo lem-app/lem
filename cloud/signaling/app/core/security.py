@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt
-from jose import jwt
+from jose import JWTError, jwt
 
 from .config import settings
 
@@ -30,10 +30,28 @@ from .config import settings
 # enforces the same bound so callers get a 422 instead of a 500.
 BCRYPT_MAX_PASSWORD_BYTES = 72
 
+# Every token this service mints carries a "scope" claim naming what it is for,
+# and every consumer asserts the scope it *requires* rather than checking that
+# some wrong scope is absent. Absence-checking fails open the moment a third
+# token type is introduced; requiring the right scope fails closed by default.
+#
+# Scope claim on an ordinary account access token: the credential minted by
+# /auth/register and /auth/login that proves "I am this account holder".
+ACCOUNT_TOKEN_SCOPE = "account"
+
 # Scope claim identifying a short-lived relay session grant. A grant is not an
 # account token: it authorizes exactly one device to join exactly one relay
 # session with exactly one peer.
 RELAY_GRANT_SCOPE = "relay-session"
+
+
+class TokenScopeError(JWTError):
+    """Raised when a token verifies but was minted for a different purpose.
+
+    Subclasses ``JWTError`` so that call sites which already treat a bad token
+    as an authentication failure cannot accidentally let a wrongly-scoped one
+    through.
+    """
 
 
 class PasswordTooLongError(ValueError):
@@ -99,21 +117,29 @@ def create_access_token(data: dict[str, Any], expires_delta: timedelta | None = 
         expire = datetime.now(UTC) + timedelta(
             minutes=settings.access_token_expire_minutes
         )
-    to_encode.update({"exp": expire})
+    # Stamped unconditionally, after the copy, so a caller cannot mint an
+    # account token wearing some other scope by passing one in ``data``.
+    to_encode.update({"exp": expire, "scope": ACCOUNT_TOKEN_SCOPE})
     encoded_jwt: str = jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
     return encoded_jwt
 
 
-def decode_access_token(token: str) -> dict[str, Any]:
-    """Decode and verify a JWT access token.
+def decode_token(token: str, *, expected_scope: str) -> dict[str, Any]:
+    """Decode a JWT and require it to carry exactly the scope asked for.
+
+    This is the only decoding primitive in the service. There is deliberately
+    no way to obtain a verified payload without having named the scope it must
+    have, so a token minted for one purpose can never satisfy another.
 
     Args:
         token: JWT token to decode.
+        expected_scope: The scope claim the caller requires.
 
     Returns:
         Decoded token payload.
 
     Raises:
+        TokenScopeError: If the token carries a different scope, or none.
         JWTError: If token is invalid, expired, or carries no expiry.
     """
     payload: dict[str, Any] = jwt.decode(
@@ -125,7 +151,31 @@ def decode_access_token(token: str) -> dict[str, Any]:
         # {"require": ["exp"]} is silently ignored here.
         options={"require_exp": True},
     )
+
+    scope = payload.get("scope")
+    if scope != expected_scope:
+        raise TokenScopeError(f"Token has scope {scope!r}, but {expected_scope!r} is required here")
     return payload
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    """Decode and verify an account access token.
+
+    Rejects anything that is not account-scoped — in particular a relay session
+    grant, which is signed with the same key and carries the same ``user_id``,
+    but is only meant to open one relay socket for 120 seconds.
+
+    Args:
+        token: JWT token to decode.
+
+    Returns:
+        Decoded token payload.
+
+    Raises:
+        JWTError: If the token is invalid, expired, carries no expiry, or is
+            not an account token.
+    """
+    return decode_token(token, expected_scope=ACCOUNT_TOKEN_SCOPE)
 
 
 def new_relay_session_id() -> str:

@@ -32,6 +32,7 @@ from typing import Any
 from fastapi import WebSocket, status
 
 from .config import settings
+from .errors import ErrorReason
 from .security import SessionGrant
 
 logger = logging.getLogger(__name__)
@@ -49,16 +50,26 @@ _PAIR_POLL_SECONDS = 0.25
 class JoinRejectedError(Exception):
     """Raised when a connection may not join the session it asked for."""
 
-    def __init__(self, reason: str, code: int = status.WS_1008_POLICY_VIOLATION) -> None:
+    def __init__(
+        self,
+        reason: str,
+        code: int = status.WS_1008_POLICY_VIOLATION,
+        reason_code: str = ErrorReason.AUTH_FAILED,
+        retryable: bool = False,
+    ) -> None:
         """Initialize the rejection.
 
         Args:
             reason: Human-readable reason, safe to send to the client.
             code: WebSocket close code to use.
+            reason_code: Machine-readable reason for the client to branch on.
+            retryable: Whether reconnecting later could succeed.
         """
         super().__init__(reason)
         self.reason = reason
         self.code = code
+        self.reason_code = reason_code
+        self.retryable = retryable
 
 
 @dataclass
@@ -99,7 +110,6 @@ class RelaySession:
         self.created_at = datetime.now(UTC)
         self.bytes_forwarded: dict[str, int] = {}
         self._connections: dict[str, RelayConnection] = {}
-        self._redeemed_jti: set[str] = set()
         self._closed = False
         self._stats_logged = False
 
@@ -126,27 +136,34 @@ class RelaySession:
             JoinRejectedError: If the grant does not authorize this session slot.
         """
         if self._closed:
-            raise JoinRejectedError("Session is closed")
+            raise JoinRejectedError(
+                "Session is closed", reason_code=ErrorReason.SESSION_CLOSED
+            )
 
         # Every grant for a session must describe the same user and the same
         # pair of devices. A grant minted for some other conversation cannot
         # be redirected into this one.
         if grant.user_id != self.user_id or grant.device_pair != self.device_pair:
-            raise JoinRejectedError("Grant does not match this session")
-
-        if grant.jti in self._redeemed_jti:
-            raise JoinRejectedError("Grant has already been used")
+            raise JoinRejectedError(
+                "Grant does not match this session",
+                reason_code=ErrorReason.SESSION_MISMATCH,
+            )
 
         if grant.device_id in self._connections:
-            raise JoinRejectedError("Device is already connected to this session")
+            raise JoinRejectedError(
+                "Device is already connected to this session",
+                reason_code=ErrorReason.DEVICE_ALREADY_CONNECTED,
+            )
 
         # A session has exactly two sides. A third socket used to park in a
         # sleep loop forever; it is now refused outright.
         if self.is_paired:
-            raise JoinRejectedError("Session already has two connections")
+            raise JoinRejectedError(
+                "Session already has two connections",
+                reason_code=ErrorReason.SESSION_FULL,
+            )
 
         connection = RelayConnection(grant=grant, websocket=websocket)
-        self._redeemed_jti.add(grant.jti)
         self._connections[grant.device_id] = connection
         logger.info(
             f"Session {self.session_id}: device {grant.device_id} joined "
@@ -328,6 +345,11 @@ class SessionManager:
     def __init__(self) -> None:
         """Initialize session manager."""
         self._sessions: dict[str, RelaySession] = {}
+        # jti -> the grant's own expiry, as a unix timestamp. Redemption has to
+        # outlive the session it opened: it used to be tracked on the
+        # RelaySession, so tearing a session down forgot that a grant had been
+        # spent and the same grant worked again for the rest of its TTL.
+        self._redeemed_jti: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
     async def join(
@@ -344,27 +366,70 @@ class SessionManager:
             Tuple of (session, this client's connection).
 
         Raises:
-            JoinRejectedError: If the session is full, capped, or not the caller's.
+            JoinRejectedError: If the session is full, capped, replayed, or not
+                the caller's.
         """
         async with self._lock:
+            # Checked before anything else, and before the session object
+            # exists, so a replay cannot even create a session.
+            self._reject_if_redeemed(grant)
+
             session = self._sessions.get(session_id)
 
             if session is None:
                 if len(self._sessions) >= settings.max_sessions:
                     raise JoinRejectedError(
-                        "Relay is at capacity", code=status.WS_1013_TRY_AGAIN_LATER
+                        "Relay is at capacity",
+                        code=status.WS_1013_TRY_AGAIN_LATER,
+                        reason_code=ErrorReason.RELAY_AT_CAPACITY,
+                        retryable=True,
                     )
                 if self._user_session_count(grant.user_id) >= settings.max_sessions_per_user:
                     raise JoinRejectedError(
                         "Too many concurrent relay sessions for this account",
                         code=status.WS_1013_TRY_AGAIN_LATER,
+                        reason_code=ErrorReason.ACCOUNT_SESSION_LIMIT,
+                        retryable=True,
                     )
                 session = RelaySession(session_id, grant.user_id, grant.device_pair)
                 self._sessions[session_id] = session
                 logger.info(f"Created session {session_id} for user {grant.user_id}")
 
             connection = session.join(grant, websocket)
+            # Spent only once the join has actually succeeded, so a rejection
+            # for some other reason does not burn a grant the client may still
+            # legitimately use against the right session.
+            self._redeemed_jti[grant.jti] = grant.expires_at
             return session, connection
+
+    def _reject_if_redeemed(self, grant: SessionGrant) -> None:
+        """Refuse a grant whose jti has already been spent.
+
+        Args:
+            grant: Verified grant presented by the client.
+
+        Raises:
+            JoinRejectedError: If this grant has been redeemed before.
+        """
+        self._prune_redeemed()
+        if grant.jti in self._redeemed_jti:
+            raise JoinRejectedError(
+                "Grant has already been used",
+                reason_code=ErrorReason.GRANT_ALREADY_USED,
+            )
+
+    def _prune_redeemed(self) -> None:
+        """Forget spent grants that have expired.
+
+        An expired grant is refused by ``decode_session_grant`` anyway, so
+        remembering it past its expiry buys nothing and would grow without
+        bound. This keeps the set no larger than the grants redeemed within one
+        grant TTL.
+        """
+        now = time.time()
+        expired = [jti for jti, expires_at in self._redeemed_jti.items() if expires_at <= now]
+        for jti in expired:
+            del self._redeemed_jti[jti]
 
     async def leave(self, session_id: str, session: RelaySession) -> None:
         """Close a session and drop it from the registry.
@@ -399,8 +464,9 @@ class SessionManager:
         return sum(1 for session in self._sessions.values() if session.user_id == user_id)
 
     def reset(self) -> None:
-        """Drop all sessions without closing them. Used by tests."""
+        """Drop all sessions and redeemed grants without closing them. Used by tests."""
         self._sessions.clear()
+        self._redeemed_jti.clear()
 
 
 # Global session manager instance. One per worker process: there is no shared

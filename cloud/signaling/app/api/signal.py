@@ -23,11 +23,12 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from jose import JWTError
 
 from ..core.config import settings
 from ..core.crypto import SIGNAL_CONTEXT, new_challenge, verify_signature
+from ..core.errors import RETRYABLE_REASONS, ErrorReason
 from ..core.ratelimit import signal_connect_limiter
 from ..core.security import (
     create_relay_grant,
@@ -51,6 +52,16 @@ AUTH_TIMEOUT_SECONDS = 10.0
 # "device offline" would turn this endpoint into a presence oracle for devices
 # the caller does not own.
 TARGET_UNAVAILABLE = "Target device is not available"
+
+# Told to a client that still puts its credential in the query string. It is a
+# distinct, actionable message rather than a generic auth failure, because the
+# cure is upgrading the client and nothing the user does will help.
+UPGRADE_REQUIRED_MESSAGE = (
+    "This signaling server no longer accepts ?token= credentials. Update your "
+    'Lem client: send {"type":"auth","token":"<JWT>","device_id":"<id>"} as the '
+    "first message, then answer the challenge frame with an ed25519 "
+    "auth-response."
+)
 
 
 @contextlib.asynccontextmanager
@@ -303,49 +314,62 @@ async def receive_json_message(websocket: WebSocket, timeout: float | None = Non
         raise ValueError(f"Invalid JSON: {e}") from e
 
 
-async def authenticate_connection(
-    websocket: WebSocket, token: str | None, device_id: str | None
-) -> tuple[int, str] | None:
+async def authenticate_connection(websocket: WebSocket) -> tuple[int, str] | None:
     """Authenticate a signaling connection and prove device key possession.
+
+    Credentials are only ever read from the ``auth`` message. The old
+    ``?token=`` query parameter is gone: it put a credential in the request
+    line, where uvicorn's access log and nginx's default log format both
+    record it in plaintext on every documented deployment.
 
     Args:
         websocket: Accepted WebSocket connection.
-        token: JWT from the query string, if supplied.
-        device_id: Device id from the query string, if supplied.
 
     Returns:
         Tuple of (user_id, device_id) on success, None if the socket was closed.
     """
-    auth_token = token
-    auth_device_id = device_id
+    try:
+        auth_msg = await receive_json_message(websocket, timeout=AUTH_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning("Auth timeout - no auth message received")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return None
+    except ValueError as e:
+        await close_with_error(
+            websocket, f"Invalid auth message: {e}", ErrorReason.PROTOCOL_ERROR
+        )
+        return None
+
+    if not isinstance(auth_msg, dict) or auth_msg.get("type") != "auth":
+        await close_with_error(
+            websocket, "First message must be auth message", ErrorReason.PROTOCOL_ERROR
+        )
+        return None
+
+    auth_token = auth_msg.get("token")
+    auth_device_id = auth_msg.get("device_id")
+
+    if not isinstance(auth_token, str) or not isinstance(auth_device_id, str):
+        await close_with_error(
+            websocket,
+            "Auth message missing token or device_id",
+            ErrorReason.PROTOCOL_ERROR,
+        )
+        return None
 
     if not auth_token or not auth_device_id:
-        try:
-            auth_msg = await receive_json_message(websocket, timeout=AUTH_TIMEOUT_SECONDS)
-        except TimeoutError:
-            logger.warning("Auth timeout - no auth message received")
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return None
-        except ValueError as e:
-            await close_with_error(websocket, f"Invalid auth message: {e}")
-            return None
-
-        if not isinstance(auth_msg, dict) or auth_msg.get("type") != "auth":
-            await close_with_error(websocket, "First message must be auth message")
-            return None
-
-        auth_token = auth_msg.get("token")
-        auth_device_id = auth_msg.get("device_id")
-
-        if not auth_token or not auth_device_id:
-            await close_with_error(websocket, "Auth message missing token or device_id")
-            return None
+        await close_with_error(
+            websocket,
+            "Auth message missing token or device_id",
+            ErrorReason.PROTOCOL_ERROR,
+        )
+        return None
 
     try:
         user_id, pubkey = await verify_token_and_device(auth_token, auth_device_id)
     except ValueError as e:
         logger.warning(f"Authentication failed: {e}")
-        await close_with_error(websocket, "Authentication failed")
+        await close_with_error(websocket, "Authentication failed", ErrorReason.AUTH_FAILED)
         return None
 
     # Proof of possession. The account token alone only proves the caller has
@@ -367,11 +391,15 @@ async def authenticate_connection(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return None
     except ValueError as e:
-        await close_with_error(websocket, f"Invalid challenge response: {e}")
+        await close_with_error(
+            websocket, f"Invalid challenge response: {e}", ErrorReason.PROTOCOL_ERROR
+        )
         return None
 
     if not isinstance(response, dict) or response.get("type") != "auth-response":
-        await close_with_error(websocket, "Expected auth-response message")
+        await close_with_error(
+            websocket, "Expected auth-response message", ErrorReason.PROTOCOL_ERROR
+        )
         return None
 
     signature = response.get("signature")
@@ -379,21 +407,48 @@ async def authenticate_connection(
         pubkey, SIGNAL_CONTEXT, auth_device_id, challenge, signature
     ):
         logger.warning(f"Device key proof failed for {auth_device_id} (user {user_id})")
-        await close_with_error(websocket, "Device key verification failed")
+        await close_with_error(
+            websocket,
+            "Device key verification failed",
+            ErrorReason.DEVICE_KEY_VERIFICATION_FAILED,
+        )
         return None
 
     return user_id, auth_device_id
 
 
-async def close_with_error(websocket: WebSocket, message: str) -> None:
-    """Send an error frame then close the connection.
+def error_frame(message: str, reason: str) -> dict[str, Any]:
+    """Build a classified error frame.
+
+    ``reason`` and ``retryable`` travel on the frame itself so a client never
+    has to infer permanence from a close code that arrives separately, and may
+    not arrive at all if the socket drops first.
+
+    Args:
+        message: Human-readable reason.
+        reason: Machine-readable reason code from ``ErrorReason``.
+
+    Returns:
+        The frame to send.
+    """
+    return {
+        "type": "error",
+        "message": message,
+        "reason": reason,
+        "retryable": reason in RETRYABLE_REASONS,
+    }
+
+
+async def close_with_error(websocket: WebSocket, message: str, reason: str) -> None:
+    """Send a classified error frame then close the connection.
 
     Args:
         websocket: Connection to close.
         message: Human-readable reason.
+        reason: Machine-readable reason code from ``ErrorReason``.
     """
     with contextlib.suppress(Exception):
-        await websocket.send_json({"type": "error", "message": message})
+        await websocket.send_json(error_frame(message, reason))
     with contextlib.suppress(Exception):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
 
@@ -418,10 +473,10 @@ async def route_message(
     msg_type = message.get("type")
     if not isinstance(msg_type, str) or not isinstance(target_device_id, str):
         await websocket.send_json(
-            {
-                "type": "error",
-                "message": "Invalid message format: missing type or target_device_id",
-            }
+            error_frame(
+                "Invalid message format: missing type or target_device_id",
+                ErrorReason.PROTOCOL_ERROR,
+            )
         )
         return
 
@@ -431,7 +486,9 @@ async def route_message(
             f"Blocked cross-user routing: device {device_id} (user {user_id}) "
             f"targeted {target_device_id}"
         )
-        await websocket.send_json({"type": "error", "message": TARGET_UNAVAILABLE})
+        await websocket.send_json(
+            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
+        )
         return
 
     if msg_type == "connect-request":
@@ -459,7 +516,9 @@ async def route_message(
         )
     else:
         logger.info(f"Target device {target_device_id} owned but not connected")
-        await websocket.send_json({"type": "error", "message": TARGET_UNAVAILABLE})
+        await websocket.send_json(
+            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
+        )
 
 
 async def handle_connect_request(
@@ -484,7 +543,9 @@ async def handle_connect_request(
     """
     if target_device_id == device_id:
         await websocket.send_json(
-            {"type": "error", "message": "Cannot open a relay session to the same device"}
+            error_frame(
+                "Cannot open a relay session to the same device", ErrorReason.SAME_DEVICE
+            )
         )
         return
 
@@ -504,7 +565,9 @@ async def handle_connect_request(
     delivered = await manager.send_message(target_device_id, notification)
     if not delivered:
         logger.info(f"Target device {target_device_id} owned but not connected")
-        await websocket.send_json({"type": "error", "message": TARGET_UNAVAILABLE})
+        await websocket.send_json(
+            error_frame(TARGET_UNAVAILABLE, ErrorReason.TARGET_UNAVAILABLE)
+        )
         return
 
     logger.info(f"Minted relay session for {device_id} <-> {target_device_id}")
@@ -521,22 +584,19 @@ async def handle_connect_request(
 
 
 @router.websocket("/signal")
-async def websocket_signal_endpoint(
-    websocket: WebSocket,
-    token: str | None = Query(None, description="JWT access token (deprecated, use auth message)"),
-    device_id: str | None = Query(None, description="Device ID (deprecated, use auth message)"),
-) -> None:
+async def websocket_signal_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint for WebRTC signaling.
 
     Handles SDP/ICE message exchange between devices belonging to the same
-    user. The handshake is: optional query credentials or an ``auth`` message,
-    then a server-issued ``challenge`` the client answers with an
-    ``auth-response`` carrying an ed25519 signature.
+    user. The handshake is: an ``auth`` message, then a server-issued
+    ``challenge`` the client answers with an ``auth-response`` carrying an
+    ed25519 signature.
+
+    A request carrying a ``?token=`` query parameter is refused outright with
+    an explicit upgrade message rather than hanging or failing generically.
 
     Args:
         websocket: WebSocket connection.
-        token: JWT access token (optional, deprecated).
-        device_id: Device identifier (optional, deprecated).
     """
     client = websocket.client
     source = client.host if client is not None else "unknown"
@@ -547,8 +607,15 @@ async def websocket_signal_endpoint(
 
     await websocket.accept()
 
+    if "token" in websocket.query_params:
+        logger.warning(f"Refused query-string credential from {source}")
+        await close_with_error(
+            websocket, UPGRADE_REQUIRED_MESSAGE, ErrorReason.UNSUPPORTED_CLIENT
+        )
+        return
+
     try:
-        identity = await authenticate_connection(websocket, token, device_id)
+        identity = await authenticate_connection(websocket)
     except WebSocketDisconnect:
         # A client hanging up mid-handshake is ordinary, not an error.
         logger.info("Client disconnected during signaling handshake")
@@ -580,12 +647,12 @@ async def websocket_signal_endpoint(
                 # than being answered, so a peer cannot keep spending server
                 # time on frames it knows are invalid.
                 logger.warning(f"Closing {verified_device_id}: {e}")
-                await close_with_error(websocket, str(e))
+                await close_with_error(websocket, str(e), ErrorReason.PROTOCOL_ERROR)
                 return
 
             if not isinstance(message, dict):
                 await websocket.send_json(
-                    {"type": "error", "message": "Message must be a JSON object"}
+                    error_frame("Message must be a JSON object", ErrorReason.PROTOCOL_ERROR)
                 )
                 continue
 
@@ -595,7 +662,9 @@ async def websocket_signal_endpoint(
                 raise
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
-                await websocket.send_json({"type": "error", "message": "Internal error"})
+                await websocket.send_json(
+                    error_frame("Internal error", ErrorReason.INTERNAL_ERROR)
+                )
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for device {verified_device_id}")
