@@ -39,7 +39,7 @@ from app.api.v1.auth import router as auth_router
 from app.catalog import get_all_services, get_service_definition
 from app.catalog.models import ServiceCategory, ServiceStatus
 from app.config.platform import ARCH, DOCKER_HOST, IS_WSL, OS_TYPE, PLATFORM
-from app.db import init_db
+from app.db import DB_PATH, init_db
 from app.drivers.clients.openwebui import OPENWEBUI_SERVICE_ID, get_openwebui_url
 from app.drivers.harbor_wrapper import HarborError, check_harbor_installed
 from app.drivers.runners.ollama import (
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Startup: Initialize database
     init_db()
-    logger.info("✓ Database initialized at ~/.lem/lem.db")
+    logger.info(f"✓ Database initialized at {DB_PATH}")
 
     # Startup: Ensure the API token exists (never log the token itself)
     ensure_api_token()

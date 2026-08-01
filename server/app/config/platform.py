@@ -95,8 +95,35 @@ def is_wsl() -> bool:
 PLATFORM: PlatformType = get_platform()
 IS_WSL: bool = is_wsl()
 
+# The install prefix. The installer accepts a custom one and bakes it into the
+# launcher it generates, which exports it before starting the server.
+LEM_HOME_ENV_VAR = "LEM_HOME"
+
+
+def get_lem_home() -> Path:
+    """
+    Return the Lem install prefix.
+
+    Honours $LEM_HOME, which ``~/.lem/bin/lem-server`` exports, so that a
+    relocated install reads its database, API token and Harbor from the prefix
+    it was actually installed to. Without this the server would silently fall
+    back to ~/.lem, leaving real state (including the API token) outside the
+    reach of ``install.sh --uninstall``.
+
+    A blank or whitespace-only value counts as unset.
+
+    Returns:
+        Path to the install prefix (default: ~/.lem)
+    """
+    override = os.getenv(LEM_HOME_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    return Path.home() / ".lem"
+
+
 # Standard paths
-LEM_HOME: Path = Path.home() / ".lem"
+LEM_HOME: Path = get_lem_home()
 HARBOR_DIR: Path = LEM_HOME / "harbor"
 HARBOR_SCRIPT: Path = HARBOR_DIR / "harbor.sh"
 

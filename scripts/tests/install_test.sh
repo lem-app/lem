@@ -422,6 +422,12 @@ assert_not_contains "$launcher" "uvicorn" "uvicorn is never invoked directly"
 assert_contains "$launcher" "config/server.env" "the launcher reads server.env"
 assert_file_test -x "$LEM_HOME/bin/lem-server" "the launcher is executable"
 
+# server/app/config/platform.py falls back to ~/.lem when LEM_HOME is unset, so
+# a relocated install used to run against the *default* prefix: its database and
+# API token landed in ~/.lem, outside anything --uninstall would clean up.
+assert_contains "$launcher" "export LEM_HOME=\"$LEM_HOME\"" \
+  "the launcher exports LEM_HOME so the server uses this prefix"
+
 bash -n "$LEM_HOME/bin/lem-server"
 assert_true $? "the generated launcher parses"
 
@@ -509,6 +515,219 @@ PY
 else
   skip "port probing" "python3 not available"
 fi
+
+# ===========================================================================
+section "the install prefix is validated"
+# ===========================================================================
+
+# LEM_HOME is the argument to every later mkdir and rm. Checking it here rather
+# than trusting the tools: GNU rm refuses `/` because of --preserve-root, and
+# macOS ships BSD rm, which does not.
+validate_status() {
+  (
+    LEM_HOME="$1"
+    [ "$#" -lt 2 ] || HOME="$2"
+    validate_lem_home
+  ) >/dev/null 2>&1
+}
+
+validate_value() {
+  (
+    LEM_HOME="$1"
+    validate_lem_home >/dev/null 2>&1 || exit 1
+    printf '%s' "$LEM_HOME"
+  )
+}
+
+validate_status "$WORK/lemhome"
+assert_true $? "an absolute prefix is accepted"
+
+assert_eq "$WORK/lem home 日本語 🎉" "$(validate_value "$WORK/lem home 日本語 🎉")" \
+  "spaces and unicode are still fine"
+
+assert_eq "/opt/lem" "$(validate_value "/opt/lem///")" "trailing slashes are collapsed"
+
+validate_status ""
+assert_false $? "an empty prefix is rejected"
+
+validate_status "relative/lem"
+assert_false $? "a relative prefix is rejected"
+
+# Was: "mkdir: invalid option -- 'w'". Fails safely either way, but a raw tool
+# error is not the script saying what is wrong.
+out="$( (LEM_HOME="-weirdhome/.lem"; validate_lem_home) 2>&1 )"; status=$?
+assert_false $status "a leading-dash prefix is rejected"
+assert_contains "$out" "absolute path" "and the rejection explains why"
+
+out="$( (LEM_HOME="/"; validate_lem_home) 2>&1 )"; status=$?
+assert_false $status "LEM_HOME=/ is rejected by the script itself"
+assert_contains "$out" "Refusing" "and says so in Lem's own words"
+
+validate_status "//"
+assert_false $? "LEM_HOME=// is rejected too"
+
+validate_status "$WORK/fakehome" "$WORK/fakehome"
+assert_false $? "LEM_HOME=\$HOME is rejected"
+
+validate_status "$WORK/fakehome/" "$WORK/fakehome"
+assert_false $? "...however it is spelled"
+
+# ===========================================================================
+section "uninstall refuses a directory Lem did not create"
+# ===========================================================================
+
+# The CRITICAL finding: --uninstall ran `rm -rf $LEM_HOME` with no check that
+# Lem had ever put anything there. Pointed at a directory of documents, with
+# --yes (what every scripted invocation uses), it deleted all of it.
+foreign="$WORK/important_stuff"
+mkdir -p "$foreign/Documents" "$foreign/.ssh"
+printf 'PRIVATE KEY DATA\n' >"$foreign/.ssh/id_rsa"
+printf 'my irreplaceable photos\n' >"$foreign/Documents/photo_manifest.txt"
+
+is_lem_install "$foreign"
+assert_false $? "a directory with no install.env is not a Lem install"
+
+is_lem_install "$WORK/never-existed"
+assert_false $? "a directory that does not exist is not a Lem install"
+
+# A real install: install.env written by write_install_env, naming itself.
+make_fake_install() {
+  local root="$1"
+  mkdir -p "$root/bin" "$root/config" "$root/data" "$root/logs" "$root/run" "$root/harbor"
+  (
+    LEM_HOME="$root"
+    SERVER_DIR="$root/src/server"
+    LEM_PLATFORM="linux"
+    LEM_IS_WSL=0
+    LEM_ARCH="testarch"
+    # shellcheck disable=SC2034  # read by write_install_env, from install.sh.
+    LEM_SERVICE="none"
+    # shellcheck disable=SC2034  # ditto.
+    LEM_SOURCE_MODE="download"
+    DRY_RUN=0
+    write_install_env
+  )
+  printf 'token\n' >"$root/api_token"
+  printf 'db\n' >"$root/lem.db"
+  printf '#!/bin/sh\n' >"$root/bin/lem-server"
+}
+
+real="$WORK/realinstall"
+make_fake_install "$real"
+
+is_lem_install "$real"
+assert_true $? "a directory carrying our install.env is recognised"
+
+# An install.env copied in from somewhere else still names the other prefix.
+cp "$real/config/install.env" "$foreign/config-install.env" 2>/dev/null
+mkdir -p "$foreign/config"
+cp "$real/config/install.env" "$foreign/config/install.env"
+is_lem_install "$foreign"
+assert_false $? "an install.env recording a different prefix does not count"
+rm -rf "$foreign/config" "$foreign/config-install.env"
+
+grep -v LEM_INSTALL_FORMAT "$real/config/install.env" >"$WORK/no-format.env"
+mkdir -p "$WORK/noformat/config"
+sed "s|^LEM_HOME=.*|LEM_HOME=\"$WORK/noformat\"|" "$WORK/no-format.env" \
+  >"$WORK/noformat/config/install.env"
+is_lem_install "$WORK/noformat"
+assert_false $? "an install.env without a known format version does not count"
+
+# --- the whole uninstall, end to end ---------------------------------------
+#
+# HOME (and everything that can point outside it) is redirected, and `have` is
+# stubbed so systemctl/launchctl count as absent: the refusal has to happen
+# before any of that, and this test must not be able to reach the developer's
+# own session, service manager or rc files even when it does not.
+run_uninstall_isolated() {
+  (
+    HOME="$WORK/fakehome"
+    # shellcheck disable=SC2034  # both are read by uninstall(), from install.sh.
+    XDG_CONFIG_HOME="$WORK/fakehome/.config"
+    # shellcheck disable=SC2034  # ditto.
+    ZDOTDIR="$WORK/fakehome"
+    LEM_HOME="$1"
+    ASSUME_YES=1
+    DRY_RUN=0
+    MODE="uninstall"
+    # shellcheck disable=SC2317  # called indirectly, by uninstall().
+    have() { case "$1" in systemctl|launchctl) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    uninstall
+  )
+}
+
+mkdir -p "$WORK/fakehome"
+out="$(run_uninstall_isolated "$foreign" 2>&1)"; status=$?
+assert_false $status "--uninstall on a foreign directory exits non-zero"
+assert_contains "$out" "not a Lem install" "and says exactly why"
+assert_file_test -f "$foreign/.ssh/id_rsa" "the foreign .ssh/id_rsa survives"
+assert_file_test -f "$foreign/Documents/photo_manifest.txt" "the foreign document survives"
+assert_eq "PRIVATE KEY DATA" "$(cat "$foreign/.ssh/id_rsa")" "byte-for-byte"
+assert_not_contains "$out" "Removed" "nothing is reported as removed"
+
+# A file where the prefix should be is refused rather than unlinked.
+printf 'not a directory\n' >"$WORK/prefix-is-a-file"
+out="$(run_uninstall_isolated "$WORK/prefix-is-a-file" 2>&1)"; status=$?
+assert_false $status "--uninstall on a plain file exits non-zero"
+assert_file_test -f "$WORK/prefix-is-a-file" "and the file is still there"
+
+# ===========================================================================
+section "uninstall removes what it installed, by name"
+# ===========================================================================
+
+make_fake_install "$WORK/mixed"
+printf 'not ours\n' >"$WORK/mixed/somebody-elses-notes.txt"
+mkdir -p "$WORK/mixed/their_dir"
+
+out="$(run_uninstall_isolated "$WORK/mixed" 2>&1)"; status=$?
+assert_true $status "--uninstall on a real install succeeds"
+assert_not_file_test -e "$WORK/mixed/api_token" "the API token is removed"
+assert_not_file_test -e "$WORK/mixed/lem.db" "the database is removed"
+assert_not_file_test -e "$WORK/mixed/bin" "bin/ is removed"
+assert_not_file_test -e "$WORK/mixed/config" "config/ is removed"
+assert_file_test -f "$WORK/mixed/somebody-elses-notes.txt" "an unrecognised file is kept"
+assert_file_test -d "$WORK/mixed/their_dir" "an unrecognised directory is kept"
+assert_contains "$out" "did not install" "and the leftovers are reported"
+
+# With nothing unrecognised in it, the prefix itself goes.
+make_fake_install "$WORK/clean"
+run_uninstall_isolated "$WORK/clean" >/dev/null 2>&1
+assert_true $? "--uninstall on a clean install succeeds"
+assert_not_file_test -e "$WORK/clean" "and the prefix is gone"
+
+# ===========================================================================
+section "the start lock"
+# ===========================================================================
+
+# Two concurrent runs each saw "not healthy yet", each launched a server, and
+# the PID file kept only the last writer: the other survived lem stop AND
+# --uninstall, holding the port with its source deleted underneath it.
+LEM_HOME="$WORK/locked"
+DRY_RUN=0
+LOCK_DIR=""
+mkdir -p "$LEM_HOME/run"
+
+lock_acquire
+assert_true $? "the lock is acquired"
+assert_file_test -d "$LEM_HOME/run/lock" "the lock directory exists"
+assert_eq "$$" "$(cat "$LEM_HOME/run/lock/pid" 2>/dev/null)" "it records the holder's pid"
+
+(LOCK_TIMEOUT=2; LOCK_DIR=""; lock_acquire) >/dev/null 2>&1
+assert_false $? "a second run cannot take a lock that is held"
+
+lock_release
+assert_not_file_test -e "$LEM_HOME/run/lock" "releasing removes it"
+lock_release
+assert_true $? "releasing twice is harmless"
+
+# A lock left behind by a killed process must not wedge every later run.
+dead="$(sh -c 'printf "%s" "$$"')"
+mkdir -p "$LEM_HOME/run/lock"
+printf '%s\n' "$dead" >"$LEM_HOME/run/lock/pid"
+# shellcheck disable=SC2034  # both are read by lock_acquire, from install.sh.
+(LOCK_TIMEOUT=10; LOCK_DIR=""; lock_acquire) >/dev/null 2>&1
+assert_true $? "a lock whose holder is gone is reclaimed"
+rm -rf "$LEM_HOME/run/lock"
 
 # ===========================================================================
 section "the CLI refuses to guess"

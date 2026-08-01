@@ -43,8 +43,12 @@
 #   ~/.lem/{data,logs,run}/ runtime state
 #   a systemd --user unit (Linux) or a LaunchAgent (macOS), unless --no-service
 #
-#   Nothing is installed as root. No sudo. Everything lands under $HOME, and
-#   `--uninstall` removes all of it.
+#   Nothing is installed as root. No sudo. Everything lands under $HOME.
+#
+#   `--uninstall` removes what this installer put there, by name, and only
+#   after ~/.lem/config/install.env proves this installer created it. It never
+#   rm -rf's a directory it does not recognise, and anything else living in the
+#   prefix is reported and left behind.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -68,6 +72,33 @@ LEM_PORT="${LEM_PORT:-5142}"
 
 # Files that must exist for a directory to count as a Lem source tree.
 readonly SOURCE_MARKERS=("server/pyproject.toml" "scripts/install.sh" "scripts/lem")
+
+# The file that proves a directory is a Lem install, written at the end of every
+# install by write_install_env(). --uninstall refuses to remove a directory that
+# does not carry it -- the same discipline SOURCE_MARKERS applies to --source,
+# which existed so that "an unrelated directory can never be mistaken" for
+# something Lem owns. Uninstall used to skip that check and rm -rf $LEM_HOME on
+# nothing more than the variable pointing there.
+readonly INSTALL_MARKER="config/install.env"
+
+# Everything the installer and the server create inside $LEM_HOME. Uninstall
+# removes these by name and then rmdir's the prefix, so anything else in there
+# is reported and left alone rather than swept away with the rest.
+readonly LEM_HOME_ENTRIES=(
+  "api_token"
+  "bin"
+  "config"
+  "data"
+  "harbor"
+  "harbor.previous"
+  "lem.db"
+  "lem.db-shm"
+  "lem.db-wal"
+  "logs"
+  "run"
+  "src"
+  "src.previous"
+)
 
 # Overridable so the test suite can point the WSL probe at a fixture.
 LEM_PROC_VERSION="${LEM_PROC_VERSION:-/proc/version}"
@@ -93,6 +124,7 @@ LEM_SERVICE="none"
 UV_BIN=""
 SERVER_DIR=""
 TMP_ROOT=""
+LOCK_DIR=""
 
 # ---------------------------------------------------------------------------
 # Output
@@ -139,11 +171,155 @@ write_file() {
 }
 
 cleanup() {
+  lock_release
   if [ -n "$TMP_ROOT" ] && [ -d "$TMP_ROOT" ]; then
     rm -rf "$TMP_ROOT"
   fi
 }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# The install prefix
+# ---------------------------------------------------------------------------
+
+# Normalise $LEM_HOME and refuse the values that make a later removal
+# catastrophic. This is a check in the script on purpose: GNU rm's
+# --preserve-root default is what stopped `LEM_HOME=/` in testing, and macOS --
+# which this installer supports -- ships BSD rm, which has no equivalent. A
+# safety net that only exists on half the supported platforms is not a safety
+# net. Also turns a leading-dash prefix into a real error message instead of
+# "mkdir: invalid option -- 'w'".
+validate_lem_home() {
+  [ -n "$LEM_HOME" ] || die "LEM_HOME is empty. Unset it, or give it a path."
+
+  case "$LEM_HOME" in
+    /*) ;;
+    *)  die "LEM_HOME must be an absolute path, not: $LEM_HOME" ;;
+  esac
+
+  # Collapse trailing slashes so "/x/" and "/x" can never disagree later.
+  while [ "$LEM_HOME" != "/" ] && [ "${LEM_HOME%/}" != "$LEM_HOME" ]; do
+    LEM_HOME="${LEM_HOME%/}"
+  done
+
+  [ "$LEM_HOME" != "/" ] ||
+    die "Refusing to use / as the install prefix."
+
+  local home="${HOME:-}"
+  while [ -n "$home" ] && [ "$home" != "/" ] && [ "${home%/}" != "$home" ]; do
+    home="${home%/}"
+  done
+  if [ -n "$home" ] && [ "$LEM_HOME" = "$home" ]; then
+    die "Refusing to use your home directory as the install prefix.
+    Lem needs a directory of its own, e.g. LEM_HOME=$home/.lem"
+  fi
+}
+
+# Physical path of $1, or $1 unchanged when it is not a directory. Used to
+# compare two spellings of the same place (trailing slash, symlink, ..).
+resolve_dir() {
+  (cd -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# Read one key out of install.env WITHOUT sourcing it: uninstall must not
+# execute the contents of a directory it has not decided to trust yet.
+marker_value() {
+  local file="$1" key="$2" line
+  line="$(grep -m 1 "^$key=" "$file" 2>/dev/null || true)"
+  line="${line#*=}"
+  line="${line#\"}"
+  line="${line%\"}"
+  printf '%s\n' "$line"
+}
+
+# True when $1 is a directory this installer created: it carries a readable
+# install.env, in a format we understand, recording $1 as its own prefix.
+is_lem_install() {
+  local dir="$1" marker="$1/$INSTALL_MARKER" recorded
+
+  [ -d "$dir" ] || return 1
+  [ -r "$marker" ] || return 1
+  [ "$(marker_value "$marker" LEM_INSTALL_FORMAT)" = "1" ] || return 1
+
+  recorded="$(marker_value "$marker" LEM_HOME)"
+  [ -n "$recorded" ] || return 1
+  [ "$(resolve_dir "$recorded")" = "$(resolve_dir "$dir")" ] || return 1
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Lock
+# ---------------------------------------------------------------------------
+#
+# mkdir is the portable atomic test-and-set: flock(1) is util-linux and does not
+# exist on macOS. The holder's pid goes inside, so a lock left behind by a
+# killed process can be identified and reclaimed instead of wedging every later
+# run. Without this, two installs (or an install and a `lem start`) each passed
+# their own "not healthy yet" check, each launched a server, and only the last
+# one to write the PID file could ever be stopped again -- the other survived
+# both `lem stop` and `--uninstall`.
+
+LOCK_TIMEOUT=180
+
+lock_acquire() {
+  local dir="$LEM_HOME/run/lock" waited=0 holder announced=0 blank=0
+
+  [ "$DRY_RUN" -eq 0 ] || return 0
+
+  mkdir -p "${dir%/*}" || die "Cannot create ${dir%/*}"
+
+  while [ "$waited" -lt "$LOCK_TIMEOUT" ]; do
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid"
+      LOCK_DIR="$dir"
+      return 0
+    fi
+
+    holder="$(cat "$dir/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*) holder="" ;;
+    esac
+    sleep 1
+    waited=$((waited + 1))
+
+    if [ -z "$holder" ]; then
+      # No readable pid: either a leftover from a crash, or a winner that
+      # has not written its pid yet (a window of microseconds). Reclaim only
+      # after seeing it twice, so the second case resolves itself.
+      blank=$((blank + 1))
+      if [ "$blank" -ge 2 ]; then
+        rm -rf "$dir"
+        blank=0
+      fi
+      continue
+    fi
+    blank=0
+
+    if ! kill -0 "$holder" 2>/dev/null; then
+      # Re-read before reclaiming: if another run got there first the pid has
+      # changed, and this one simply waits for it like any other holder.
+      if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$holder" ]; then
+        rm -rf "$dir"
+      fi
+      continue
+    fi
+
+    if [ "$announced" -eq 0 ]; then
+      info "Waiting for another Lem run (pid $holder) to finish"
+      announced=1
+    fi
+  done
+
+  die "Timed out after ${LOCK_TIMEOUT}s waiting for $dir.
+    If no other install or 'lem start' is running, remove that directory."
+}
+
+lock_release() {
+  [ -n "$LOCK_DIR" ] || return 0
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+  LOCK_DIR=""
+}
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -625,6 +801,12 @@ set -euo pipefail
 export PATH="${UV_BIN%/*}:\$PATH"
 export LEM_PORT="\${LEM_PORT:-$LEM_PORT}"
 
+# The server resolves its database, API token and Harbor path from this. It is
+# exported, not just recorded, because app/config/platform.py otherwise falls
+# back to ~/.lem -- which meant a relocated install ran against the *default*
+# prefix and left its real state (the API token included) orphaned there.
+export LEM_HOME="$LEM_HOME"
+
 # Your knobs (LEM_HOST, LEM_PORT, LEM_ALLOWED_ORIGINS, ...). Read here and by
 # the service unit, so both paths see the same configuration.
 if [ -f "$LEM_HOME/config/server.env" ]; then
@@ -685,6 +867,7 @@ LEM_SERVER_DIR="$SERVER_DIR"
 LEM_LAUNCHER="$LEM_HOME/bin/lem-server"
 LEM_LOG_FILE="$LEM_HOME/logs/lem.log"
 LEM_PID_FILE="$LEM_HOME/run/lem.pid"
+LEM_LOCK_DIR="$LEM_HOME/run/lock"
 LEM_SERVICE="$LEM_SERVICE"
 LEM_SERVICE_NAME="$(service_name)"
 LEM_SOURCE_MODE="$LEM_SOURCE_MODE"
@@ -1029,14 +1212,39 @@ confirm() {
 uninstall() {
   printf '\n%sUninstalling Lem%s\n\n' "$C_BLUE" "$C_OFF"
   detect_platform
+  validate_lem_home
 
-  if [ ! -d "$LEM_HOME" ]; then
+  # Everything below this point is decided before a single file is touched.
+  # The old order asked for confirmation and then rm -rf'd $LEM_HOME whatever
+  # it was: pointing LEM_HOME at a directory of documents and running
+  # --uninstall --yes deleted it, having never checked that Lem put anything
+  # there. --yes is what every scripted invocation uses, so the prompt was not
+  # a safeguard at all.
+  local installed=0
+  if [ -e "$LEM_HOME" ] || [ -L "$LEM_HOME" ]; then
+    [ -d "$LEM_HOME" ] ||
+      die "$LEM_HOME is not a directory. Refusing to remove it."
+    if is_lem_install "$LEM_HOME"; then
+      installed=1
+    else
+      die "$LEM_HOME is not a Lem install: it has no readable $INSTALL_MARKER
+    recording it as one, so this installer did not create it. Nothing was
+    removed. Check LEM_HOME, and delete the directory yourself if you really
+    meant to."
+    fi
+  else
     warn "$LEM_HOME does not exist; cleaning up stray entries only."
   fi
 
   if [ "$DRY_RUN" -eq 0 ]; then
     confirm "Remove $LEM_HOME (source, Harbor, logs, data, API token)?" ||
       die "Aborted; nothing was removed."
+  fi
+
+  # Held across the whole uninstall so a concurrent `lem start` cannot slip a
+  # server in behind it and outlive the install it belonged to.
+  if [ "$installed" -eq 1 ]; then
+    lock_acquire
   fi
 
   # 1. Stop and deregister the service.
@@ -1084,11 +1292,9 @@ uninstall() {
     fi
   done
 
-  # 5. Remove the install prefix. src/ may be a symlink into a git checkout:
-  #    rm -rf removes the link, never the checkout behind it.
-  if [ -d "$LEM_HOME" ]; then
-    run rm -rf "$LEM_HOME"
-    success "Removed $LEM_HOME"
+  # 5. Remove what we installed, by name.
+  if [ "$installed" -eq 1 ]; then
+    remove_install_prefix
   fi
 
   printf '\n'
@@ -1097,18 +1303,60 @@ uninstall() {
   detail "Review them with: docker ps -a"
 }
 
-# Stop a nohup-launched server using the PID file the CLI writes.
+# Remove the entries this installer and the server create, then the prefix
+# itself if that emptied it. Deliberately not `rm -rf $LEM_HOME`: a directory
+# that also holds something we did not create keeps it, and says so.
+remove_install_prefix() {
+  local entry left
+
+  for entry in "${LEM_HOME_ENTRIES[@]}"; do
+    # src/ may be a symlink into a git checkout: rm removes the link, never
+    # the checkout behind it. -L as well as -e, or a dangling one is missed.
+    if [ -e "$LEM_HOME/$entry" ] || [ -L "$LEM_HOME/$entry" ]; then
+      run rm -rf "$LEM_HOME/$entry"
+    fi
+  done
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    detail "[dry-run] rmdir $LEM_HOME (only if it is now empty)"
+    return 0
+  fi
+
+  if rmdir "$LEM_HOME" 2>/dev/null; then
+    success "Removed $LEM_HOME"
+    return 0
+  fi
+
+  success "Removed Lem's files from $LEM_HOME"
+  warn "$LEM_HOME also holds things Lem did not install; leaving it in place:"
+  find "$LEM_HOME" -mindepth 1 -maxdepth 1 2>/dev/null | while read -r left; do
+    detail "  ${left##*/}"
+  done
+}
+
+# Stop a nohup-launched server using the PID file the CLI writes. Never pkill:
+# that pattern also matches an unrelated checkout's dev server.
 stop_by_pidfile() {
-  local pid_file="$LEM_HOME/run/lem.pid" pid
+  local pid_file="$LEM_HOME/run/lem.pid" pid waited=0
 
   [ -f "$pid_file" ] || return 0
   pid="$(cat "$pid_file" 2>/dev/null || true)"
   case "$pid" in
-    ''|*[!0-9]*) return 0 ;;
+    ''|*[!0-9]*) run rm -f "$pid_file"; return 0 ;;
   esac
 
   if kill -0 "$pid" 2>/dev/null; then
     run kill "$pid" 2>/dev/null || true
+    # Wait for it, then insist. Removing the source tree out from under a
+    # process that is still running is how the old installer left a server
+    # answering on the port after "Lem is uninstalled".
+    while [ "$DRY_RUN" -eq 0 ] && [ "$waited" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if [ "$DRY_RUN" -eq 0 ] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
     success "Stopped the Lem server (pid $pid)"
   fi
   run rm -f "$pid_file"
@@ -1161,14 +1409,20 @@ main() {
 
   print_banner
   detect_platform
+  validate_lem_home
   success "Platform      $(platform_label)"
   require_cmd curl
   require_cmd tar
   check_docker
-  ensure_uv
 
   run mkdir -p "$LEM_HOME/data" "$LEM_HOME/logs" "$LEM_HOME/config" "$LEM_HOME/run"
 
+  # One installer at a time per prefix. Two of them interleaving swapped src/
+  # and the venv underneath each other, raced to install uv into the same
+  # ~/.local/bin, and then both went on to start a server.
+  lock_acquire
+
+  ensure_uv
   install_source
   install_python_deps
   install_harbor
@@ -1178,6 +1432,10 @@ main() {
   install_cli
   install_service
   write_install_env
+
+  # Released before the server starts: `lem start` takes the same lock, and it
+  # is the CLI's job to decide whether a server is already running.
+  lock_release
 
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '\n'

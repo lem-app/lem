@@ -54,11 +54,90 @@ LEM_SERVICE_NAME="${LEM_SERVICE_NAME:-}"
 LEM_LAUNCHER="${LEM_LAUNCHER:-$LEM_HOME/bin/lem-server}"
 LEM_LOG_FILE="${LEM_LOG_FILE:-$LEM_HOME/logs/lem.log}"
 LEM_PID_FILE="${LEM_PID_FILE:-$LEM_HOME/run/lem.pid}"
+LEM_LOCK_DIR="${LEM_LOCK_DIR:-$LEM_HOME/run/lock}"
 
 HEALTH_URL="http://127.0.0.1:$LEM_PORT/v1/health"
 START_TIMEOUT=60
+LOCK_TIMEOUT=180
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Lock
+# ---------------------------------------------------------------------------
+#
+# Start and stop are serialised per install. mkdir is the portable atomic
+# test-and-set -- flock(1) is util-linux and absent on macOS. The holder's pid
+# goes inside so a lock left by a killed process is reclaimed rather than
+# wedging every later run.
+#
+# Without it, two `lem start` runs (or a `lem start` racing the installer, which
+# delegates here) each saw "not healthy yet", each launched a server, and this
+# PID file kept only the last writer. The other server then survived both
+# `lem stop` and `install.sh --uninstall`, holding the port with its source tree
+# deleted underneath it.
+
+LOCK_HELD=""
+
+lock_acquire() {
+  local waited=0 holder announced=0 blank=0
+
+  mkdir -p "${LEM_LOCK_DIR%/*}" 2>/dev/null || true
+
+  while [ "$waited" -lt "$LOCK_TIMEOUT" ]; do
+    if mkdir "$LEM_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$LEM_LOCK_DIR/pid"
+      LOCK_HELD="$LEM_LOCK_DIR"
+      return 0
+    fi
+
+    holder="$(cat "$LEM_LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*) holder="" ;;
+    esac
+    sleep 1
+    waited=$((waited + 1))
+
+    if [ -z "$holder" ]; then
+      # No readable pid: a leftover from a crash, or a winner that has not
+      # written its pid yet. Reclaim only on the second sighting, so the
+      # second case resolves itself.
+      blank=$((blank + 1))
+      if [ "$blank" -ge 2 ]; then
+        rm -rf "$LEM_LOCK_DIR"
+        blank=0
+      fi
+      continue
+    fi
+    blank=0
+
+    if ! kill -0 "$holder" 2>/dev/null; then
+      # Re-read before reclaiming: if another run got there first the pid has
+      # changed, and this one waits for it like any other holder.
+      if [ "$(cat "$LEM_LOCK_DIR/pid" 2>/dev/null || true)" = "$holder" ]; then
+        rm -rf "$LEM_LOCK_DIR"
+      fi
+      continue
+    fi
+
+    if [ "$announced" -eq 0 ]; then
+      printf 'Waiting for another lem run (pid %s) to finish\n' "$holder" >&2
+      announced=1
+    fi
+  done
+
+  printf 'lem: timed out after %ss waiting for %s\n' "$LOCK_TIMEOUT" "$LEM_LOCK_DIR" >&2
+  printf 'lem: if nothing else is running, remove that directory.\n' >&2
+  return 1
+}
+
+lock_release() {
+  [ -n "$LOCK_HELD" ] || return 0
+  rm -rf "$LOCK_HELD" 2>/dev/null || true
+  LOCK_HELD=""
+}
+
+trap lock_release EXIT
 
 is_healthy() {
   curl -fsS -m 2 "$HEALTH_URL" >/dev/null 2>&1
@@ -110,6 +189,23 @@ cmd_start() {
     return 0
   fi
 
+  lock_acquire || return 1
+
+  # Re-check under the lock. Whoever we queued behind may have started the
+  # server already, and launching a second one here is exactly how an
+  # untracked process used to escape both stop and uninstall.
+  if is_healthy; then
+    printf 'Lem is already running on port %s\n' "$LEM_PORT"
+    lock_release
+    return 0
+  fi
+  local existing
+  if existing="$(running_pid)"; then
+    printf 'Lem is already starting (pid %s)\n' "$existing"
+    lock_release
+    return 0
+  fi
+
   case "$LEM_SERVICE" in
     systemd-user)
       systemctl --user start "$LEM_SERVICE_NAME"
@@ -124,16 +220,20 @@ cmd_start() {
   esac
 
   if wait_for_health; then
+    lock_release
     printf 'Lem is running: http://127.0.0.1:%s\n' "$LEM_PORT"
     return 0
   fi
 
+  lock_release
   printf 'lem: the server did not become healthy in %ss\n' "$START_TIMEOUT" >&2
   cmd_logs_tail 20 >&2 || true
   return 1
 }
 
 cmd_stop() {
+  lock_acquire || return 1
+
   case "$LEM_SERVICE" in
     systemd-user)
       systemctl --user stop "$LEM_SERVICE_NAME" || true
@@ -157,6 +257,7 @@ cmd_stop() {
     fi
   fi
   rm -f "$LEM_PID_FILE"
+  lock_release
 
   if is_healthy; then
     printf 'lem: something is still answering on port %s\n' "$LEM_PORT" >&2

@@ -32,6 +32,7 @@ from app.config.platform import (
     PlatformType,
     get_docker_host_uri,
     get_docker_socket_path,
+    get_lem_home,
     get_platform,
     is_wsl,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "PlatformType",
     "get_docker_host_uri",
     "get_docker_socket_path",
+    "get_lem_home",
     "get_platform",
     "is_wsl",
 ]
