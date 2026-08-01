@@ -3,83 +3,166 @@
 How to verify Lem — automated gates, per-component manual checks, and the end-to-end scenario
 that defines "remote access works".
 
-**Read this first**: `main` does not currently pass its own gates. §1 records the measured
-baseline from [#20](https://github.com/lem-app/lem/issues/20) so you can tell a regression you
-caused from one you inherited.
+**Read this first**: `main` still does not pass its own gates — but for different reasons than
+it did a week ago. Every test suite is green now; what is red is formatting, lint, and coverage
+headroom. §1 records a **re-measured** baseline so you can tell a regression you caused from one
+you inherited.
+
+**§1 is a perishable measurement, not a specification.** It is pinned to a commit. Before
+trusting any row, re-run the command in that row — the whole table is cheap to reproduce, and it
+has already gone stale once (PRs [#24](https://github.com/lem-app/lem/pull/24) and
+[#26](https://github.com/lem-app/lem/pull/26) landed between two revisions of this document and
+flipped most of it).
 
 ---
 
 ## 1. Baseline on `main`
 
-Measured 2026-08-01, at `28baea7`.
+**Re-measured 2026-08-01 at `506af26`** (includes #24 and #26). The previous revision of this
+table was measured at `28baea7`, before both landed, and every row it contained about tests,
+types, or lint has since changed.
 
-| Gate | Command | Result |
+### Python services
+
+| Gate | Command (from the service directory) | server | cloud/signaling | cloud/relay |
+|---|---|---|---|---|
+| deps | `uv sync` | **PASS** | **PASS** | **PASS** |
+| deps (CI form) | `uv sync --locked --all-extras` | **PASS** | **PASS** | **PASS** |
+| tests | `uv run pytest` | **40 passed**, 0 failed | **9 passed**, 0 failed | **0 collected** (exit 5) |
+| lint | `uv run ruff check app/ tests/` | **7 errors** (5 F401, 2 E501 — all in `tests/`) | **0** | **0** |
+| format | `uv run ruff format --check app/` | **6 files** | **7 files** | **4 files** |
+| types | `uv run mypy app/` | **0 errors**, 34 files | **0 errors**, 14 files | **0 errors**, 10 files |
+| coverage | see below | **19.32 %** | **67.05 %** | **0.00 %** |
+
+### Web dashboards
+
+| Gate | Command (from the app directory) | web/local | web/remote |
+|---|---|---|---|
+| deps | `pnpm install --frozen-lockfile` | **PASS** | **PASS** |
+| types (CI form) | `pnpm exec tsc --build --noEmit` | **PASS** | **PASS** |
+| lint | `pnpm exec eslint .` | **2 errors** | **4 errors** |
+| format | `pnpm exec prettier --check .` | **25 files** | **20 files** |
+| build | `pnpm run build` | **PASS** | **PASS** |
+| tests | `pnpm exec vitest run` | **no tests** (no script, no vitest dep) | **28 passed**, 0 failed |
+
+### What this means
+
+**Green**: every test suite that exists, and every `mypy app/` check.
+**Red**: `ruff format --check app/` in all three Python services, `ruff check app/ tests/` in
+`server`, and `eslint` + `prettier` in both web apps. CI (§2) is therefore currently failing on
+5 of its 7 check runs; only `license-headers` and `dco` are green.
+
+None of the red rows are test failures. That distinction matters when triaging: a red build
+today is a formatting or lint debt, not a broken behaviour.
+
+### Rows that flipped since `28baea7` — do not trust an older copy of this table
+
+| Row | Old claim | Now |
 |---|---|---|
-| server pytest | `cd server && uv run pytest` | **5 failed**, 33 passed; coverage **19 %** (target > 80 %) |
-| server test deps | `uv sync` then `uv run pytest` | **fails** — dev deps are in `[project.optional-dependencies]` (`server/pyproject.toml:18-26`), so a plain `uv sync` never installs pytest |
-| server ruff | `cd server && uv run ruff check app/` | **9 errors** (7 × E501, UP035, F401) |
-| server mypy | `cd server && uv run mypy app/` | clean (34 files) |
-| signaling pytest | `cd cloud/signaling && uv run pytest` | **3 failed** / 6 on a clean DB; **4 failed** / 5 on re-run — non-idempotent |
-| signaling mypy | `cd cloud/signaling && uv run mypy app/` | **9 errors** in 5 files |
-| signaling ruff | `cd cloud/signaling && uv run ruff check app/` | **3 errors** |
-| relay pytest | `cd cloud/relay && uv run pytest` | **0 tests collected** — `tests/` holds only `__init__.py` |
-| web/remote vitest | `cd web/remote && pnpm test` | **2 failed** / 25 passed |
-| web/local tests | — | **no test script** (`web/local/package.json:7-13`) |
-| both apps `tsc --noEmit` | `pnpm tsc --noEmit` | passes, but **checks zero files** — see below |
-| both apps eslint | `pnpm lint` | **fails** (2 local, 4 remote) |
-| formatting | `pnpm prettier --check .` | **37 files** unformatted |
-| CI | — | none; no `.github/` directory on `main` |
+| server pytest | 5 failed, 33 passed | **40 passed, 0 failed** |
+| server dev deps | plain `uv sync` never installs pytest | **plain `uv sync` works** — see the `--extra dev` warning below |
+| server ruff (`app/`) | 9 errors | **0 errors** |
+| signaling pytest | 3 failed / 6, non-idempotent | **9 passed, idempotent** across three consecutive runs |
+| signaling mypy | 9 errors in 5 files | **0 errors**, 14 files |
+| signaling ruff | 3 errors | **0 errors** |
+| web/remote vitest | 2 failed / 25 passed | **28 passed, 0 failed** |
+| CI | none; no `.github/` | **7 check runs**, incl. DCO, license headers, and a real type-check gate (§2) |
+| formatting | "37 files" from one root command | **25 + 20 = 45**, and the root command does not run at all — see below |
 
-### `tsc --noEmit` is a no-op — do not trust it
+### ⚠️ `uv sync --extra dev` is now a hard error
 
-Both `tsconfig.json` files are solution-style: `"files": []` plus `"references"`
-(`web/remote/tsconfig.json`, `web/local/tsconfig.json`). In non-build mode that yields a program
-with **zero root files**, so the command always passes. `web/remote`'s `"type-check"` script and
-`CLAUDE.md`'s documented command are both no-ops. Real checking happens only incidentally inside
-`tsc -b` during `build`.
+PR #24 moved dev dependencies to PEP 735 `[dependency-groups]` in **all three** Python services
+(`server/pyproject.toml:64-74`, `cloud/signaling/pyproject.toml:47-59`,
+`cloud/relay/pyproject.toml:42-52`). None of them declares `[project.optional-dependencies]` at
+all. So:
+
+```
+$ uv sync --extra dev
+error: Extra `dev` is not defined in the project's `optional-dependencies` table
+```
+
+Plain `uv sync` is now correct and installs the dev tooling. An earlier revision of this
+document prescribed `--extra dev` in §2 for server, signaling and relay — that instruction
+failed on the first command of three of the five component gates and has been removed.
+
+### Coverage needs `pytest-cov`, which only `server` declares
+
+```bash
+cd server        && uv run pytest --cov=app --cov-report=term-missing        # 19.32 %
+cd cloud/signaling && uv run --with 'pytest-cov==7.0.0' pytest --cov=app     # 67.05 %
+cd cloud/relay     && uv run --with 'pytest-cov==7.0.0' pytest --cov=app     #  0.00 %
+```
+
+In signaling and relay, plain `pytest --cov=app` exits 4 with
+`unrecognized arguments: --cov=app`. CI uses the `--with` form for all three.
+
+### `prettier` does not run from the repository root
+
+There is **no root `package.json`** and no `pnpm-workspace.yaml`. From the root,
+`pnpm prettier --check .` fails with `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND` and
+`pnpm exec prettier --check .` with `ERR_PNPM_RECURSIVE_EXEC_NO_PACKAGE`. The old single
+"formatting — 37 files" row was not a runnable gate. Run it per app, as CI does.
+
+### `tsc --noEmit` is still a no-op — do not trust it
+
+**Unchanged by #24 and #26, and still the sharpest trap in this repo.** Both `tsconfig.json`
+files are solution-style: `"files": []` plus `"references"` (`web/remote/tsconfig.json`,
+`web/local/tsconfig.json`). In non-build mode that yields a program with **zero root files**, so
+the command always passes. Re-measured today with `--listFiles | wc -l`: **0** in both apps.
+
+Consequently `web/remote`'s `"type-check"` script (`web/remote/package.json:13`) is still a
+no-op — it runs the bare `tsc --noEmit` — and so is `CLAUDE.md`'s documented command.
+`web/local` has no `type-check` script at all. Fixing those two scripts is a genuinely open item.
 
 Use one of these instead:
 
 ```bash
-pnpm tsc -p tsconfig.app.json --noEmit    # type-checks src/
-pnpm tsc -b --force                       # what `build` does
+pnpm exec tsc --build --noEmit            # what CI runs; walks every project reference
+pnpm exec tsc -p tsconfig.app.json --noEmit   # type-checks src/ only
 ```
 
-Verify with `--listFiles | wc -l`: the solution config reports 0; `tsconfig.app.json` reports
-137 (remote) / 115 (local).
+`tsconfig.app.json` reports **137** files (local) / **115** (remote), against 0 for the
+solution config. CI deliberately uses `tsc --build --noEmit` rather than `pnpm run type-check`,
+precisely because the script is wrong.
 
-### The frame tests were stale in both languages
+### Fixed since the last revision — kept for provenance
 
-The HTTP frame format gained a leading `frame_type` byte; the serializers were updated, the
-tests were not. Python failed with `Expected HTTP_REQUEST frame (0x01), got 0x00`; TypeScript
-failed with `expected 33554432 to be 42` — `0x02000000`, the response frame's type byte read as
-the top octet of a `getUint32(0)`. That accounts for all 5 server failures and both remote
-failures. PR [#24](https://github.com/lem-app/lem/pull/24) fixes them.
+Two problems this document used to prescribe workarounds for are **resolved**; the workarounds
+are obsolete and were removed from §2.
 
-### Signaling tests corrupt their own state
-
-`cloud/signaling/tests/test_api.py:40` sets `db_module.DATABASE_FILE`, a name that does not
-exist — the code hardcodes `"signaling.db"` (`app/db/database.py:90`, `:112`). Tests write to a
-persistent DB in the working directory with no teardown and re-register `test@example.com`, so
-results depend on what the previous run left behind. Between runs:
-
-```bash
-rm -f cloud/signaling/signaling.db
-```
+- **Stale frame tests in both languages.** The HTTP frame format gained a leading `frame_type`
+  byte; the serializers were updated, the tests were not. Python failed with
+  `Expected HTTP_REQUEST frame (0x01), got 0x00`; TypeScript with `expected 33554432 to be 42`
+  — `0x02000000`, the response frame's type byte read as the top octet of a `getUint32(0)`.
+  That accounted for all 5 server failures and both remote failures.
+  **Fixed by [#24](https://github.com/lem-app/lem/pull/24)**; both suites are green.
+- **Non-idempotent signaling tests.** Tests wrote to a persistent `signaling.db` in the working
+  directory with no teardown, so results depended on what the previous run left behind.
+  **Fixed by #24**: `cloud/signaling/tests/test_api.py:30-36` now monkeypatches
+  `database.DATABASE_FILE` to a `tmp_path`-scoped file. Verified idempotent across three
+  consecutive runs with a clean `git status` after each. **The `rm -f signaling.db` step is
+  obsolete — do not re-add it.**
 
 ---
 
 ## 2. Automated gates
 
+**CI is the authority on what these gates are.** PR [#26](https://github.com/lem-app/lem/pull/26)
+landed `.github/workflows/ci.yml`, and it runs on every pull request and every push to `main`.
+The commands below are the local equivalents of what CI runs — they are written to match it
+exactly, so that passing locally means passing in CI. **If they ever diverge, the workflow file
+wins**; a checklist that quietly prescribes a weaker gate than CI is worse than no checklist.
+See §2.5 for the gate list and the coverage floors rather than duplicating them here.
+
 ### Local server
 
 ```bash
 cd server
-uv sync --extra dev                 # NOT plain `uv sync` — see §1
-uv run pytest --cov=app --cov-report=term-missing
-uv run mypy app/
-uv run ruff check app/
+uv sync                             # NOT `--extra dev` — that is now a hard error, see §1
 uv run ruff format --check app/
+uv run ruff check app/ tests/
+uv run mypy app/
+uv run pytest --cov=app --cov-report=term-missing
 ```
 
 Existing suites: `tests/tunnel/test_http_frame.py`, `tests/tunnel/test_relay_fallback.py`,
@@ -95,21 +178,22 @@ Largest untested areas, in the order worth fixing (this is where the 19 % comes 
 
 ```bash
 cd cloud/signaling
-rm -f signaling.db                  # tests are not idempotent — see §1
-uv sync --extra dev
-uv run pytest --cov=app
+uv sync                             # tests are idempotent now — no `rm -f signaling.db`
+uv run ruff format --check app/
+uv run ruff check app/ tests/
 uv run mypy app/
-uv run ruff check app/
+uv run --with 'pytest-cov==7.0.0' pytest --cov=app --cov-report=term-missing
 ```
 
 ### Cloud relay
 
 ```bash
 cd cloud/relay
-uv sync --extra dev
-uv run pytest                       # collects 0 tests today
+uv sync
+uv run ruff format --check app/
+uv run ruff check app/ tests/
 uv run mypy app/
-uv run ruff check app/
+uv run --with 'pytest-cov==7.0.0' pytest --cov=app   # collects 0 tests today; exit 5
 ```
 
 `cloud/relay/test_relay.py` sits at the package root, not in `tests/`, so pytest's default
@@ -123,30 +207,56 @@ binary frames; a third client joining a full session; idle timeout; a rejected t
 
 ```bash
 cd web/remote
-pnpm install
-pnpm test                           # vitest
-pnpm tsc -p tsconfig.app.json --noEmit
-pnpm lint
-pnpm prettier --check .
+pnpm install --frozen-lockfile
+pnpm exec tsc --build --noEmit      # NOT `pnpm run type-check` — that script is a no-op, see §1
+pnpm exec eslint .
+pnpm exec prettier --check .
+pnpm run build
+pnpm exec vitest run                # `pnpm test` is watch mode; use `vitest run` for a gate
 
 cd ../local
-pnpm install
-pnpm tsc -p tsconfig.app.json --noEmit
-pnpm lint
-pnpm prettier --check .
+pnpm install --frozen-lockfile
+pnpm exec tsc --build --noEmit
+pnpm exec eslint .
+pnpm exec prettier --check .
+pnpm run build
 # no test script yet — add vitest, matching web/remote
 ```
 
 Existing remote tests: `src/api/auth.test.ts`, `src/lib/http-frame.test.ts`,
-`src/lib/webrtc.test.ts`.
+`src/lib/webrtc.test.ts` — 28 tests across 3 files.
 
-### Suggested CI matrix
+### 2.5 CI gates (the source of truth)
 
-Six jobs, one per checkable unit, so a failure names its component:
-`server`, `cloud/signaling`, `cloud/relay`, `web/local`, `web/remote`, plus a license-header
-check for the SPDX requirement in `CLAUDE.md`. Python matrix 3.11 / 3.12; Node 20. Docker is not
-available in CI, so Docker-dependent paths must be mocked, not skipped. PR
-[#26](https://github.com/lem-app/lem/pull/26) implements this.
+`.github/workflows/ci.yml` — triggers on `pull_request` and on push to `main`; pinned to Python
+3.11, Node 22, pnpm 10, `ubuntu-24.04`; no `continue-on-error` anywhere. **7 check runs:**
+
+| Check run | What it runs |
+|---|---|
+| `server`, `cloud-signaling`, `cloud-relay` | `uv sync --locked --all-extras`, then `ruff format --check app/`, `ruff check app/ tests/`, `mypy app/`, and pytest with `--cov-fail-under` |
+| `web-local`, `web-remote` | `pnpm install --frozen-lockfile`, `tsc --build --noEmit`, `eslint .`, `prettier --check .`, `pnpm run build`, and `vitest run` (skipped for `web-local`, which has no tests) |
+| `license-headers` | `./scripts/check-license-headers.sh` — the SPDX requirement in `CLAUDE.md`. Currently green: 128 files checked, 10 skipped |
+| `dco` | Every non-merge commit in the PR needs a `Signed-off-by:` whose name and email **match the commit author**. Commit with `git commit -s`. Skipped for dependabot |
+
+**Per-service coverage floors** (`--cov-fail-under`), described in the workflow as a one-way
+ratchet that may only go up:
+
+| Service | Floor | Measured at `506af26` | Headroom |
+|---|---|---|---|
+| `server` | **17 %** | 19.32 % | +2.32 |
+| `cloud-signaling` | **65 %** | 67.05 % | +2.05 |
+| `cloud-relay` | **0 %** | 0.00 % | 0 |
+
+A pytest exit code of 5 (no tests collected) is tolerated and downgraded to a warning — which is
+the only reason `cloud-relay` passes. Every other non-zero exit fails the job.
+
+**Do not restate the floors anywhere else in this document.** They are a ratchet; a second copy
+is a second thing to forget to raise. The numbers above are a snapshot for orientation, and the
+workflow file is what gates.
+
+Two things CI does **not** do, so they remain manual: Docker is unavailable on the runners, so
+every Docker-dependent path must be mocked rather than skipped, and nothing in CI exercises the
+end-to-end remote-access scenario in §4.
 
 ---
 

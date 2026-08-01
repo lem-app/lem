@@ -82,7 +82,7 @@ FastAPI app created in `server/app/main.py:130-137`. Startup and shutdown are dr
 
 ```
 server/app/
-├── main.py                  # 20 endpoints + lifespan  (main.py:160-726)
+├── main.py                  # 26 endpoints + lifespan  (main.py:160-726)
 ├── api/v1/auth.py           # 4 endpoints, /v1/auth/*  (auth.py:102-389)
 ├── db.py                    # SQLite: settings, device, auth, jobs
 ├── crypto.py                # Ed25519 keypair generation
@@ -231,9 +231,13 @@ addressed by PR [#25](https://github.com/lem-app/lem/pull/25).
 
 Signaling server storage is separate: `users` and `devices` tables in `signaling.db` (SQLite) or
 PostgreSQL when `DATABASE_URL` starts with `postgresql`
-(`cloud/signaling/app/db/database.py:29-30`, `:110-186`). The SQLite path hardcodes the filename
-`"signaling.db"` in the working directory (`database.py:90`, `:112`) — the cause of the
-non-idempotent tests in [#20](https://github.com/lem-app/lem/issues/20).
+(`cloud/signaling/app/db/database.py:29-30`, `:177-252`). The SQLite filename comes from
+`DATABASE_FILE = os.environ.get("SQLITE_DB_FILE", "signaling.db")` (`database.py:34`), read at
+call time by both consumers (`get_db()` at `:157`, `_init_sqlite()` at `:179`) so tests can
+point it at a temporary directory. It was previously hardcoded, which was the cause of the
+non-idempotent tests in [#20](https://github.com/lem-app/lem/issues/20); PR
+[#24](https://github.com/lem-app/lem/pull/24) fixed it, and the signaling suite is now
+idempotent.
 
 ---
 
@@ -304,8 +308,8 @@ sequenceDiagram
   `TunnelManager.start()` (`manager.py:56-123`), which builds the `ws://…/signal` URL from the
   stored `signaling_url` (`manager.py:101-104`).
 - Signaling never sees payload bytes; it routes JSON by `target_device_id`
-  (`cloud/signaling/app/api/signal.py:249-325`) with a 64 KiB per-message limit
-  (`signal.py:266-270`).
+  (`cloud/signaling/app/api/signal.py:249-329`) with a 64 KiB per-message limit
+  (`signal.py:269-273`).
 - Frames are dispatched on byte 0 (`message_dispatcher.py:65-101`) into `HTTPProxyHandler` or
   `WSProxyHandler`.
 
@@ -403,16 +407,16 @@ FastAPI app (`app/main.py:36-60`) with four routers: health, auth, devices, sign
 
 | Concern | Implementation |
 |---|---|
-| Auth | Email/password → JWT (`api/auth.py:28-129`), HS256, 24 h expiry (`core/config.py`). |
-| Devices | UPSERT keyed by `device_id`, rejecting a device id owned by another user with 403 (`api/devices.py:83-136`). |
+| Auth | Email/password → JWT (`api/auth.py:27-135`), HS256, 24 h expiry (`core/config.py`). |
+| Devices | UPSERT keyed by `device_id`, rejecting a device id owned by another user with 403 (`api/devices.py:86-141`). |
 | Signaling | `WS /signal`; auth via a first `{"type":"auth"}` message, or deprecated query params (`api/signal.py:150-233`). |
-| Routing | `ConnectionManager` maps `device_id` → WebSocket (`signal.py:35-101`); one connection per device, older one closed on re-register (`signal.py:54-65`). |
-| Relay coordination | `connect-request` / `connect-ack` are rewritten into `…-received` forms and forwarded, injecting `settings.relay_url` (`signal.py:276-296`). |
+| Routing | `ConnectionManager` maps `device_id` → WebSocket (`signal.py:34-100`); one connection per device, older one closed on re-register (`signal.py:53-64`). |
+| Relay coordination | `connect-request` / `connect-ack` are rewritten into `…-received` forms and forwarded, injecting `settings.relay_url` (`signal.py:279-299`). |
 | ICE config | Sent in the `connected` message from `settings.ice_servers`; defaults to Google's public STUN (`core/config.py`). |
 | Storage | SQLite (`signaling.db`) or PostgreSQL via `DATABASE_URL` (`db/database.py:29-30`). |
 
 **Known authorization gaps** (not fixed on `main`): any authenticated user can address a
-message to any `target_device_id` (`signal.py:272`, `:303`) — the target's ownership is never
+message to any `target_device_id` (`signal.py:275`, `:306`) — the target's ownership is never
 checked. That is [#16](https://github.com/lem-app/lem/issues/16). The default JWT secret
 `dev-secret-key-change-in-production` is only rejected when `ENV=production`
 (`core/config.py`), which is [#18](https://github.com/lem-app/lem/issues/18).
@@ -504,7 +508,15 @@ app code and requires it to move.
 | Relay transport | **Implemented** | `relay_client.py`, `cloud/relay/` |
 | Relay **auto-fallback** | **Not working** | `webrtc_client.py:704-743`, `:69` ([#12](https://github.com/lem-app/lem/issues/12)) |
 | Local API authentication | **Not on `main`** | ([#7](https://github.com/lem-app/lem/issues/7)); PR [#25](https://github.com/lem-app/lem/pull/25) |
-| Cloud authorization (session / device ownership) | **Not on `main`** | ([#15](https://github.com/lem-app/lem/issues/15), [#16](https://github.com/lem-app/lem/issues/16)) |
-| Ed25519 device authentication | **Planned** | key generated (`auth.py:155-157`) and never used ([#17](https://github.com/lem-app/lem/issues/17)) |
-| End-to-end encryption on the relay path | **Planned** | plaintext to the relay (`relay_client.py:141-154`) ([#12](https://github.com/lem-app/lem/issues/12)) |
-| CI | **Planned** | no `.github/` on `main` ([#20](https://github.com/lem-app/lem/issues/20)); PR [#26](https://github.com/lem-app/lem/pull/26) |
+| Cloud authorization (session / device ownership) | **Not on `main`** | ([#15](https://github.com/lem-app/lem/issues/15), [#16](https://github.com/lem-app/lem/issues/16)); PR [#45](https://github.com/lem-app/lem/pull/45) — **breaking**, see below |
+| Ed25519 device authentication | **Not on `main`** | key generated (`auth.py:155-157`) and never used ([#17](https://github.com/lem-app/lem/issues/17)); PR [#45](https://github.com/lem-app/lem/pull/45) implements real challenge/response |
+| End-to-end encryption on the relay path | **Planned** | plaintext to the relay (`relay_client.py:141-154`) ([#12](https://github.com/lem-app/lem/issues/12)). PR #45 documents this rather than fixing it |
+| CI | **Implemented** | `.github/workflows/ci.yml` — 7 check runs incl. DCO, license headers, per-service coverage floors. PR [#26](https://github.com/lem-app/lem/pull/26) merged. The green-baseline half of [#20](https://github.com/lem-app/lem/issues/20) is still open: format/lint gates are currently red |
+
+**PR #45 (`fix/cloud-authz`) is a breaking signaling/relay protocol change.** It is open, not
+merged. It replaces the guessable `${browserDeviceId}-${targetDeviceId}` relay session id with a
+server-minted one, requires a per-side single-use session grant instead of the account token at
+the relay, and adds an ed25519 challenge/response to both device registration and the `/signal`
+handshake. Any client work against the current handshake will need rewriting; the exact contract
+is in the PR body and is summarised in
+[`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.1.

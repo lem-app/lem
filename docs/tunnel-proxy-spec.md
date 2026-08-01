@@ -74,7 +74,7 @@ response" work, and make the wire protocol able to carry it.
 | N3 | HTTP/2 or HTTP/3 semantics, trailers, `100-continue`. | Nothing in the stack needs them. |
 | N4 | A real security boundary between the framed app and the dashboard. | Requires per-service origins; see §8.4 and the Phase 7 note. |
 | N5 | End-to-end encryption over the relay path. | Separate work; see [#12](https://github.com/lem-app/lem/issues/12). Frames are plaintext to the relay today (`server/app/tunnel/relay_client.py:141-154`). |
-| N6 | Multiple simultaneous target devices in one dashboard tab. | One tunnel per tab; `/app/<serviceId>/` needs no device segment. |
+| N6 | Multiple simultaneous *active* tunnels in one dashboard tab. | One tunnel at a time per tab. The path **does** carry a device segment (`/app/<deviceId>/<serviceId>/`, §3.1) so that a request bound to a previous device is rejected rather than silently re-routed — but v3 does not keep two tunnels open at once. |
 
 ---
 
@@ -87,8 +87,30 @@ scoped to that path intercepts every request the framed app makes and performs i
 tunnel.**
 
 ```
-https://remote.lem.gg/app/<serviceId>/<pathInsideService>
+https://remote.lem.gg/app/<deviceId>/<serviceId>/<pathInsideService>
 ```
+
+**The device segment is mandatory** (decided; see §10, decision 2). A path that identifies only
+the service is ambiguous the moment the dashboard's active target device changes, and the
+Service Worker outlives every React component that could have cleaned up after it. Concretely:
+the SW's `clientBindings` store (§3.5 step 4) persists for 24 h across reloads and SW restarts;
+an app-spawned `Worker`, a bfcache-restored document, or an iframe whose unmount handler did not
+run can all issue a fetch after the dashboard has switched targets. Without the segment those
+requests resolve to a binding written for the *old* device and are forwarded to the *new* one —
+wrong content at best, and at worst one machine's request landing on another.
+
+The Service Worker **rejects** a request whose `<deviceId>` does not match the currently active
+tunnel, with `E_DEVICE_MISMATCH` → `409` (§7.1). It does **not** re-route it to the active
+device, and it does not silently rewrite the path. Failing visibly is the point: a stale frame
+that shows an error is diagnosable; a stale frame that quietly starts showing another machine's
+data is not.
+
+> **Honest note on the evidence.** An earlier draft cited `App.tsx:187` ("Change Device") as
+> proof this race is reachable *today*. It is not: `App.tsx:154-169` returns `<ClientViewer>`
+> in an early branch, so while a service is being viewed the only affordance rendered is "Back
+> to Dashboard", which unmounts the iframe first. The justification above does not depend on
+> that button — it rests on Service Worker and IndexedDB lifetimes, which are the parts of the
+> Phase-4 design that genuinely outlive React state.
 
 The iframe's `src` is *always* same-origin. `appInfo.url` — the local `http://127.0.0.1:PORT`
 endpoint — is never given to the browser as a URL to load. It is used only server-side, by the
@@ -127,7 +149,7 @@ flowchart LR
   subgraph Browser["Remote browser — origin https://remote.lem.gg"]
     DASH["Dashboard page /<br/>owns RTCDataChannel / relay socket<br/>NOT controlled by SW"]
     SW["Service Worker<br/>scope /app/"]
-    IF["iframe /app/openwebui/<br/>the service's real UI<br/>controlled by SW"]
+    IF["iframe /app/dev-7f3a/openwebui/<br/>the service's real UI<br/>controlled by SW"]
   end
 
   subgraph Home["User's machine"]
@@ -167,11 +189,16 @@ tunnel ownership stays in the page.
    `bridgePort`. The SW never searches for its page with `clients.matchAll()`; the page pushes
    the port.
 3. Before rendering the iframe, the dashboard registers a **service session**:
-   `bridgePort.postMessage({ type: 'LEM_SESSION_OPEN', serviceId, upstreamHint })` where
-   `upstreamHint` is the `?client=` / service selector the local router needs (§3.6). The SW
-   acknowledges. Only then is the iframe created.
+   `bridgePort.postMessage({ type: 'LEM_SESSION_OPEN', deviceId, serviceId })`, where `deviceId`
+   is the target device the tunnel is currently connected to. The SW acknowledges. Only then is
+   the iframe created, at `/app/<deviceId>/<serviceId>/`.
 4. On unmount, `LEM_SESSION_CLOSE` removes the session; the SW rejects further requests for it
    with 410 (§7.1).
+   On a **device change**, the dashboard sends `LEM_ACTIVE_DEVICE { deviceId }` before opening
+   any new session. The SW stores exactly one `activeDeviceId` and answers `409`
+   (`E_DEVICE_MISMATCH`) to any request whose path segment names a different device — including
+   requests from clients still bound to the old device via steps 1–4 of §3.5. It never
+   re-routes them (§3.1).
 5. On tunnel loss, the dashboard sends `LEM_TUNNEL_DOWN`; in-flight SW requests are failed with
    503 and new ones are refused until `LEM_TUNNEL_UP`.
 
@@ -185,11 +212,11 @@ The framed app issues three shapes of request:
 
 | Shape | Example | Carries prefix? |
 |---|---|---|
-| Navigation into the scope | `GET /app/openwebui/` | yes |
+| Navigation into the scope | `GET /app/dev-7f3a/openwebui/` | yes |
 | Root-relative from the app | `GET /api/models`, `GET /static/x.js` | **no** |
 | Absolute cross-origin | `GET https://cdn.jsdelivr.net/x.js` | n/a |
 
-The SW must resolve all three to `(serviceId, upstreamPath)`.
+The SW must resolve all three to `(deviceId, serviceId, upstreamPath)`.
 
 #### Resolution algorithm (normative)
 
@@ -202,31 +229,46 @@ onfetch(event):
       return                                  # fall through to network, see §3.8
 
   # B. Explicit prefix wins, always.
-  m = /^\/app\/([A-Za-z0-9._-]{1,64})(\/.*)?$/.exec(url.pathname)
+  m = /^\/app\/([A-Za-z0-9._-]{1,64})\/([A-Za-z0-9._-]{1,64})(\/.*)?$/.exec(url.pathname)
   if m:
-      serviceId = m[1]
-      upstreamPath = (m[2] || '/') + url.search
+      deviceId  = m[1]
+      serviceId = m[2]
+      upstreamPath = (m[3] || '/') + url.search
+      # Device check happens BEFORE any tunnel work, and never re-routes.
+      if deviceId != self.activeDeviceId:
+          event.respondWith(problem(409, 'E_DEVICE_MISMATCH', deviceId))
+          return
       if event.request.mode == 'navigate':
-          bindClient(event.resultingClientId, serviceId)   # NOT event.clientId
-      event.respondWith(proxy(serviceId, upstreamPath, event.request))
+          bindClient(event.resultingClientId, deviceId, serviceId)  # NOT event.clientId
+      event.respondWith(proxy(deviceId, serviceId, upstreamPath, event.request))
       return
 
   # C. No prefix. Resolve the owning client.
-  serviceId = resolveServiceForClient(event)
-  if serviceId is null:
+  binding = resolveBindingForClient(event)          # -> {deviceId, serviceId} | null
+  if binding is null:
       return                                  # uncontrolled client -> network
-  event.respondWith(proxy(serviceId, url.pathname + url.search, event.request))
+  if binding.deviceId != self.activeDeviceId:
+      event.respondWith(problem(409, 'E_DEVICE_MISMATCH', binding.deviceId))
+      return
+  event.respondWith(
+      proxy(binding.deviceId, binding.serviceId, url.pathname + url.search, event.request))
 ```
 
-`resolveServiceForClient` runs these steps **in order** and stops at the first hit:
+Both branches check the device **after** resolution and **before** proxying, and both fail the
+request rather than substituting the active device. A binding recovered from IndexedDB (step 4)
+can name a device the dashboard left hours ago; that is exactly the case the check exists for.
+
+`resolveBindingForClient` runs these steps **in order** and stops at the first hit. Every step
+yields a `{deviceId, serviceId}` pair, never a bare service id — the device is part of the
+binding, so a stale binding is *detectable* rather than invisible:
 
 | Step | Source | Notes |
 |---|---|---|
-| 1 | In-memory `Map<clientId, serviceId>` | Populated at navigation (`event.resultingClientId`) and by step 3. |
-| 2 | `event.request.referrer` | For a subresource fetched by the iframe document this is the iframe's own URL, e.g. `https://remote.lem.gg/app/openwebui/`. Same-origin, so the default `strict-origin-when-cross-origin` policy sends the full path. Parse `/app/<serviceId>/` out of it and, if `event.clientId` is non-empty, cache the binding. |
-| 3 | `await clients.get(event.clientId)` → `client.url` | Survives an empty referrer (`Referrer-Policy: no-referrer` set by the app, `<meta name=referrer>`, `fetch(..., {referrerPolicy:'no-referrer'})`) because it does not depend on the referrer at all. Works for `window`, `worker`, and `sharedworker` clients — a worker the app spawned was itself loaded from `/app/<serviceId>/…`, so its `client.url` carries the prefix. |
-| 4 | IndexedDB store `lem-sw/clientBindings` | The in-memory map is lost every time the browser kills an idle SW. Every binding written in steps B/2/3 is mirrored here with a 24 h TTL, and this step reads it back. |
-| 5 | Single-session fallback | If exactly one service session is open, use it. Log a warning with the request URL — hitting this step routinely means steps 1–4 have a bug. |
+| 1 | In-memory `Map<clientId, {deviceId, serviceId}>` | Populated at navigation (`event.resultingClientId`) and by step 3. |
+| 2 | `event.request.referrer` | For a subresource fetched by the iframe document this is the iframe's own URL, e.g. `https://remote.lem.gg/app/dev-7f3a/openwebui/`. Same-origin, so the default `strict-origin-when-cross-origin` policy sends the full path. Parse `/app/<deviceId>/<serviceId>/` out of it and, if `event.clientId` is non-empty, cache the binding. |
+| 3 | `await clients.get(event.clientId)` → `client.url` | Survives an empty referrer (`Referrer-Policy: no-referrer` set by the app, `<meta name=referrer>`, `fetch(..., {referrerPolicy:'no-referrer'})`) because it does not depend on the referrer at all. Works for `window`, `worker`, and `sharedworker` clients — a worker the app spawned was itself loaded from `/app/<deviceId>/<serviceId>/…`, so its `client.url` carries the full prefix. |
+| 4 | IndexedDB store `lem-sw/clientBindings` | The in-memory map is lost every time the browser kills an idle SW. Every binding written in steps B/2/3 is mirrored here with a 24 h TTL, and this step reads it back. Records are `{clientId, deviceId, serviceId, expiresAt}` — **keyed by `clientId`, storing `deviceId`**, which is what lets the caller reject a binding written for a device the dashboard has since left. |
+| 5 | Single-session fallback | If exactly one service session is open **on the active device**, use it. Log a warning with the request URL — hitting this step routinely means steps 1–4 have a bug. Sessions for any other device are not candidates. |
 | 6 | **Fail closed** | Return a synthetic `421 Misdirected Request` (§7.1) whose body names the unresolvable URL. Never guess between two sessions. |
 
 Why the referrer is step 2 and not step 1: it is the cheapest signal, but it is also the one an
@@ -237,8 +279,18 @@ optimisation that avoids an async `clients.get()` on the hot path.
 `Referrer-Policy: no-referrer` on some builds. A request for `/static/chunk-abc.js` then
 arrives with `referrer === ''`. Step 2 yields nothing. Step 3 calls
 `clients.get('<clientId of the iframe document>')`, gets
-`https://remote.lem.gg/app/openwebui/`, extracts `openwebui`, caches it in the map and IDB, and
-the request proceeds. No user-visible difference.
+`https://remote.lem.gg/app/dev-7f3a/openwebui/`, extracts `{deviceId: 'dev-7f3a', serviceId:
+'openwebui'}`, caches it in the map and IDB, and — `dev-7f3a` being the active device — the
+request proceeds. No user-visible difference.
+
+**Stale-device worked example.** The user views Open WebUI on `dev-7f3a`, returns to the
+dashboard, and switches the target to `dev-91c2`. The dashboard sends
+`LEM_ACTIVE_DEVICE { deviceId: 'dev-91c2' }`. A `SharedWorker` the old app spawned is still
+alive and fetches `/api/models`. Step 1 misses (the SW was recycled), step 4 recovers
+`{deviceId: 'dev-7f3a', serviceId: 'openwebui'}` from IndexedDB. `dev-7f3a !== 'dev-91c2'`, so
+the SW answers `409 E_DEVICE_MISMATCH` and forwards nothing. Without the device segment this
+request would have been proxied to `dev-91c2` — a different machine — and returned whatever
+that machine's `openwebui` had to say.
 
 **Cold-start worked example.** The SW was killed while the iframe sat idle. The user clicks a
 button; the app fetches `/api/chat/completions`. The SW boots with an empty map, `LEM_BRIDGE_INIT`
@@ -259,9 +311,10 @@ sequenceDiagram
   participant Up as harbor.webui
 
   App->>SW: fetch GET /api/models
-  SW->>SW: resolve serviceId = openwebui
+  SW->>SW: resolve binding = {deviceId: dev-7f3a, serviceId: openwebui}
+  SW->>SW: reject 409 unless deviceId == activeDeviceId
   SW->>SW: body = await request.arrayBuffer()  (empty here)
-  SW->>Page: bridgePort.postMessage(LEM_FETCH{reqId, serviceId, method, path, headers, body}, [port2])
+  SW->>Page: bridgePort.postMessage(LEM_FETCH{reqId, deviceId, serviceId, method, path, headers, body}, [port2])
   Page->>Srv: HTTP_REQUEST_HEAD (0x01)
   Srv->>Up: GET http://127.0.0.1:33801/api/models
   Up-->>Srv: 200, headers, streamed body
@@ -289,10 +342,11 @@ arrive.
 |---|---|---|
 | `LEM_BRIDGE_INIT` | page → SW | `[MessagePort]` transferred |
 | `LEM_BRIDGE_HELLO` | SW → all clients | broadcast on `activate`, asks pages to re-init |
-| `LEM_SESSION_OPEN` | page → SW | `{ serviceId, upstreamHint }` |
-| `LEM_SESSION_CLOSE` | page → SW | `{ serviceId }` |
+| `LEM_ACTIVE_DEVICE` | page → SW | `{ deviceId }` — sent on connect and on every device change, before any `LEM_SESSION_OPEN` |
+| `LEM_SESSION_OPEN` | page → SW | `{ deviceId, serviceId }` |
+| `LEM_SESSION_CLOSE` | page → SW | `{ deviceId, serviceId }` |
 | `LEM_TUNNEL_UP` / `LEM_TUNNEL_DOWN` | page → SW | `{}` |
-| `LEM_FETCH` | SW → page | `{ reqId, serviceId, method, path, headers: [[k,v]…], body: ArrayBuffer \| null }`, plus a transferred reply `MessagePort` |
+| `LEM_FETCH` | SW → page | `{ reqId, deviceId, serviceId, method, path, headers: [[k,v]…], body: ArrayBuffer \| null }`, plus a transferred reply `MessagePort`. The page re-checks `deviceId` against its own live tunnel and answers `LEM_RESPONSE_ERROR{E_DEVICE_MISMATCH}` on a mismatch — the SW's check is not the only one, because the page is the side that actually owns the tunnel. |
 | `LEM_RESPONSE_HEAD` | page → SW | `{ reqId, status, headers: [[k,v]…] }` |
 | `LEM_RESPONSE_CHUNK` | page → SW | `{ reqId, buf }`, `buf` transferred |
 | `LEM_RESPONSE_END` | page → SW | `{ reqId }` |
@@ -310,10 +364,10 @@ issues the request through the existing `HTTPProxy` (upgraded to v3, §5).
 
 The current router (`server/app/tunnel/router.py:59-100`) resolves `?client=openwebui` to the
 discovered Open WebUI port and otherwise falls through to `http://localhost:5142`. That is a
-one-service special case (`router.py:127-131`). v3 requires a general selector; the page sends
-the service id and the server resolves it through the same status machinery that `/v1/services`
-uses (`server/app/services/status.py:223-249`, which already returns
-`http://127.0.0.1:<hostPort>` for any running Harbor service).
+one-service special case (`router.py:127-131`, including the `http://127.0.0.1:3000` sentinel at
+`:131` that the router reads as "not found"). v3 requires a general selector; the page sends the
+service id and the server resolves it through the same status machinery that `/v1/services`
+uses — **in strict mode**. See §3.6.1, which is a code change, not a routing policy.
 
 **Normative**: the request path put on the wire is the *upstream* path (`/api/models`), and the
 target service is carried in a request header `X-Lem-Service: <serviceId>`. Not a query
@@ -323,11 +377,76 @@ class of bug here (`proxy-fetch.ts:112-118` injecting `?client=` into arbitrary 
 Server-side, `RequestRouter.route()` gains a header-aware entry point. `X-Lem-Service` is
 consumed by the router and **stripped before forwarding** — add it to PR #25's
 `PROXY_CONTROLLED_HEADERS` set (`server/app/tunnel/http_proxy.py`, the frozenset defined
-alongside `HOP_BY_HOP_HEADERS`) so a peer cannot smuggle its own value through.
+alongside `HOP_BY_HOP_HEADERS`) so a peer cannot smuggle its own value through. Both frozensets
+exist **only on PR #25's branch**; neither name appears anywhere on `main` today (§5.5, §6).
 
 An unknown or not-running `serviceId` produces `502` with the §7.1 taxonomy, never a fall
-through to `localhost:5142`. The current silent fallback (`router.py:94-96`) is how a
-mistyped service id ends up hitting the privileged local API instead of erroring.
+through to `localhost:5142`. The current silent fallback (`router.py:93-100` — the
+"falling back to local server" warning, then the unconditional
+`return self.local_server_url`) is how a mistyped service id ends up hitting the privileged
+local API instead of erroring. Delete the `openwebui` special case at `router.py:127-131` and
+the `http://127.0.0.1:3000` sentinel in `get_openwebui_url()`: a sentinel value that a caller
+reinterprets as "not found" is a bug waiting to be rediscovered.
+
+#### 3.6.1 Strict port resolution — a code change, not a policy
+
+**Decided** (see §10, decision 1). Naming a caller "authoritative" does not disable a guess
+that lives *inside* it. On `main` today:
+
+- `_parse_host_port(ports_str, container_port)` (`server/app/services/status.py:155-185`) tries
+  the container-port-specific pattern first (`:171-176`) and, **on a miss, silently falls
+  through** to a fallback regex (`:178-183`) that returns the first host port it finds anywhere
+  in the Docker `Ports` string, with no verification that it maps to the right container port.
+- `get_service_endpoint()` (`:223-249`) — the general mechanism — calls that same function at
+  `:244`. So does `get_all_services_with_status()` at `:284`.
+
+Routing tunnel traffic through `get_service_endpoint` therefore inherits the guess; it only
+moves it one layer further from view. The fix has to be in the resolver.
+
+**Normative contract.** `_parse_host_port` gains a strict mode. The spec fixes the *contract*
+and leaves the shape to the implementer — a `strict: bool` parameter, or a separate
+`parse_host_port_strict` entry point, are both acceptable:
+
+| Mode | Behaviour on a container-port miss | Callers |
+|---|---|---|
+| **strict** | Return `None`. Never run the fallback regex. A `container_port` of `None` is itself a miss — you cannot match exactly against an unknown target. | **Tunnel routing only.** |
+| lenient | Current behaviour: fall through to the fallback regex. | The local dashboard's own service list and `endpoint`/`host_port` display. |
+
+**Tunnel routing MUST use strict mode.** When strict resolution yields no port, the tunnel
+returns `E_UNKNOWN_SERVICE` (§7.1) naming the service, and forwards nothing. Guessing where to
+send an authenticated request is a security decision disguised as a convenience: a wrong guess
+delivers the caller's credentials to whatever else happens to be listening on that host port.
+This is the same rule as [#29](https://github.com/lem-app/lem/issues/29) applied to addresses
+instead of identities — the tunnel must not forward to an address it cannot positively resolve,
+for the same reason it must not extend credentials to a peer it cannot positively identify.
+
+**The lenient path may remain**, unchanged, for the local dashboard's display. There the failure
+mode of a wrong guess is a broken link on a page the user is already looking at, on their own
+machine — not an authenticated request sent somewhere unintended. Deleting it would regress
+services whose container port the catalog does not declare, for no security gain.
+
+**Where this lands after PR #27.** PR #27 (`fix/platform-and-docker-correctness`, unmerged)
+rewrites `services/status.py` substantially, and the correction must be written against *that*
+version, not `main`'s. What changes:
+
+- `_parse_host_port` **survives with its fallback regex intact** — PR #27 only lifts the
+  function-local `import re` to module scope. The gap is not fixed there.
+- PR #27 funnels every port lookup through one new helper,
+  `_endpoint_for(service_id, container) -> tuple[int | None, str | None]`, which all three
+  call sites now use. **That helper is the right place for the `strict` flag**: threading one
+  boolean through `_endpoint_for` into `_parse_host_port` covers every caller, which is a
+  strictly smaller change than it would have been on `main`.
+- PR #27 also adds `get_service_url(service_id) -> str | None` — synchronous, non-raising, and
+  documented in its own docstring as being "used by callers that cannot await (e.g. tunnel
+  request routing)". **That is the tunnel's entry point**, and it is the function that must pass
+  `strict=True`. `get_all_services_with_status()` keeps `strict=False`.
+
+Concretely, against PR #27's file: `get_service_url` → `_endpoint_for(..., strict=True)` →
+`_parse_host_port(..., strict=True)`, and `_parse_host_port` returns `None` instead of reaching
+its fallback regex. Land this on PR #27's branch, not on `main`; if PR #27 lands first, apply it
+to the merged result. Either way the acceptance test is the same: a container whose `Ports`
+string publishes a port that does **not** map to the catalog's `container_port` resolves to
+`None` for the tunnel and to the guessed port for the dashboard, asserted separately.
 
 ### 3.7 WebSocket shim: injection point and the race
 
@@ -353,14 +472,37 @@ it.
    request whose `Content-Type` starts with `text/html`, the SW splices a single inline
    `<script>` in as the **first child of `<head>`** (or, if no `<head>` is found before the
    first `<script>` or `<body>`, immediately after the doctype). This is the injection point.
-   It is race-free by construction: the browser executes scripts in document order, so the shim
-   runs before any of the app's own scripts exist.
+   Because the browser executes scripts in document order, a shim spliced ahead of the app's
+   first `<script>` runs before any of the app's own code — so *given a correct splice*, the
+   ordering race is closed.
 
    Splicing happens on the byte stream, not on a buffered document: the SW passes the response
    through a `TransformStream` that scans only the first `HTML_SNIFF_BYTES = 65536` bytes for
    the insertion point and thereafter forwards untouched. If no insertion point is found in
    that window, the shim is not injected and the SW posts a `LEM_SHIM_SKIPPED` diagnostic —
    HTTP still works, WebSockets in that document do not.
+
+   **The correctness of the splice is a real requirement, not a given.** Calling this
+   "race-free by construction" would overstate it: the insertion point is found by scanning a
+   *stream*, and the marker can straddle a chunk boundary. `<he` at the end of one chunk and
+   `ad>` at the start of the next must still match. Normatively, the transform MUST:
+
+   - retain a carry-over buffer of at least `max(len(marker)) - 1` bytes between chunks, and
+     search the concatenation of carry-over and new chunk, not the chunk alone;
+   - decode as bytes with an ASCII-safe scan, not by `TextDecoder`-ing each chunk
+     independently — a multi-byte UTF-8 sequence split across chunks otherwise yields
+     replacement characters inside the document;
+   - emit nothing downstream until either the insertion point is found or
+     `HTML_SNIFF_BYTES` is exhausted, so the shim cannot be spliced *after* bytes the browser
+     has already begun parsing;
+   - treat the buffered prefix as a hard bound on memory: `HTML_SNIFF_BYTES` is the maximum
+     the transform may hold before it gives up and forwards untouched.
+
+   With those four properties the ordering guarantee holds for the documented cases. Without
+   the first two it fails intermittently, on exactly the large HTML documents where it matters,
+   which is the failure mode a "by construction" claim would hide. A test that feeds the
+   transform a document split at every byte offset across the marker is the cheap way to pin
+   this.
 
 3. **Shim behaviour in the iframe realm.** The injected script replaces
    `window.WebSocket` with a class that:
@@ -396,9 +538,10 @@ classes survive and become the bridge implementation.
 | Same-origin request from an **uncontrolled** client (the dashboard itself) | Do not intercept. | The dashboard's own bundle, `/lem-app-sw.js`, and its `proxyFetch` traffic must never enter the tunnel path. This is enforced structurally: `/` is outside scope `/app/`, so the dashboard is never a controlled client. |
 | `GET /lem-app-sw.js` from a controlled client | `403` (§7.1). | An app must not be able to read the worker source to look for the bridge protocol, and must not be able to trigger a re-registration. |
 | Same-origin path from a controlled client that resolves to no session (§3.5 step 6) | `421`. | Never guess a service. |
+| Request whose `<deviceId>` ≠ the active tunnel's device (§3.1) | `409` `E_DEVICE_MISMATCH`. **Never re-routed to the active device.** | A stale iframe, worker, or IndexedDB binding must not have its requests silently redirected to a different machine. Fail visibly; the user can reload. |
 | Any request while `LEM_TUNNEL_DOWN` | `503`. | Fail fast instead of hanging. |
 | `event.request.mode === 'navigate'` targeting `/app/…` **in the top-level frame** | Allowed, but the SW sets `Content-Security-Policy: frame-ancestors 'self'` and the dashboard treats a top-level `/app/` load as a hard-reload of the whole session. | Opening a service in a new tab is a legitimate affordance. See §8.4 for what it costs. |
-| Upstream `Location:` on a 3xx | Rewritten: same-origin-to-upstream absolute URLs and root-relative paths are re-prefixed to `/app/<serviceId>/…`; anything else is passed through verbatim. | Without this, a login redirect to `/auth/callback` escapes the prefix on the *next* navigation. PR #25 already stops the *server* from following redirects (`allow_redirects: False`), which is what makes this rewrite possible. |
+| Upstream `Location:` on a 3xx | Rewritten: same-origin-to-upstream absolute URLs and root-relative paths are re-prefixed to `/app/<deviceId>/<serviceId>/…` — carrying the **same** device segment as the request being answered, never the active one; anything else is passed through verbatim. | Without this, a login redirect to `/auth/callback` escapes the prefix on the *next* navigation. PR #25 already stops the *server* from following redirects (`allow_redirects: False`), which is what makes this rewrite possible. |
 
 Response headers the SW **strips before constructing the `Response`**:
 `Content-Security-Policy` and `Content-Security-Policy-Report-Only` from the upstream (they
@@ -777,38 +920,231 @@ MAX_HEADERS_BYTES = 256 * 1024      # 256 KiB
 with checks placed **before** every slice, in `deserialize_request` and `deserialize_response`.
 It also adds `MAX_WS_CONNECTIONS = 64` to `ws_proxy.py`.
 
+> **Scoping note.** None of these symbols exist on `main` today — `MAX_BODY_BYTES`,
+> `MAX_HEADERS_BYTES`, `MAX_WS_CONNECTIONS`, `HOP_BY_HOP_HEADERS` and
+> `PROXY_CONTROLLED_HEADERS` all return zero hits repo-wide at the time of writing. They exist
+> only on PR #25's branch, which is unmerged. Everywhere this document says v3 "extends" or
+> "adds to" one of them, it means *on top of PR #25's branch* (§6), not on top of `main`.
+
 **v3 keeps these names, values, and the check-before-allocate discipline**, and extends them:
 
 | Constant | Value | Applies to |
 |---|---|---|
 | `MAX_HEADERS_BYTES` | 256 KiB | *(PR #25)* `headers_len` in every HEAD/CONNECT frame |
-| `MAX_BODY_BYTES` | 32 MiB | *(PR #25, meaning extended)* total accumulated payload across all CHUNK frames of one `request_id`, in each direction |
-| `MAX_CHUNK_BYTES` | 48 KiB (49 152) | `payload_len` in one CHUNK or `WS_DATA` frame |
+| `MAX_BODY_BYTES` | 32 MiB | *(PR #25, meaning extended)* total accumulated payload across all CHUNK frames of one `request_id`, in each direction. **Enforced by the accumulator in §5.5.1 — a table row is not a mechanism.** |
+| `MAX_CHUNK_BYTES` | 48 KiB (49 152) **default** | `payload_len` in one CHUNK or `WS_DATA` frame. Negotiated per-peer in `HELLO`; see §5.5.2. |
 | `MAX_URL_BYTES` | 8 KiB | `path_len`, `url_len` |
 | `MAX_INFLIGHT_REQUESTS` | 128 | concurrent `request_id`s per channel, per direction |
 | `MAX_WS_CONNECTIONS` | 64 | *(PR #25)* live upstream sockets |
 | `MAX_WS_MESSAGE_BYTES` | 8 MiB | total across fragments of one WS message |
+| `POST_CANCEL_DRAIN_BYTES` | 512 KiB | bytes tolerated on a tombstoned `request_id` before the channel is closed (§5.5.1) |
 
-`MAX_CHUNK_BYTES` rationale: SCTP negotiates `maxMessageSize`; the interoperable floor is
-64 KiB, and the frame header costs up to 10 bytes. 48 KiB leaves headroom and is comfortably
-under every browser's advertised value. Implementations MUST additionally clamp to
-`min(MAX_CHUNK_BYTES, peer.max_chunk_bytes, pc.sctp.maxMessageSize - 1024)` where
-`pc.sctp` is available, and MUST use the smaller of the two peers' advertised
-`max_chunk_bytes` from `HELLO`.
-
-Exceeding any cap is a protocol error: the offending message is failed with the §7.1 code and
+Exceeding any cap is a protocol error: the offending *message* is failed with the §7.1 code and
 the channel is **not** torn down (a single oversized asset should not kill the session), except
-for `MAX_INFLIGHT_REQUESTS`, which is a peer-behaviour problem and does close the channel.
+for `MAX_INFLIGHT_REQUESTS` and a peer that keeps streaming past `POST_CANCEL_DRAIN_BYTES`,
+which are peer-behaviour problems and do close the channel.
+
+#### 5.5.1 Enforcing `MAX_BODY_BYTES` — cumulative per-`request_id` accounting
+
+This is the enforcement mechanism, stated normatively, because there is otherwise nothing to
+build. v2 carried a request's entire declared body length in a single frame, so PR #25's
+`if body_len > MAX_BODY_BYTES: raise` — one check, before one slice — was mechanically
+sufficient. v3 splits the body across an open-ended series of `HTTP_REQUEST_CHUNK` frames, each
+individually legal at ≤ `MAX_CHUNK_BYTES`. **A per-frame check cannot bound a multi-frame
+total.** Without the accumulator below, a peer sends unlimited 48 KiB `FINAL=0` chunks under one
+`request_id` and nothing rejects it — a regression against the control PR #25 established.
+
+There are **three independent layers**, and v3 adds only the third. This composes with PR #25's
+check; it does not replace it:
+
+| Layer | Where | Checks | Provenance |
+|---|---|---|---|
+| 1 | `http_frame.py` `deserialize_*` | `headers_len ≤ MAX_HEADERS_BYTES`, `path_len ≤ MAX_URL_BYTES` — before any slice | PR #25, kept verbatim |
+| 2 | `http_frame.py` `deserialize_chunk` | `payload_len ≤ effective_max_chunk` — before the slice, same style | v3, new, per-frame |
+| 3 | `HTTPProxyHandler` / `HTTPProxy` | cumulative `received[request_id] ≤ MAX_BODY_BYTES` — before the append | **v3, new, the subject of this section** |
+
+Layer 3 lives in the proxy handler, not the codec, because the codec is stateless and sees one
+frame at a time. That is precisely why it cannot be the layer that enforces a per-`request_id`
+total, and why a reviewer reading only `http_frame.py` would conclude the cap holds when it does
+not.
+
+**Receiving side, request direction (local server).** The handler keeps one intake record per
+in-flight `request_id`:
+
+```python
+@dataclass
+class RequestIntake:
+    method: str
+    path: str
+    headers: list[tuple[str, str]]
+    chunks: list[bytes]
+    received: int = 0          # cumulative payload bytes, THE accumulator
+
+# Per channel:
+intakes: dict[int, RequestIntake]      # bounded by MAX_INFLIGHT_REQUESTS
+tombstoned: dict[int, int]             # request_id -> bytes seen since teardown
+```
+
+On every `HTTP_REQUEST_CHUNK`, in this exact order:
+
+```python
+async def on_request_chunk(self, request_id: int, payload: bytes, final: bool) -> None:
+    # 0. A chunk for an id we already tore down: count it, never buffer it.
+    if request_id in self.tombstoned:
+        self.tombstoned[request_id] += len(payload)
+        if self.tombstoned[request_id] > POST_CANCEL_DRAIN_BYTES:
+            await self.close_channel(4006, "peer ignored cancellation")
+        if final:
+            del self.tombstoned[request_id]
+        return
+
+    intake = self.intakes.get(request_id)
+    if intake is None:
+        # CHUNK with no preceding HEAD is malformed, not merely unknown.
+        await self.fail_request(request_id, E_PROTO_MALFORMED)
+        return
+
+    # 1. THE CHECK. Before the append, on the running total, not on this frame.
+    if intake.received + len(payload) > MAX_BODY_BYTES:
+        await self.reject_oversize(request_id, intake, len(payload))
+        return
+
+    # 2. Only now is it safe to retain the bytes.
+    intake.received += len(payload)
+    intake.chunks.append(payload)
+
+    if final:
+        await self.dispatch(request_id, self.intakes.pop(request_id))
+```
+
+The check is `intake.received + len(payload) > MAX_BODY_BYTES`, evaluated **before**
+`chunks.append`, so the frame that breaches the cap is never retained. Peak memory for one
+`request_id` is therefore `MAX_BODY_BYTES + MAX_CHUNK_BYTES`, and for one channel
+`MAX_INFLIGHT_REQUESTS × (MAX_BODY_BYTES + MAX_CHUNK_BYTES)` — a number the implementer can
+check against the deployment's memory budget, which is the whole point of having a cap.
+
+**What happens on breach** (`reject_oversize`), in order:
+
+1. **Frames sent to the peer.** `HTTP_RESPONSE_HEAD` for that `request_id` with
+   `status_code = 502`, `BODY_FOLLOWS = 1`, followed by a single
+   `HTTP_RESPONSE_CHUNK` with `FINAL = 1` carrying the RFC 7807 problem detail for
+   `E_TOO_LARGE` (§7.1). The body is PR #25's **generic** string — it names neither the cap nor
+   the observed size, for the same reason `GENERIC_PROXY_ERROR` exists.
+   Then `HTTP_CANCEL` for the same `request_id`, `reason_code = E_TOO_LARGE`, telling the peer
+   to stop sending. The response frames come first so a peer that stops reading on `CANCEL`
+   still gets a diagnosable answer.
+2. **Stream teardown.** The exchange is over. No upstream request is issued — the local service
+   never sees a byte of an over-cap body, which is the second reason this control matters:
+   it is a guard on the *upstream* as much as on the tunnel process.
+3. **Partial state reclaimed.** `self.intakes.pop(request_id)` drops every buffered chunk
+   immediately, so the accumulated bytes are freed at rejection time rather than at
+   garbage-collection time. The `request_id` moves to `tombstoned` with a counter at 0.
+   The tombstone map is itself bounded at `MAX_INFLIGHT_REQUESTS` entries, evicted
+   least-recently-touched; an evicted id simply behaves as `E_PROTO_MALFORMED` afterwards.
+   A tombstone is released on the `FINAL` chunk, or when the channel closes.
+4. **The peer sees**: a real 502 in the iframe with an `E_TOO_LARGE` problem detail, and its own
+   send path cancelled. Not a hang, not a silent truncation.
+5. **The local log sees** — at `WARNING`, on the server only, one line with everything the
+   generic peer-facing body omits: `request_id`, resolved `serviceId`, method, path,
+   `received` at rejection, `MAX_BODY_BYTES`, and the peer's `impl` string from `HELLO`.
+
+**Receiving side, response direction (browser).** Symmetric, and it is why
+`PendingExchange.received` exists in §5.7 rather than being decorative. On every
+`HTTP_RESPONSE_CHUNK`, before `controller.enqueue`:
+
+```ts
+if (ex.received + payload.byteLength > MAX_BODY_BYTES) {
+  ex.controller?.error(new LemProxyError('E_TOO_LARGE'))   // the ReadableStream fails
+  sendFrame(serializeCancel(reqId, E_TOO_LARGE))           // tell the server to stop
+  pending.delete(reqId)                                    // reclaim: the queued chunks go too
+  tombstone(reqId)                                         // later chunks counted, not enqueued
+  return
+}
+ex.received += payload.byteLength
+ex.controller!.enqueue(payload)
+```
+
+Erroring the `ReadableStream` — rather than closing it — is what stops this from becoming
+silent corruption: the iframe's `fetch` rejects with a network error, exactly as an interrupted
+download does. A `controller.close()` here would hand the app a truncated body it believes is
+complete. The SW forwards the failure as `LEM_RESPONSE_ERROR{code: 'E_TOO_LARGE'}` (§3.5).
+
+**Sending side, response direction (local server).** The server MUST NOT emit a response body
+larger than `min(MAX_BODY_BYTES, peer.max_body_bytes)` for one `request_id`, so the browser's
+accumulator is a backstop rather than the primary control:
+
+- If the upstream response carries a `Content-Length` exceeding the effective cap, the server
+  rejects **before streaming**: `HTTP_RESPONSE_HEAD` 502 / `E_TOO_LARGE` with a final chunk, and
+  the upstream response is released unread. This is the good case — the failure is clean and
+  arrives immediately.
+- If the length is unknown (chunked, SSE, `Content-Encoding` stripped), the server accumulates
+  `sent[request_id]` across `iter_chunked` and, on breach, **cancels the upstream response and
+  sends `HTTP_CANCEL` with `reason_code = E_TOO_LARGE` without ever sending a `FINAL` chunk.**
+  The absence of `FINAL` is deliberate and load-bearing: the browser treats an inbound
+  `HTTP_CANCEL` on a streaming exchange as `controller.error()`, so a response whose 200 status
+  was already committed still fails visibly instead of truncating. A `FINAL` chunk here would
+  tell the browser the body was complete.
+
+A > 32 MiB transfer over the tunnel is therefore **not supported** in v3, and fails loudly at
+both ends. That is a deliberate product limit, not an oversight; N1 in §2 records why the number
+is where it is.
+
+#### 5.5.2 `MAX_CHUNK_BYTES` is a negotiated parameter, not a constant
+
+**Decided** (see §10, decision 3). 48 KiB is v3's *default advertised value*, not a fixed
+protocol constant. Each peer advertises what it will accept in `HELLO.max_chunk_bytes` (§5.4),
+and the effective value for a channel is:
+
+```
+effective_max_chunk = min(
+    local.max_chunk_bytes,          # what this peer will accept
+    peer.max_chunk_bytes,           # what the other peer advertised in HELLO
+    pc.sctp.maxMessageSize - 1024,  # WebRTC only; absent on the relay path
+)
+```
+
+The 48 KiB default is derived from the SCTP constraint: SCTP negotiates `maxMessageSize`, the
+interoperable floor is 64 KiB, and the frame header costs up to 10 bytes. 48 KiB leaves headroom
+and is comfortably under every browser's advertised value.
+
+Carrying it as a negotiated parameter rather than a hardcoded constant matters because **the
+relay path has no SCTP limit**. A relay peer may advertise a larger value and get larger frames
+without burning a protocol version. Implementations MUST send their own true limit, MUST clamp
+to the `min` above, and MUST reject a peer's frame that exceeds *their own* advertised value
+(§8.5: a peer enforces its own caps regardless of what the other side advertised).
+
+**Open dependency.** The relay's own per-message ceiling is *not* settled by this spec and
+must not be assumed. PR #45 (`fix/cloud-authz`, §6) is actively rewriting
+`cloud/relay/app/core/session_manager.py` — it adds `max_prepair_buffer_bytes`, a 30 s pair
+timeout, and per-account session caps, and it adds `--ws-max-size 65536` to the **signaling**
+service specifically. Whether the relay data path ends up with an equivalent ceiling is that
+branch's decision, not this one's. A v3 relay peer MUST therefore advertise a
+`max_chunk_bytes` it has actually verified against the deployed relay, and MUST default to
+48 KiB until that number is confirmed.
 
 ### 5.6 Server-side streaming
 
 `HTTPProxyHandler` changes shape. `handle_request(data) -> bytes` becomes a coroutine that
-*emits* frames through the existing `send_frame` callable (`webrtc_client.py:910-926`, already
+*emits* frames through the existing `_send_frame` callable (`webrtc_client.py:910-926`, already
 used by `WSProxyHandler`), rather than returning a single response blob to
 `_handle_datachannel_message` (`webrtc_client.py:893-908`).
 
+**Request ingress** is the receive loop of §5.5.1: `HTTP_REQUEST_HEAD` opens a `RequestIntake`,
+each `HTTP_REQUEST_CHUNK` runs the cumulative `received + len(payload) > MAX_BODY_BYTES` check
+**before** appending, and only a `FINAL` chunk dispatches upstream. Nothing below runs until
+that loop has completed a request, so an over-cap body never reaches `session.request`.
+
+**Response egress**, with its own accumulator per §5.5.1:
+
 ```python
 async with self.session.request(method, url, **kwargs) as response:
+    cap = min(MAX_BODY_BYTES, self.peer_max_body_bytes)
+
+    declared = response.content_length
+    if declared is not None and declared > cap:
+        await self.fail_request(request_id, E_TOO_LARGE)   # before a byte is streamed
+        return
+
     head = serialize_response_head(
         request_id,
         response.status,
@@ -817,7 +1153,16 @@ async with self.session.request(method, url, **kwargs) as response:
     )
     await self.send_frame(head)
 
-    async for chunk in response.content.iter_chunked(self.max_chunk_bytes):
+    sent = 0
+    async for chunk in response.content.iter_chunked(self.effective_max_chunk):
+        sent += len(chunk)
+        if sent > cap:
+            # Status 200 is already committed; the only honest ending is a failure.
+            # No FINAL chunk — see §5.5.1 on why that would be silent truncation.
+            response.close()
+            await self.send_frame(serialize_cancel(request_id, E_TOO_LARGE))
+            logger.warning(...)                            # local only, full detail
+            return
         await self._send_with_backpressure(
             serialize_response_chunk(request_id, chunk, final=False)
         )
@@ -825,7 +1170,8 @@ async with self.session.request(method, url, **kwargs) as response:
 ```
 
 `iter_chunked` yields as bytes arrive from the upstream socket, so an Ollama or Open WebUI
-token stream is forwarded token-group by token-group. That is G4.
+token stream is forwarded token-group by token-group. That is G4. Note `iter_chunked` takes the
+**negotiated** `effective_max_chunk` (§5.5.2), not the 48 KiB default.
 
 **Header filtering (`filter_response_headers`)** — new, symmetric with PR #25's
 `filter_request_headers`:
@@ -882,7 +1228,7 @@ interface PendingExchange {
   resolveResponse: (r: Response) => void
   rejectResponse: (e: Error) => void
   controller: ReadableStreamDefaultController<Uint8Array> | null
-  received: number            // total bytes, checked against MAX_BODY_BYTES
+  received: number            // cumulative body bytes; THE accumulator of §5.5.1
   headTimer: number           // HEAD_TIMEOUT_MS
   idleTimer: number           // CHUNK_IDLE_TIMEOUT_MS
 }
@@ -892,8 +1238,11 @@ interface PendingExchange {
   `start` stores the controller, and **resolve immediately** with
   `new Response(stream, { status, headers })`. `Response` with a stream body requires the
   `duplex` handling only for *requests*; a streamed response body is universally supported.
-- On `HTTP_RESPONSE_CHUNK`: `controller.enqueue(new Uint8Array(payload))`; on `FINAL`,
-  `controller.close()` and delete the entry.
+- On `HTTP_RESPONSE_CHUNK`: run the §5.5.1 cumulative check **before**
+  `controller.enqueue(new Uint8Array(payload))`; on `FINAL`, `controller.close()` and delete the
+  entry. An inbound `HTTP_CANCEL` for a streaming exchange is `controller.error()`, never
+  `controller.close()` — that distinction is what makes an over-cap response a visible failure
+  rather than a truncated body the app believes is whole.
 - Timeouts replace the single 30 s blanket timer at `proxy-fetch.ts:179-182`:
   - `HEAD_TIMEOUT_MS = 30_000` — no HEAD ⇒ reject the `fetch` promise.
   - `CHUNK_IDLE_TIMEOUT_MS = 60_000` — a stalled stream ⇒ `controller.error()`.
@@ -907,8 +1256,12 @@ interface PendingExchange {
 - Delete the `?client=` injection at `proxy-fetch.ts:112-118`; service targeting is the
   `X-Lem-Service` header (§3.6).
 
-Frame reading in `useWebRTC.ts:123-146` gains the new types; `0x02` routes to a loud
-`E_PROTO_V2_FRAME` error rather than the current `console.warn` for unknown types.
+Frame reading gains the new types; `0x02` routes to a loud `E_PROTO_V2_FRAME` error rather than
+the current `console.warn` for unknown types. Note there are **two** copies of this dispatch to
+update, not one: `useWebRTC.ts:123-146` for the DataChannel path and `useWebRTC.ts:206-222` for
+the relay path, differing only in indentation. They must not be allowed to diverge — extract one
+`routeFrame(message)` and call it from both, which is also the only way the relay-path
+acceptance criterion in Phase 3 stays honest.
 
 ### 5.8 Version negotiation
 
@@ -961,7 +1314,7 @@ stateDiagram-v2
   Sent --> Streaming: RESPONSE_HEAD then resolve Response
   Sent --> Failed: HEAD_TIMEOUT_MS / transport closed / bodyless 5xx RESPONSE_HEAD
   Streaming --> Done: RESPONSE_CHUNK final=1 then controller.close()
-  Streaming --> Failed: CHUNK_IDLE_TIMEOUT_MS / MAX_BODY_BYTES exceeded / transport closed
+  Streaming --> Failed: CHUNK_IDLE_TIMEOUT_MS / accumulator breach (5.5.1) / inbound CANCEL / transport closed
   Sent --> Cancelled: request.signal aborted then send HTTP_CANCEL
   Streaming --> Cancelled: request.signal aborted then send HTTP_CANCEL
   Done --> [*]
@@ -980,7 +1333,7 @@ stateDiagram-v2
   Streaming --> Streaming: iter_chunked then RESPONSE_CHUNK
   Streaming --> Done: send RESPONSE_CHUNK final=1
   Dispatched --> Errored: upstream error then RESPONSE_HEAD 502 + final CHUNK
-  Receiving --> Aborted: HTTP_CANCEL / cap exceeded
+  Receiving --> Aborted: HTTP_CANCEL / accumulator breach (5.5.1) then 502 + CANCEL, tombstone id
   Streaming --> Aborted: HTTP_CANCEL then cancel task, close upstream
   Done --> [*]
   Errored --> [*]
@@ -1032,16 +1385,61 @@ Reorder so the ack precedes the task creation.
 
 ## 6. Interaction with in-flight work
 
-| PR / branch | Overlap | How v3 composes |
-|---|---|---|
-| PR #24 `fix/green-baseline` | Repaired the v2 frame tests in both languages. | v3 replaces those tests wholesale, but keeps their structure (explicit byte-offset assertions, wrong-frame-type rejection). Land #24 first; do not revert it. |
-| PR #25 `fix/local-api-security` | Rewrites `http_proxy.py` (SSRF, header filtering, generic errors) and adds caps to `http_frame.py`. | **Additive.** v3 keeps `validate_path`, `build_target_url`, `filter_request_headers`, `HOP_BY_HOP_HEADERS`, `PROXY_CONTROLLED_HEADERS`, `allow_redirects=False`, `error_body`, `MAX_BODY_BYTES`, `MAX_HEADERS_BYTES`, `MAX_WS_CONNECTIONS`. v3 *adds* `filter_response_headers`, `MAX_CHUNK_BYTES`, `MAX_URL_BYTES`, `MAX_INFLIGHT_REQUESTS`, `X-Lem-Service` in `PROXY_CONTROLLED_HEADERS`, and `peek_request_id`. Implement v3 **on top of** #25's branch, not on top of `main`. |
-| `fix/platform-and-docker-correctness` | No tunnel overlap. | None. |
-| [#12](https://github.com/lem-app/lem/issues/12) relay fallback | The relay path carries the same frames. | v3 must be exercised on both transports (§9 Phase 3 criteria). The relay's own defects are out of scope here. |
+Status as of this revision: **#24 and #26 are merged**; **#25, #27 and #45 are open.**
+
+| PR / branch | State | Overlap | How v3 composes |
+|---|---|---|---|
+| PR #24 `fix/green-baseline` | **merged** (`5dafa1f`) | Repaired the v2 frame tests in both languages; moved dev deps to PEP 735 `[dependency-groups]`. | v3 replaces those tests wholesale, but keeps their structure (explicit byte-offset assertions, wrong-frame-type rejection). Do not revert it. |
+| PR #26 `ci/quality-gates` | **merged** (`506af26`) | Adds `.github/workflows/ci.yml`: 7 check runs, per-service coverage floors, a DCO gate and a license-header gate. | Every phase below must keep CI green. Coverage floors are a one-way ratchet, so a phase that adds untested code lowers nothing — it fails. See `testing_checklist.md` §3. |
+| PR #25 `fix/local-api-security` | open | Rewrites `http_proxy.py` (SSRF, header filtering, generic errors) and adds caps to `http_frame.py`. | **Additive.** v3 keeps `validate_path`, `build_target_url`, `filter_request_headers`, `HOP_BY_HOP_HEADERS`, `PROXY_CONTROLLED_HEADERS`, `allow_redirects=False`, `error_body`, `MAX_BODY_BYTES`, `MAX_HEADERS_BYTES`, `MAX_WS_CONNECTIONS`. v3 *adds* `filter_response_headers`, the §5.5.1 cumulative accumulator, `MAX_CHUNK_BYTES`, `MAX_URL_BYTES`, `MAX_INFLIGHT_REQUESTS`, `X-Lem-Service` in `PROXY_CONTROLLED_HEADERS`, and `peek_request_id`. Implement v3 **on top of** #25's branch, not on top of `main` — none of those symbols exist on `main`. |
+| PR #27 `fix/platform-and-docker-correctness` | open | **Corrected:** this does overlap. It rewrites `server/app/services/status.py`, which is the tunnel's upstream resolver, and adds `get_service_url()` documented for "callers that cannot await (e.g. tunnel request routing)". | §3.6.1's strict-mode change lands against **PR #27's** version of the file, using its `_endpoint_for` chokepoint. An earlier revision of this table said "no tunnel overlap"; that was wrong. |
+| PR #45 `fix/cloud-authz` | open | **Breaking** signaling + relay protocol change. See §6.1. | v3 must be built against #45's handshake, not today's. Phases 3 and 4 are affected. |
+| [#12](https://github.com/lem-app/lem/issues/12) relay fallback | open issue | The relay path carries the same frames. | v3 must be exercised on both transports (§9 Phase 3 criteria). Frames remain plaintext to the relay (`server/app/tunnel/relay_client.py:141-154`); #45 confirms and documents this rather than fixing it. |
 
 The one v2 fix worth landing **independently and immediately**: the `data[:4]` → `data[1:5]`
 correlation bug (§4.5). It converts a class of 30-second hangs into instant, correct 500s, and
-it is a one-line change with an obvious test.
+it is a one-line change with an obvious test. It touches a file PR #25 is rewriting, so it
+sequences **immediately after #25 lands**, not in parallel with it (§9 Phase 0).
+
+### 6.1 PR #45 changes the handshake v3 builds on
+
+PR #45 (`fix/cloud-authz`) is **open, not merged**, and it is a breaking change to the
+signaling and relay protocols. It closes a proven cross-account tunnel
+([#15](https://github.com/lem-app/lem/issues/15),
+[#16](https://github.com/lem-app/lem/issues/16)) in which one account could join a stranger's
+relay session. Its scope is `cloud/signaling`, `cloud/relay` and `deploy` only — it deliberately
+leaves `server/` and `web/` untouched and instead specifies the client work as a contract.
+
+**This spec must not assume today's handshake.** Nothing in v3's frame layer changes — v3 frames
+ride inside the session #45 establishes — but the code paths Phases 3 and 4 modify are the same
+ones #45's contract rewrites. Building v3 against today's handshake means writing the conflict
+twice.
+
+The five client-side changes v3 inherits:
+
+| # | Change | Files v3 also touches |
+|---|---|---|
+| 1 | **ed25519 challenge/response on `/signal`.** The server now answers `auth` with `{"type":"challenge", …}` and requires `{"type":"auth-response","signature":…}` before `connected`. Both clients currently treat the socket as authenticated the moment they send `auth` and never await an ack. | `webrtc_client.py::_connect_signaling` (`:429`), `web/remote/src/lib/webrtc.ts::connectSignaling` |
+| 2 | **Two-step device registration.** `POST /devices/challenge` then `POST /devices/register` with a signature; `pubkey` must be base64 of 32 raw ed25519 bytes, so the browser's literal `'browser-key'` becomes a 422. The browser has no keypair at all today and needs one (WebCrypto `Ed25519`), persisted alongside `browser_device_id`. | `server/app/api/v1/auth.py`, `web/remote/src/api/auth.ts::registerDevice` |
+| 3 | **`generateSessionId` is deleted.** `${browserDeviceId}-${targetDeviceId}` is guessable and was half the exploit. The server mints the session id; a client-supplied `relay_session_id` is ignored. `fallbackToRelay` must resolve on a new `connect-request-sent` message instead of `connect-ack-received`. | `web/remote/src/lib/webrtc.ts`, `web/remote/src/hooks/useWebRTC.ts` — **the same `useWebRTC.ts` Phase 3 rewrites for v3 frame types** |
+| 4 | **Per-side relay token.** The relay no longer accepts an account token; each side presents its own single-use, 120 s session grant, and the two are not interchangeable. Reconnect after expiry needs a fresh `connect-request`, not a replay. | `relay_client.py::_connect_relay`, `web/remote/src/lib/relay-client.ts::connectRelay` |
+| 5 | **`_try_relay_fallback` must be removed or rewritten.** It sets `session_id = self.device_id` (`webrtc_client.py:950`, inside the function defined at `:928`) and connects with the account token. Both are now rejected. A self-initiated relay fallback has to go through `connect-request` to obtain a session and a grant, exactly like the browser path. | `webrtc_client.py` |
+
+**Effect on the phases in §9:**
+
+- **Phase 3** (`proxy-fetch.ts`, `useWebRTC.ts`, `HELLO` on both sides) collides with items 3–5.
+  `useWebRTC.ts` is edited by both. Sequence Phase 3 **after** #45's client contract is
+  implemented, or accept a merge conflict in the file that owns relay fallback.
+- **Phase 3's** "both transports exercised" criterion cannot be met against a #45 relay without
+  items 3 and 4 — the relay closes the connection with `Authentication failed` before a single
+  v3 frame is exchanged. Any relay-path test written before then is testing a protocol that is
+  being removed.
+- **Phase 4** inherits item 2: the dashboard must hold a real device keypair. That is also
+  where §3.1's `<deviceId>` path segment gets its value from, so the two land naturally
+  together.
+- **§5.5.2** depends on #45 for the relay's per-message ceiling; it must not be assumed.
+- Nothing in Phases 0, 1, 2, 5 or 6 is affected — they are frame-layer and browser-side work
+  that sits above the session.
 
 ---
 
@@ -1051,11 +1449,12 @@ it is a one-line change with an obvious test.
 
 Carried in `LEM_RESPONSE_ERROR` between page and SW, and rendered by the SW into a synthetic
 `Response` whose body is an RFC 7807 problem detail — the same shape the local server already
-uses (`server/app/main.py:518-523`, `:720-724`; `server/app/services/lifecycle.py:100-108`).
+uses (`server/app/main.py:518-523`, `:720-724`; `server/app/services/lifecycle.py:99-108`).
 
 | Code | HTTP status | Meaning | Raised by |
 |---|---|---|---|
 | `E_NO_SESSION` | 421 | Request could not be attributed to a service (§3.5 step 6) | SW |
+| `E_DEVICE_MISMATCH` | 409 | The request's `<deviceId>` is not the active tunnel's device (§3.1) | SW, re-checked by page |
 | `E_SW_FORBIDDEN` | 403 | Controlled client asked for a dashboard-owned path | SW |
 | `E_BRIDGE_UNAVAILABLE` | 503 | No `bridgePort` within `BRIDGE_WAIT_MS` | SW |
 | `E_TUNNEL_DOWN` | 503 | `LEM_TUNNEL_DOWN` is in effect | page |
@@ -1080,13 +1479,14 @@ exactly how `FrameType` drifted between `http_frame.py` and `http-frame.ts` in v
 | Code | Meaning |
 |---|---|
 | 1000 | Normal closure, relayed from upstream |
-| 1006 | Abnormal closure, relayed from upstream (already used at `ws_proxy.py:155`, `:308`, `:323`) |
+| 1006 | Abnormal closure, relayed from upstream (already used at `ws_proxy.py:155`, `:327`, `:342`) |
 | 1011 | Upstream error |
 | 4001 | Protocol version mismatch (§5.8) |
 | 4002 | Shim could not reach the parent bridge (§3.7) |
 | 4003 | `WS_CONNECT_TIMEOUT_MS` elapsed with no ack |
 | 4004 | `MAX_WS_CONNECTIONS` reached (PR #25's limit) |
 | 4005 | `MAX_WS_MESSAGE_BYTES` exceeded |
+| 4006 | Peer kept streaming on a cancelled `request_id` past `POST_CANCEL_DRAIN_BYTES` (§5.5.1) — channel-level, not per-request |
 
 Reason strings sent over the wire stay generic; specifics go to the local server's log.
 
@@ -1102,7 +1502,7 @@ every control that PR #25 introduced (§6) and adds three:
 - The **service selector is a header the proxy strips** (§3.6), not a query parameter the peer
   can smuggle into an arbitrary path.
 - `X-Lem-Service` resolving to nothing produces `E_UNKNOWN_SERVICE`, never a silent fall-through
-  to `http://localhost:5142` (today's `router.py:94-96`). Falling through means a typo in a
+  to `http://localhost:5142` (today's `router.py:93-100`). Falling through means a typo in a
   service id reaches the privileged local API.
 - The SW never proxies a cross-origin URL (§3.8), so the framed app cannot use the tunnel to
   reach the wider internet from the user's home network.
@@ -1141,10 +1541,34 @@ The same-origin SW design makes this worse in one specific way and better in ano
 **Normative requirements that ship with Phase 6:**
 
 1. The remote dashboard MUST NOT persist the signaling JWT (or any bearer credential) in
-   `localStorage`, `sessionStorage`, or IndexedDB once the SW proxy is enabled. Hold it in a
-   module-scoped variable, and persist only a refresh credential in a cookie scoped
-   `Path=/; HttpOnly; Secure; SameSite=Lax` — `document.cookie` in the framed realm cannot read
-   an `HttpOnly` cookie.
+   `localStorage`, `sessionStorage`, or IndexedDB once the SW proxy is enabled. It MUST hold it
+   in a module-scoped variable.
+
+   **The `HttpOnly` refresh cookie is a prerequisite, not part of this phase — and it does not
+   exist.** An `HttpOnly` cookie can only be set by a server response header, so the signaling
+   service would have to issue one. It does not: `POST /auth/login` returns the JWT in the JSON
+   body, the token is a 24 h access token, and there is no refresh-token concept and no refresh
+   endpoint anywhere in `cloud/signaling` (see `api.md` §12). PR #45 (`fix/cloud-authz`) rewrites
+   a great deal of that service and still adds neither. Nothing in Phases 0–7 of this spec
+   touches `cloud/signaling`.
+
+   So the honest scoping is:
+
+   - **Phase 6 ships the in-memory JWT**, with the interim UX cost stated plainly: **every full
+     page reload logs the user out and requires re-authentication.** That is a real regression
+     against today's behaviour and must be a conscious trade, not a surprise discovered in
+     testing. Ship it behind the same flag as the SW proxy, so the cost is only paid where the
+     origin is actually shared.
+   - **The refresh-cookie work is separate, cross-service, and must be tracked as its own item
+     against `cloud/signaling`**: a refresh endpoint, a rotating refresh token in a
+     `Path=/; HttpOnly; Secure; SameSite=Lax` cookie, and access-token exchange on load.
+     `document.cookie` in the framed realm cannot read an `HttpOnly` cookie, which is what makes
+     it the right end state — but it is not a requirement this spec can satisfy, and writing it
+     as one made a document look complete that was not.
+
+   Phase 6's acceptance criterion is written accordingly (§9): a lint rule proving the token is
+   not persisted is necessary but not sufficient, so the criterion also asserts the reload
+   behaviour explicitly rather than letting "no `setItem`" stand in for a working design.
 2. `ClientViewer` keeps `sandbox="allow-scripts allow-same-origin allow-forms"` — dropping
    `allow-popups`, which the apps we target do not need — and the code carries a comment stating
    plainly that this restrains well-behaved apps only.
@@ -1175,7 +1599,12 @@ Build order note: branch from PR #25 (`fix/local-api-security`), not from `main`
 
 **Scope**: `server/app/tunnel/http_proxy.py` error path only.
 
-Replace `struct.unpack(">I", data[:4])` with the guarded `data[1:5]` read.
+Replace `struct.unpack(">I", data[:4])` (`http_proxy.py:115`) with the guarded `data[1:5]` read.
+
+**Sequencing**: ship this **as soon as PR #25 lands**, not with the rest of v3. It converts
+every proxy-level 500 from a 30-second browser hang into an immediate error, and it is one line.
+Because it touches a file #25 rewrites, it sequences immediately *after* #25 rather than in
+parallel with it.
 
 **Acceptance criteria**
 
@@ -1236,11 +1665,14 @@ return value), `message_dispatcher.py` (new types).
 - [ ] v3 server + v2 browser ⇒ same, from the other side.
 - [ ] Both transports exercised: WebRTC DataChannel and relay WebSocket.
 
-### Phase 4 — Service Worker and `/app/<serviceId>/` routing
+### Phase 4 — Service Worker and `/app/<deviceId>/<serviceId>/` routing
 
 **Scope**: `web/remote/public/lem-app-sw.js`, the bridge in the dashboard, `ClientViewer`
-rewritten to render `<iframe src={'/app/' + serviceId + '/'}>`, `ServiceCard` launch flow,
-`X-Lem-Service` on the wire and in the router.
+rewritten to render `<iframe src={'/app/' + deviceId + '/' + serviceId + '/'}>`, `ServiceCard`
+launch flow, `X-Lem-Service` on the wire, and the router's strict resolution path (§3.6.1).
+
+**Depends on PR #45** for the device keypair (§6.1 item 2) — the `<deviceId>` in the path is the
+device the dashboard has authenticated to signaling, not a value it invents.
 
 **Acceptance criteria**
 
@@ -1255,7 +1687,25 @@ rewritten to render `<iframe src={'/app/' + serviceId + '/'}>`, `ServiceCard` la
 - [ ] A same-origin request from a controlled client for `/lem-app-sw.js` returns 403.
 - [ ] A cross-origin request from the iframe is **not** intercepted (verified by a network-level
       assertion, not a log line).
-- [ ] A 302 to `/auth/callback` is rewritten to `/app/<serviceId>/auth/callback`.
+- [ ] A 302 to `/auth/callback` is rewritten to `/app/<deviceId>/<serviceId>/auth/callback`,
+      carrying the *request's* device segment, not the active one.
+- [ ] **Device-segment rejection**: with the active device switched to B, a request bearing
+      device A's segment — including one whose binding is recovered from IndexedDB after the SW
+      has been killed and restarted — returns `409 E_DEVICE_MISMATCH` and **no frame is put on
+      the wire**, asserted at the transport, not by a log line. Specifically: it must not be
+      re-routed to B.
+- [ ] **The §5.5.1 accumulator, on the request path**: a peer that sends `MAX_BODY_BYTES /
+      MAX_CHUNK_BYTES + 1` chunks of `MAX_CHUNK_BYTES` under a single `request_id`, each
+      individually legal, is rejected with `E_TOO_LARGE`; the server's buffered bytes for that
+      id never exceed `MAX_BODY_BYTES + MAX_CHUNK_BYTES` (asserted by instrumenting the intake,
+      not inferred); no upstream request is issued; and the id is tombstoned so continued
+      streaming is dropped without reallocation and closes the channel past
+      `POST_CANCEL_DRAIN_BYTES`. **This test must fail against an implementation that only
+      checks each frame against `MAX_CHUNK_BYTES`** — that is the whole point of it.
+- [ ] **The accumulator, on the response path**: an upstream that streams past the cap with no
+      `Content-Length` causes the browser's `ReadableStream` to *error*, not close — the
+      iframe's `fetch` rejects, and no truncated body is delivered as if complete. An upstream
+      that declares an over-cap `Content-Length` is rejected before any chunk is sent.
 - [ ] `MAX_BODY_BYTES` exceeded produces `E_TOO_LARGE` as a real 502 in the iframe.
 
 ### Phase 5 — WebSocket ack, shim injection, and streaming apps
@@ -1285,11 +1735,20 @@ through the secure WebRTC tunnel" claims where they are not yet true.
 
 - [ ] Dashboard served at `http://<lan-ip>:5173` shows the degraded state with reason
       `insecure-context`; catalog, install/start/stop, and `APITester` still work.
-- [ ] No `localStorage.setItem('token', …)` remains in `web/remote/src`; a lint rule enforces it.
+- [ ] No `localStorage.setItem('token', …)` remains in `web/remote/src` (today: `useAuth.ts:44`,
+      `:70`, plus reads at `:33`, `:34` and the remove at `:92`); a lint rule enforces it.
+- [ ] The token lives only in a module-scoped variable, asserted by a test that reloads the page
+      and observes a forced re-authentication — the accepted interim cost of §8.4 requirement 1.
+      A green lint rule with the token silently re-persisted elsewhere must fail this criterion.
 - [ ] Upstream `Content-Security-Policy` is stripped; the injected shim executes under the
       substituted CSP.
-- [ ] The strings at `ClientViewer.tsx:290-293` and `ClientSelector.tsx:197-198` describe what
-      the build actually does.
+- [ ] The strings at `ClientViewer.tsx:290-293` ("All HTTP requests and WebSocket connections
+      are automatically routed through the secure WebRTC tunnel to your local device") and
+      `ClientSelector.tsx:197-198` ("All connections are routed through the secure WebRTC
+      tunnel. HTTP requests and WebSocket connections are automatically proxied to your local
+      device") describe what the build actually does. The two are near-duplicates making the
+      same untrue claim, but they are **not** verbatim identical — fix both, do not
+      search-and-replace one string.
 - [ ] README's security section carries the §8.4 warning.
 
 ### Phase 7 — Per-service origins (post-v0.1, tracked separately)
@@ -1298,21 +1757,83 @@ Not part of this spec's deliverable. Recorded so the boundary work in §8.4 is n
 
 ---
 
-## 10. Open questions
+## 10. Decisions
 
-These are the places where the current code did not settle the answer, and the implementer
-should decide with the maintainer rather than guess.
+The three questions the code did not settle are **decided**. They are recorded here for
+provenance; each is folded into the normative body of the spec, and the body is what an
+implementer should build from. Nothing in this section is optional, and no part of the spec
+still contradicts it.
 
-1. **Service→upstream resolution for non-Harbor-named services.** `router.py:127-131` only
-   knows `openwebui`, and `get_openwebui_url()` has a `http://127.0.0.1:3000` sentinel that the
-   router treats as "not found". `services/status.py:223-249` is the general mechanism, but its
-   port parsing has a fallback regex (`status.py:180`) that picks *a* port when the container
-   port is unknown. Which of the two is authoritative for tunnel routing is not decided in code.
-2. **Whether `/app/` should carry a device segment.** One tunnel per tab makes
-   `/app/<serviceId>/` sufficient, but nothing in `App.tsx` prevents the user from changing the
-   target device while an iframe is open (`App.tsx:187` "Change Device"). Either close all
-   sessions on device change, or move to `/app/<deviceId>/<serviceId>/`.
-3. **Relay-path chunk sizing.** The relay has no `maxMessageSize` analogue, and
-   `cloud/relay/app/core/session_manager.py` was not audited for per-message limits as part of
-   this spec. `MAX_CHUNK_BYTES` is chosen for the SCTP constraint and applied to both
-   transports for uniformity; whether the relay wants a larger value is untested.
+### Decision 1 — Tunnel routing resolves ports strictly, or not at all
+
+**Normative text: §3.6.1.** Also §3.6, §7.1 (`E_UNKNOWN_SERVICE`), §8.1.
+
+`get_service_endpoint()` is the general mechanism, and the `openwebui` special case
+(`router.py:127-131`), its `http://127.0.0.1:3000` sentinel, and the silent fall-through to
+`http://localhost:5142` (`router.py:93-100`) all go away.
+
+**But naming that function authoritative is not sufficient, and an earlier version of this
+decision was wrong to stop there.** `get_service_endpoint` calls `_parse_host_port`
+(`status.py:155-185`) at `:244`, and `_parse_host_port` *is* the function containing the
+port-guessing fallback regex at `:180`. Declaring the caller authoritative relocates the guess
+inside the function now being trusted; it does not disable it. An implementer following the
+original wording exactly — delete the special case, call `get_service_endpoint`, treat it as
+authoritative — would have shipped the identical guessed-port behaviour the decision existed to
+forbid, one layer further from view.
+
+The decision therefore requires a **code change**: `_parse_host_port` gains a strict mode
+(a `strict: bool` parameter or a separate strict entry point — §3.6.1 fixes the contract and
+leaves the shape to the implementer). Strict mode returns no result instead of guessing.
+**Tunnel routing uses strict mode only.** The lenient path stays for the local dashboard's own
+display, where a wrong guess yields a broken link on the user's own machine rather than an
+authenticated request delivered to whatever else is listening.
+
+This lands against **PR #27's** rewrite of `services/status.py`, which keeps the fallback regex
+intact but introduces the `_endpoint_for` chokepoint and `get_service_url()` — see §3.6.1 for
+the exact placement.
+
+### Decision 2 — `/app/` carries a device segment
+
+**Normative text: §3.1.** Also §2 N6, §3.3, §3.4, §3.5, §3.8, §7.1
+(`E_DEVICE_MISMATCH`), §9 Phase 4.
+
+The path is `/app/<deviceId>/<serviceId>/`. The Service Worker **rejects** a request whose
+device segment does not match the active tunnel — `409`, visibly — and never re-routes it.
+
+Non-goal N6 has been rewritten: it previously read "One tunnel per tab; `/app/<serviceId>/`
+needs no device segment," which directly contradicted this decision. N6 now scopes to what is
+actually out of scope (two *simultaneously active* tunnels), which is a different claim.
+
+The justification is Service Worker and IndexedDB lifetime, not the "Change Device" button:
+`App.tsx:187`'s button is not reachable while `ClientViewer` is mounted (`App.tsx:154-169`
+returns early), so the race is *not* demonstrable in today's UI. It is demonstrable in the
+Phase-4 design, where 24 h `clientBindings` records, app-spawned workers, and bfcache-restored
+documents all outlive the React state that would have cleaned them up. §3.1 carries this
+correction inline.
+
+### Decision 3 — `MAX_CHUNK_BYTES` is negotiated in `HELLO`, defaulting to 48 KiB
+
+**Normative text: §5.5.2.** Also §5.4 (`HELLO` layout), §5.5 caps table, §5.8.
+
+48 KiB stays as the default — it is correctly derived from the SCTP constraint — but it travels
+as a per-peer advertised parameter rather than a hardcoded constant, because **the relay path
+has no SCTP limit** and may prefer larger frames. Negotiation lets that change without burning a
+protocol version.
+
+The wire format already supported this: `HELLO` carries `max_chunk_bytes` per peer (§5.4) and
+§5.5 already specified `min(local, peer, sctp)`. What was missing was saying so — §5.5's prose
+still framed 48 KiB as one constant "applied to both transports for uniformity." §5.5.2 now
+states the negotiation explicitly instead of leaving it implied by a byte layout.
+
+The relay's own per-message ceiling remains **unaudited and must not be assumed**.
+`cloud/relay/app/core/session_manager.py` is being rewritten by PR #45, which adds a pre-pair
+buffer bound and session caps, and adds `--ws-max-size 65536` to the *signaling* service. A v3
+relay peer advertises 48 KiB until it has verified a larger number against the deployed relay.
+
+---
+
+## 11. Open questions
+
+None outstanding. The three questions this document originally raised are decided in §10.
+New questions belong here rather than in a PR comment — a decision that lives only in review
+history is a decision the next implementer will re-derive, or contradict.

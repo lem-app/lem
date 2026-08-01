@@ -19,10 +19,16 @@ Tracking epic: [#23](https://github.com/lem-app/lem/issues/23).
 
 Plus three things the roadmap does not mention:
 
-- **`main` does not pass its own quality gates.** 5 failing server tests, 19 % coverage against
-  a stated 80 % target, 9 ruff errors, non-idempotent signaling tests, 0 relay tests, and a
-  `tsc --noEmit` that type-checks zero files. No CI exists.
-  [#20](https://github.com/lem-app/lem/issues/20).
+- **`main` still does not pass its own quality gates — but the shape of the problem has
+  changed.** Re-measured at `506af26`: every test suite is now green (server 40 passed,
+  signaling 9 passed and idempotent, web/remote 28 passed) and `mypy app/` is clean in all three
+  Python services. What remains red is `ruff format --check app/` in all three, `ruff check
+  app/ tests/` in `server` (7 errors, all in `tests/`), and `eslint` + `prettier` in both web
+  apps — so 5 of CI's 7 check runs currently fail. Still open beyond formatting: 19 % server
+  coverage against a stated 80 % target, 0 relay tests, and a `tsc --noEmit` that type-checks
+  zero files. **CI now exists** (`.github/workflows/ci.yml`, PR
+  [#26](https://github.com/lem-app/lem/pull/26)); the green-baseline half of
+  [#20](https://github.com/lem-app/lem/issues/20) does not.
 - **The local API that controls Docker has no authentication at all.**
   [#7](https://github.com/lem-app/lem/issues/7).
 - **Three proven cross-account compromises in the cloud services**, each needing nothing but a
@@ -45,7 +51,8 @@ Corrected roadmap, for the README:
 - [ ] Local API authentication (#7)
 - [ ] Cloud authorization (#15, #16)
 - [ ] Linux/WSL2 correctness (#10)
-- [ ] CI and a green baseline (#20)
+- [x] CI (#20, #26) — `.github/workflows/ci.yml`, 7 check runs
+- [ ] A green baseline (#20) — CI gates exist; 5 of 7 runs are red on formatting and lint
 - [ ] One-command install
 ```
 
@@ -93,22 +100,40 @@ flowchart TD
 
 ### Wave 1 — Green baseline · [#20](https://github.com/lem-app/lem/issues/20) · PR [#24](https://github.com/lem-app/lem/pull/24)
 
-Nothing else is trustworthy until the gates are.
+Nothing else is trustworthy until the gates are. **PR #24 is merged; most of this wave is done.**
+Re-checked against `506af26`:
 
-- Repair the stale frame-format tests in both languages (they assert the v1 layout; the wire is
-  v2).
-- Move dev dependencies out of `[project.optional-dependencies]` so the README's own
-  `uv sync && uv run pytest` works on a fresh checkout.
-- Give the signaling tests a per-test temporary database (`tests/test_api.py:40` sets
-  `db_module.DATABASE_FILE`, which does not exist; the code hardcodes `"signaling.db"` at
-  `app/db/database.py:90`, `:112`).
-- Fix ruff and eslint errors; run prettier.
-- Point type-checking at `tsconfig.app.json` so it checks files.
-- Correct the README's paths (`lem-app/server` and `lem/lem-app/web/local` do not exist; the
-  real paths are `server/` and `web/local/`).
+- [x] Repair the stale frame-format tests in both languages (they asserted the v1 layout; the
+      wire is v2). *Done — server 40 passed, web/remote 28 passed.*
+- [x] Move dev dependencies out of `[project.optional-dependencies]` so the README's own
+      `uv sync && uv run pytest` works on a fresh checkout. *Done, via PEP 735
+      `[dependency-groups]` (`server/pyproject.toml:64`, `cloud/signaling/pyproject.toml:47`,
+      `cloud/relay/pyproject.toml:42`) rather than plain `optional-dependencies`. **Side effect
+      worth knowing**: `uv sync --extra dev` is now a hard error in all three, because none of
+      them declares an `optional-dependencies` table at all.*
+- [x] Give the signaling tests a per-test temporary database. *Done —
+      `cloud/signaling/tests/test_api.py:29-36` is an autouse fixture that monkeypatches
+      `database.DATABASE_FILE` to a `tmp_path`. Verified idempotent across three consecutive
+      runs. The bullet's original citation is now obsolete: `DATABASE_FILE` **does** exist
+      (`app/db/database.py:34`), and the old hardcoded reads at `:90`/`:112` are now `:157` and
+      `:179` and go through it.*
+- [ ] **Fix ruff and eslint errors; run prettier.** *Partially done and the largest remaining
+      item. `ruff check app/` is clean in all three services, but CI checks `app/ tests/` and
+      `server` has 7 errors there (5 × F401, 2 × E501 in `tests/tunnel/`). `ruff format --check
+      app/` would reformat 6 / 7 / 4 files. `eslint`: 2 errors in `web/local`, 4 in
+      `web/remote`. `prettier --check`: 25 and 20 files.*
+- [ ] **Point type-checking at `tsconfig.app.json` so it checks files.** *Still open.
+      `web/remote/package.json:13` is still `"type-check": "tsc --noEmit"` — a no-op — and
+      `web/local` has no `type-check` script at all. CI works around it with
+      `tsc --build --noEmit` rather than depending on the scripts.*
+- [x] Correct the README's paths. *Done — the README now uses `cd server`, `cd web/local`,
+      `cd cloud/signaling`, `cd web/remote`. The only remaining `lem-app/` strings are GitHub
+      URLs.*
 
-**Done when**: `uv run pytest`, `mypy`, `ruff`, `vitest`, `tsc -p tsconfig.app.json --noEmit`,
-`eslint`, and `prettier --check` all pass in all five units on a clean checkout.
+**Done when**: every gate in `.github/workflows/ci.yml` passes on a clean checkout — that is now
+a machine-checkable statement rather than a list to keep in sync by hand. See
+[`testing_checklist.md`](./testing_checklist.md) §2.5 for the gate list and the per-service
+coverage floors.
 
 ### Wave 2 — Local API security · [#7](https://github.com/lem-app/lem/issues/7) [#8](https://github.com/lem-app/lem/issues/8) [#14](https://github.com/lem-app/lem/issues/14) · PR [#25](https://github.com/lem-app/lem/pull/25)
 
@@ -129,14 +154,21 @@ manual checks in [`testing_checklist.md`](./testing_checklist.md) §3.2 pass.
 Wave 7 builds on this branch, not on `main` — see
 [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.
 
-### Wave 3 — Cloud authorization · [#15](https://github.com/lem-app/lem/issues/15) [#16](https://github.com/lem-app/lem/issues/16) [#17](https://github.com/lem-app/lem/issues/17) [#18](https://github.com/lem-app/lem/issues/18) [#19](https://github.com/lem-app/lem/issues/19)
+### Wave 3 — Cloud authorization · [#15](https://github.com/lem-app/lem/issues/15) [#16](https://github.com/lem-app/lem/issues/16) [#17](https://github.com/lem-app/lem/issues/17) [#18](https://github.com/lem-app/lem/issues/18) [#19](https://github.com/lem-app/lem/issues/19) · PR [#45](https://github.com/lem-app/lem/pull/45)
+
+> **PR #45 (`fix/cloud-authz`) implements this wave and is open, not merged.** It is a
+> **breaking** signaling/relay protocol change, scoped to `cloud/` and `deploy/` only, and it
+> specifies the required client changes rather than making them. Wave 7 Phase 3 and Phase 4
+> touch the same client files (`useWebRTC.ts`, `webrtc.ts`, `relay_client.py`,
+> `webrtc_client.py`) — sequence them after #45's client contract, or plan for the conflict.
+> The contract is summarised in [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.1.
 
 - **Relay session ownership** (#15): bind a `session_id` to the account that created it and
   reject any other. Today the relay only checks that the token decodes
   (`cloud/relay/app/core/security.py:43-56`) — any account joins any session and reads or
   injects peer traffic.
 - **Signaling target ownership** (#16): check that `target_device_id` belongs to the sender's
-  account before routing (`cloud/signaling/app/api/signal.py:272`, `:303`).
+  account before routing (`cloud/signaling/app/api/signal.py:275`, `:306`).
 - **Ed25519 device authentication** (#17): either use the keypair — challenge/response at
   signaling connect — or stop generating it and correct the README claim.
 - **Fail-closed secrets** (#18): refuse to boot with the default
@@ -177,12 +209,19 @@ currently-failing security checks pass, each with a regression test.
 **Done when**: §4 step 9 of [`testing_checklist.md`](./testing_checklist.md) passes with a
 UDP-blocked network, fallback visible within 15 s.
 
-### Wave 6 — CI quality gates · [#20](https://github.com/lem-app/lem/issues/20) · PR [#26](https://github.com/lem-app/lem/pull/26)
+### Wave 6 — CI quality gates · [#20](https://github.com/lem-app/lem/issues/20) · PR [#26](https://github.com/lem-app/lem/pull/26) · **merged**
 
-Six jobs — `server`, `cloud/signaling`, `cloud/relay`, `web/local`, `web/remote`, license
-headers — plus contributor templates. Required for merge.
+**Done.** `.github/workflows/ci.yml` ships **7** check runs, not the six originally planned:
+`server`, `cloud-signaling`, `cloud-relay`, `web-local`, `web-remote`, `license-headers`, and a
+`dco` gate that verifies each non-merge commit's `Signed-off-by` matches its author. Contributor
+templates and dependabot config landed with it. Per-service coverage floors are enforced with
+`--cov-fail-under` as a one-way ratchet.
 
-**Done when**: every wave-1 gate runs on every PR and blocks merge on failure.
+Gate list and floors: [`testing_checklist.md`](./testing_checklist.md) §2.5 — **do not restate
+them here**, so there is one place to raise the ratchet.
+
+**Remaining**: CI exists but is currently red on 5 of 7 runs (formatting and lint, not tests).
+That is Wave 1's unfinished bullets, now enforced rather than merely noted.
 
 ### Wave 7 — Remote app viewing · [#6](https://github.com/lem-app/lem/issues/6) [#3](https://github.com/lem-app/lem/issues/3)
 
@@ -195,7 +234,7 @@ criteria: [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md).
 | 1 | v3 frame codecs in both languages, with cross-language golden vectors |
 | 2 | Server-side streaming proxy: binary bodies, chunking, backpressure, header filtering, cancellation |
 | 3 | Browser streaming client + `HELLO` version negotiation |
-| 4 | Service Worker, `/app/<serviceId>/` routing, `ClientViewer` rewrite |
+| 4 | Service Worker, `/app/<deviceId>/<serviceId>/` routing, `ClientViewer` rewrite |
 | 5 | `WS_CONNECT_ACK` / `WS_CONNECT_ERROR`, WebSocket shim injection |
 | 6 | Degradation path, security hardening, truthful UI copy |
 

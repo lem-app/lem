@@ -52,9 +52,15 @@ Some raises pass extra keys alongside the three standard ones — `service` and 
 (truncated to 500 chars) on Harbor failures (`lifecycle.py:100-108`), `job_id` on a 409
 (`lifecycle.py:157-164`). RFC 7807 permits these extensions.
 
-A few paths return a **plain string** `detail` instead of the object form: all four
-`/v1/auth/*` endpoints (`api/v1/auth.py:135-138`, `:249-252`, `:325-328`) and
-`POST /v1/tunnel/enable` (`main.py:409-412`). Clients must tolerate both shapes.
+A few paths return a **plain string** `detail` instead of the object form:
+`POST /v1/auth/register` and `POST /v1/auth/login` (`api/v1/auth.py:135-138`, `:249-252`,
+`:325-328`) and `POST /v1/tunnel/enable` (`main.py:409-412`). Clients must tolerate both shapes.
+
+This is **two** of the four `/v1/auth/*` endpoints, not all four: `logout()` (`auth.py:331-358`)
+and `get_status()` (`:361-389`) contain zero `raise HTTPException` calls and return
+unconditionally, so a claim about their error shape is vacuous rather than demonstrated. All 8
+`raise HTTPException` sites in the file — `:135`, `:142`, `:175`, `:211` in `register()`, and
+`:249`, `:256`, `:289`, `:325` in `login()` — do use the string form consistently.
 
 ### Error `type` URIs in use
 
@@ -393,16 +399,28 @@ or `{"authenticated": false, "tunnel_status": "offline"}`. Always 200.
 
 ## 12. Cloud signaling (`cloud/signaling/`, default `:8000`)
 
+> **This section documents `main`. PR [#45](https://github.com/lem-app/lem/pull/45)
+> (`fix/cloud-authz`, open) changes it breakingly.** Under #45: `/signal` gains an ed25519
+> challenge/response that must be answered before `connected` arrives; device registration
+> becomes two-step (`POST /devices/challenge` then `POST /devices/register` with a signature
+> over the nonce, and `pubkey` must be base64 of 32 raw ed25519 bytes, so the browser's literal
+> `'browser-key'` becomes a 422); `connect-request` no longer accepts a client-chosen
+> `relay_session_id` and answers with a new `connect-request-sent` message carrying a
+> server-minted session id plus a per-side, single-use, 120 s relay grant; and the relay refuses
+> account tokens outright. There is still **no refresh-token concept and no refresh endpoint**
+> — the 24 h access token in the JSON body below is unchanged by #45. Client-side impact is
+> enumerated in [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §6.1.
+
 ### `GET /health`
 `app/api/health.py:27-34`. `{"status": "ok", "timestamp": "<ISO-8601 UTC>"}`. 200.
 
 ### `POST /auth/register`
-`app/api/auth.py:28-88`. Body `{"email": EmailStr, "password": str}` — password
+`app/api/auth.py:27-93`. Body `{"email": EmailStr, "password": str}` — password
 `min_length=8` (`models/schemas.py:24-28`).
 **201** `{"access_token": "<jwt>", "token_type": "bearer"}` · 400 `Email already registered`.
 
 ### `POST /auth/login`
-`app/api/auth.py:91-129`. Same body without the length constraint.
+`app/api/auth.py:96-135`. Same body without the length constraint.
 200 with the same token envelope · 401 `Incorrect email or password`
 (with `WWW-Authenticate: Bearer`).
 
@@ -411,7 +429,7 @@ Tokens are HS256, 24 h expiry, signed with `settings.secret_key`
 when `ENV=production` — [#18](https://github.com/lem-app/lem/issues/18).
 
 ### `POST /devices/register`
-`app/api/devices.py:61-157`. `Authorization: Bearer <jwt>` required.
+`app/api/devices.py:62-162`. `Authorization: Bearer <jwt>` required.
 Body `{"device_id": str, "pubkey": str}`. Idempotent UPSERT that refreshes `last_seen`.
 
 ```json
@@ -422,17 +440,17 @@ Body `{"device_id": str, "pubkey": str}`. Idempotent UPSERT that refreshes `last
 200 · 401 invalid token · 403 `Device ID belongs to another user` · 500 if the row vanishes.
 
 ### `GET /devices/`
-`app/api/devices.py:160-197`. Bearer required. Array of the caller's devices. 200 · 401.
+`app/api/devices.py:165-203`. Bearer required. Array of the caller's devices. 200 · 401.
 Note the **trailing slash** — the route is registered as `"/"` under `prefix="/devices"`.
 
 ### `WS /signal`
-`app/api/signal.py:150-345`.
+`app/api/signal.py:150-349`.
 
 Authentication, either:
 - query parameters `?token=…&device_id=…` (deprecated — lands in access logs), or
 - the first text frame `{"type": "auth", "token": "…", "device_id": "…"}` within 10 s.
 
-The device must belong to the token's user (`signal.py:107-147`); otherwise the socket closes
+The device must belong to the token's user (`signal.py:106-147`); otherwise the socket closes
 with 1008.
 
 On success the server sends:
@@ -443,22 +461,22 @@ On success the server sends:
 ```
 
 Thereafter every client frame must be JSON with `type` and `target_device_id`, and must be
-≤ 64 KiB (`signal.py:266-270`).
+≤ 64 KiB (`signal.py:269-273`).
 
 | Client `type` | Server behaviour |
 |---|---|
-| `connect-request` | Rewritten to `connect-request-received` with `from_device_id`, `preferred_transport`, `relay_session_id`, and `relay_url` from settings; delivered to the target (`signal.py:276-286`). |
-| `connect-ack` | Rewritten to `connect-ack-received` with `from_device_id`, `transport`, `relay_session_id`, `status` (`signal.py:287-296`). |
-| anything else (`offer`, `answer`, `ice-candidate`, …) | `sender_device_id` is added and the message is forwarded verbatim (`signal.py:298-303`). |
+| `connect-request` | Rewritten to `connect-request-received` with `from_device_id`, `preferred_transport`, `relay_session_id`, and `relay_url` from settings; delivered to the target (`signal.py:279-288`). |
+| `connect-ack` | Rewritten to `connect-ack-received` with `from_device_id`, `transport`, `relay_session_id`, `status` (`signal.py:290-299`). |
+| anything else (`offer`, `answer`, `ice-candidate`, …) | `sender_device_id` is added and the message is forwarded verbatim (`signal.py:301-306`). |
 
 Server → sender replies: `{"type": "ack", "message": "Message delivered to …"}` on success, or
 `{"type": "error", "message": "…"}` when the target is not connected, the JSON is invalid, the
 message is oversized, or `type`/`target_device_id` is missing.
 
-Schemas for the relay-coordination messages: `models/schemas.py:80-137`.
+Schemas for the relay-coordination messages: `models/schemas.py:80-136`.
 
 **Authorization gap**: `target_device_id` is never checked against the sender's account
-(`signal.py:272`, `:303`). Any authenticated user can push messages at any online device —
+(`signal.py:275`, `:306`). Any authenticated user can push messages at any online device —
 [#16](https://github.com/lem-app/lem/issues/16).
 
 ---
