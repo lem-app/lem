@@ -92,13 +92,30 @@
 # examining prefixes any more. Neither app inlines an asset today, so this
 # costs nothing right now and fails closed the first time one appears.
 #
-# LINE BREAKS. Every rule is applied twice: once to the file as it is, and once
-# to a copy with newlines removed. A base64 literal split across an ordinary
-# line break inside a template literal is line-oriented grep's blind spot, and
-# it needs no deliberate obfuscation - a formatter wrapping a long string does
-# it by accident. Measured on both real bundles, the joined pass adds ZERO new
-# findings, so it is free. (Stripping spaces as well as newlines is NOT free:
-# it fuses Tailwind class lists into 29 false positives on web/local alone.)
+# SPLIT LITERALS. Every rule is applied twice: once to the file as it is, and
+# once to a copy with whitespace removed. A base64 literal split by whitespace
+# inside a template literal is line-oriented grep's blind spot, and it needs no
+# deliberate obfuscation - a formatter wrapping a long string does it by
+# accident.
+#
+# The first version of this stripped only "\n", which review broke with a TAB
+# through ordinary bundling and with "\r\n" through public/ - where `tr -d
+# '\n'` deletes the newline and LEAVES THE \r behind as a residual separator,
+# so the join reassembles nothing. The class is now every whitespace character
+# except U+0020 SPACE, chosen by measuring each one rather than by adding the
+# two that were reported; see JOIN_STRIP_ASCII below for the measurements.
+#
+# public/ IS THE AWKWARD PATH. Vite copies it into dist/ verbatim, bypassing
+# esbuild entirely, so nothing may assume the bundler has normalised anything:
+# not line endings, not encoding, not escaping. Every assumption in this script
+# is therefore about bytes on disk under dist/, never about what esbuild would
+# have produced. `find dist -type f` picks those copies up like any other file
+# (confirmed: the file count rises when public/ gains a file), the value rules
+# are pure content matching, and the whitespace class above is applied to raw
+# bytes under LC_ALL=C. The only bundler-shaped assumption left is the positive
+# control, which looks for the hashed entry chunk that Vite always emits - and
+# that is a check on the build having happened at all, not on any file's
+# content.
 #
 # WHAT THIS CANNOT DO. It is a heuristic scan over build output, not a proof.
 # It will not see a secret that is split across concatenated literals, encoded
@@ -124,10 +141,20 @@
 # detection of real secrets while the self-test still reported success. So the
 # set now includes: one canary per keyword alternative; shapes that start with
 # a digit and end with a digit; letter-heavy and digit-heavy shapes; strings
-# exactly AT the 32- and 16-char thresholds; the data: URI shapes above; and
-# NEGATIVE canaries one character BELOW each threshold plus a genuine inlined
-# PNG, which must NOT be reported. Both directions fail the script, so a rule
-# cannot silently narrow or silently widen.
+# exactly AT the 32- and 16-char thresholds; the data: URI shapes above; splits
+# by newline, tab and CRLF; a canary in a non-.js file at the dist root, which
+# is what a public/ static copy looks like; and NEGATIVE canaries one character
+# BELOW each threshold plus a genuine inlined PNG, which must NOT be reported.
+# Both directions fail the script, so a rule cannot silently narrow or silently
+# widen.
+#
+# WHAT THE SELF-TEST CANNOT CATCH. Its canaries are random, so it detects a
+# rule that stops matching a whole SHAPE. It cannot detect a weakening that
+# only shows up on collisions - review demonstrated this by truncating the
+# hash comparison to 32 bits, which random canaries missed in three runs
+# because they never collide by chance. The shipped code compares full
+# SHA-256 digests; the point is that this particular self-test is not the
+# thing keeping it that way, so read it as a shape check, not a proof.
 #
 # Usage:
 #   ./scripts/check-bundle-secrets.sh
@@ -250,6 +277,62 @@ filter_asset_hashes() {
   done
 }
 
+# Whitespace removed for the join pass: EVERY whitespace character except
+# U+0020 SPACE. Held as raw byte sequences and applied under LC_ALL=C, so this
+# is byte-exact regardless of locale - which matters because content copied
+# from public/ never goes through esbuild and can carry any bytes at all.
+#
+# Drawn on measurement, not on listing the cases that happened to be reported.
+# Against real builds of both apps, each of these costs ZERO extra findings,
+# individually and combined:
+#
+#   TAB U+0009  LF U+000A  VT U+000B  FF U+000C  CR U+000D  NBSP U+00A0
+#   OGHAM U+1680  U+2000-200A  LINE SEP U+2028  PARA SEP U+2029
+#   NNBSP U+202F  MMSP U+205F  IDEOGRAPHIC U+3000  ZWNBSP/BOM U+FEFF
+#
+# U+0020 SPACE is the one deliberate omission. It is NOT free: stripping it
+# fuses Tailwind class lists into runs that trip the opaque rule, costing 28
+# findings on web/local and 30 on web/remote. Every other whitespace character
+# costs nothing, so the line is drawn at "all whitespace except space" rather
+# than at whichever characters a reviewer has demonstrated so far.
+readonly JOIN_STRIP_ASCII=$'\t\n\v\f\r'
+readonly -a JOIN_STRIP_UTF8=(
+  $'\xc2\xa0'     # U+00A0 NO-BREAK SPACE
+  $'\xe1\x9a\x80' # U+1680 OGHAM SPACE MARK
+  $'\xe2\x80\x80' # U+2000 EN QUAD
+  $'\xe2\x80\x81' # U+2001 EM QUAD
+  $'\xe2\x80\x82' # U+2002 EN SPACE
+  $'\xe2\x80\x83' # U+2003 EM SPACE
+  $'\xe2\x80\x84' # U+2004 THREE-PER-EM SPACE
+  $'\xe2\x80\x85' # U+2005 FOUR-PER-EM SPACE
+  $'\xe2\x80\x86' # U+2006 SIX-PER-EM SPACE
+  $'\xe2\x80\x87' # U+2007 FIGURE SPACE
+  $'\xe2\x80\x88' # U+2008 PUNCTUATION SPACE
+  $'\xe2\x80\x89' # U+2009 THIN SPACE
+  $'\xe2\x80\x8a' # U+200A HAIR SPACE
+  $'\xe2\x80\xa8' # U+2028 LINE SEPARATOR
+  $'\xe2\x80\xa9' # U+2029 PARAGRAPH SEPARATOR
+  $'\xe2\x80\xaf' # U+202F NARROW NO-BREAK SPACE
+  $'\xe2\x81\x9f' # U+205F MEDIUM MATHEMATICAL SPACE
+  $'\xe3\x80\x80' # U+3000 IDEOGRAPHIC SPACE
+  $'\xef\xbb\xbf' # U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM
+)
+
+# sed program deleting each multi-byte sequence above. Built once. The bytes are
+# interpolated literally by bash, so sed never sees an escape it has to
+# interpret - no \x support required, and no metacharacters among them.
+JOIN_STRIP_SED=''
+for _seq in "${JOIN_STRIP_UTF8[@]}"; do
+  JOIN_STRIP_SED+="s/${_seq}//g;"
+done
+readonly JOIN_STRIP_SED
+unset _seq
+
+# Emit $1 with every whitespace character except SPACE removed.
+join_whitespace() {
+  LC_ALL=C tr -d "$JOIN_STRIP_ASCII" < "$1" | LC_ALL=C sed "$JOIN_STRIP_SED"
+}
+
 # Scan one built file for credential-shaped material.
 #
 # $1: path to the file
@@ -258,14 +341,13 @@ scan_file() {
   local file="$1"
   local scannable="${TMP_DIR}/scannable"
 
-  # The file as it is, plus the same file with newlines removed. The second
-  # copy is what catches a literal split across an ordinary line break, which
-  # line-oriented grep cannot see. Measured to add no findings of its own on
-  # either real bundle. Nothing is elided from either copy: see the header for
-  # why data: URI payloads are no longer special-cased.
+  # The file as it is, plus the same file with whitespace removed. The second
+  # copy is what catches a literal split by whitespace, which line-oriented
+  # grep cannot see. Nothing is elided from either copy: see the header for why
+  # data: URI payloads are no longer special-cased.
   cat "$file" > "$scannable"
   printf '\n' >> "$scannable"
-  tr -d '\n' < "$file" >> "$scannable"
+  join_whitespace "$file" >> "$scannable"
 
   grep -oaE "$OPAQUE_RE" "$scannable" 2>/dev/null \
     | grep -E '[0-9]' \
@@ -398,15 +480,31 @@ verify_scanner_detects_canaries() {
     "$(printf 'const lemCanaryC="data:font/woff2;base64,%s%s";' "$WOFF2_SIG_B64" "$woff2_tail")"
   )
 
-  # --- split across a line break, positive --------------------------------
-  # A long literal broken by an ordinary newline inside a template literal.
-  # Line-oriented grep cannot see it; the newline-stripped second pass can.
-  # Both halves are deliberately under the 32-char threshold on their own.
-  local split_head split_tail
-  split_head="$(rand_letters 1)$(rand_b64std 19)"
-  split_tail="$(rand_b64std 19)$(rand_digits 1)"
-  must_detect+=("${split_head}${split_tail}")
-  lines+=("$(printf 'const lemCanarySplit = `%s' "$split_head")" "$(printf '%s`;' "$split_tail")")
+  # --- split by whitespace, positive --------------------------------------
+  # A long literal broken by whitespace inside a template literal. Each half is
+  # deliberately under the 32-char threshold, so only the join pass can see the
+  # whole. One canary per separator that review proved live: a newline, a TAB
+  # (survives ordinary esbuild bundling), and a CRLF (survives the public/
+  # static copy, and defeats any join that removes \n but leaves \r).
+  local nl_head nl_tail tab_head tab_tail crlf_head crlf_tail
+  nl_head="$(rand_letters 1)$(rand_b64std 19)"
+  nl_tail="$(rand_b64std 19)$(rand_digits 1)"
+  tab_head="$(rand_letters 1)$(rand_b64std 19)"
+  tab_tail="$(rand_b64std 19)$(rand_digits 1)"
+  crlf_head="$(rand_letters 1)$(rand_b64std 19)"
+  crlf_tail="$(rand_b64std 19)$(rand_digits 1)"
+  must_detect+=(
+    "${nl_head}${nl_tail}"
+    "${tab_head}${tab_tail}"
+    "${crlf_head}${crlf_tail}"
+  )
+  lines+=(
+    "$(printf 'const lemCanaryNl = `%s' "$nl_head")"
+    "$(printf '%s`;' "$nl_tail")"
+    "$(printf 'const lemCanaryTab = `%s\t%s`;' "$tab_head" "$tab_tail")"
+    "$(printf 'const lemCanaryCrlf = `%s\r' "$crlf_head")"
+    "$(printf '%s`;' "$crlf_tail")"
+  )
 
   # --- keyword-adjacent, positive -----------------------------------------
   # One per alternative in KEYWORD_RE, each with a literal exactly at the
@@ -434,6 +532,16 @@ verify_scanner_detects_canaries() {
   )
 
   printf '%s\n' "${lines[@]}" >> "$target"
+
+  # --- a static file, positive --------------------------------------------
+  # Written at the dist root as a non-.js file, which is what a public/ copy
+  # looks like after Vite's verbatim static copy. Guards against scan_tree ever
+  # narrowing to the bundle chunks and missing the path that bypasses esbuild.
+  local static_secret
+  static_secret="$(rand_letters 1)$(rand_b64std 41)$(rand_digits 1)"
+  must_detect+=("$static_secret")
+  printf 'lem-canary-static %s\n' "$static_secret" > "${canary_dir}/lem-canary-static.txt"
+
   found="$(scan_tree "$canary_dir")"
   rm -rf "$canary_dir"
 
@@ -582,8 +690,9 @@ PASS. Checked, across ${#APPS[@]} app(s):
   - every byte of every base64 data: URI payload, with nothing excluded by MIME
     type or file signature; genuine assets are cleared by SHA-256 of the whole
     payload instead
-  - the same rules again over a newline-stripped copy, so a literal split by a
-    line break is not invisible
+  - the same rules again over a copy with every whitespace character except
+    SPACE removed, so a literal split by a newline, tab or CRLF is not
+    invisible (SPACE is left alone: stripping it costs 28-30 false positives)
   - the value scan itself, per app, against ${canary_positive} boundary canaries that must be
     reported and ${canary_negative} that must not
 
