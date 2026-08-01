@@ -27,7 +27,8 @@ a progress bar.
 
 ## 1. Where we are starting from (the honest baseline)
 
-The current documented quickstart is not five minutes and does not reach a phone. It is:
+The current documented quickstart is not five minutes and does not reach a phone. As documented
+when this was written it was:
 
 ```bash
 git clone https://github.com/lem-app/lem.git
@@ -40,11 +41,17 @@ cd lem/lem-app/web/local           # ← also does not exist (README.md:44)
 pnpm install && pnpm run dev       # ← a Vite dev server is the only way to get a UI
 ```
 
+**Two of those five annotations have since been fixed on `main`** (PR #24, 1 Aug 2026): the
+phantom `lem-app/` path segment is gone from `README.md` and `CONTRIBUTING.md`, and all dev
+tooling moved to `[dependency-groups].dev`, which a plain `uv sync` installs under PEP 735. What
+remains true is the part that matters for this document: **the server still binds `0.0.0.0` with
+no authentication, and a Vite dev server is still the only way to get a UI.**
+
 Measured facts behind that annotation:
 
 | Claim | Evidence |
 |---|---|
-| The `lem-app/` path segment does not exist | `README.md:39` and `README.md:44`; repo root has no `lem-app/` directory |
+| ~~The `lem-app/` path segment does not exist~~ | Was `README.md:39` and `README.md:44`; the repo root still has no `lem-app/` directory, but **PR #24 removed every reference to it** — this row is fixed |
 | The server never serves the dashboard | `server/app/main.py` contains no `StaticFiles` mount; static serving exists only on the unmerged `feat/install-script` branch (`server/app/main.py:752` there) |
 | The local API has no authentication | No auth dependency anywhere in `server/app/main.py` across 26 endpoints; only CORS at `server/app/main.py:141-154` (#7) |
 | The advertised one-liner cannot work | `scripts/install.sh:8` on `feat/install-script` advertises `curl -sSf https://lem.gg/install \| bash`; `https://lem.gg/install` returns **HTTP 404**; and the script resolves its own location via `${BASH_SOURCE[0]}` at `:301`, `:338`, `:543` — under a pipe that evaluates to the literal string `main`, so `dirname` yields `.` and the script silently treats the user's **current working directory** as the repo root |
@@ -399,19 +406,29 @@ Deliberately excluded, so implementation agents do not gold-plate:
 ## 7. Ordered dependency chain
 
 Phase 3 is the differentiator, but it cannot be built first — it stands on the security and
-correctness work. This is the build order:
+correctness work. This is the build order, **re-checked against `main` @ `652373b` on
+1 Aug 2026**; the first two rungs have since landed:
 
 ```
-#20  CI + green baseline
-      └─ #7, #8, #14   local API auth, SSRF, secret permissions   → Phase 1 criteria 1.6–1.8
-      └─ #10, #11, #13 platform module, async, job recovery        → Phase 2 criteria 2.3, 2.5, 2.6
-            └─ install script rewritten, location-independent      → Phase 1
-            └─ dashboard served by the server                      → Phase 1 criterion 1.9
-                  └─ #15, #16, #17  session/device authorization   → Phase 3 criteria 3.4–3.7
-                        └─ #12       relay fallback that triggers  → Phase 3 criterion 3.8
-                        └─ #6        service worker tunnel proxy   → Phase 3 criterion 3.10
-                              └─ generic catalog routing           → Phase 4
+[DONE]  #20            CI + green baseline                    PRs #24, #26 merged
+  └─ [DONE]  #10,#11,#13  platform module, async, job recovery   PR #27 merged
+  └─ [OPEN]  #7,#8,#14    local API auth, SSRF, secret perms     PR #25 open (+ #29)
+                          → Phase 1 criteria 1.6–1.8
+        └─ install script rewritten, location-independent      → Phase 1
+        └─ dashboard served by the server                      → Phase 1 criterion 1.9
+              └─ [OPEN]  #15,#16,#17  session/device authz      PR #45 open (+ #18, #19)
+                          → Phase 3 criteria 3.4–3.7
+                    └─ #12   relay fallback that triggers      → Phase 3 criterion 3.8
+                    └─ #6    service worker tunnel proxy       → Phase 3 criterion 3.10
+                          └─ generic catalog routing           → Phase 4
 ```
+
+**What this changes:** the chain's root is no longer blocking. CI exists, `main` is green
+(200 tests passing, 53% server coverage), and Linux/WSL2 works. The critical path now starts at
+the security work — #25 and #45 are open PRs against exactly those issues, so **reviewing and
+landing them is the build order**, not planning it. Note that all of these issues remain *open*
+on GitHub even where the code has merged; issue state is not a reliable signal of what is done
+in this repo right now, so check `main` rather than the tracker.
 
 Nothing in Phase 3 should be demoed publicly before #15 and #16 are closed. Both are proven
 cross-account compromises, and a pairing demo is exactly the scenario that exposes them.

@@ -23,8 +23,8 @@ Cloudflare.** Lem currently re-exposes Harbor's catalog through a worse UI and a
 tunnel.
 
 So the honest position is: **the two-sided gap Lem was built to fill is now occupied on both
-flanks, and Lem has 3 GitHub stars, 36 commits, one contributor, no CI, no working remote
-access, three proven cross-account compromises, and no hosted service** (`signal.lem.gg` and
+flanks, and Lem has 3 GitHub stars, 56 commits, one contributor, no working remote access,
+three proven cross-account compromises, and no hosted service** (`signal.lem.gg` and
 `relay.lem.gg` do not resolve in DNS).
 
 That is the bad news, and it is most of the news.
@@ -68,7 +68,9 @@ product*, and Lem currently has an unauthenticated one.
 
 ### 1.1 The README versus the code
 
-The README's roadmap marks four of five v0.1 items complete. Measured against `main`:
+The README's roadmap marks four of five v0.1 items complete. Measured against `main` @ `652373b`
+(re-checked 1 Aug 2026 — two rows have been fixed since this document was drafted and are marked
+as such; see the rebase note in §1.4):
 
 | README claim | Reality | Evidence |
 |---|---|---|
@@ -78,8 +80,8 @@ The README's roadmap marks four of five v0.1 items complete. Measured against `m
 | "End-to-end encryption: All remote traffic is encrypted" (`README.md:65`) | False on the relay path. `cloud/relay/README.md:74` states plainly: "v0.1: TLS only, relay sees plaintext" | #17 |
 | "Device registration: ed25519 public key authentication" (`README.md:67`) | The keypair is generated and never used. `load_keypair_from_b64()` and `public_key_from_b64()` in `server/app/crypto.py` have **zero call sites**. Every browser registers the literal string `'browser-key'` (`web/remote/src/api/auth.ts:70`) | #17 |
 | "Privacy-First… remote access requires your explicit authentication" (`README.md:11`) | The local API that controls Docker has **no authentication on any route**: 26 handlers in `server/app/main.py` plus 4 in `server/app/api/v1/auth.py`, with no auth dependency or middleware anywhere — only a CORS allowlist at `server/app/main.py:141-154`, which is not authentication | #7 |
-| "Cross-Platform: macOS, Linux, Windows (WSL2)" (`README.md:13`) | The macOS Docker socket is hardcoded at `server/app/drivers/harbor_wrapper.py:51`; `server/app/config/platform.py` does not exist on `main` | #10 |
-| Quick Start commands (`README.md:39,44`) | Reference a `lem-app/` directory that does not exist in the repository | #21 |
+| "Cross-Platform: macOS, Linux, Windows (WSL2)" (`README.md:13`) | **Fixed since this document was drafted.** The macOS Docker socket was hardcoded at `server/app/drivers/harbor_wrapper.py:51` and `server/app/config/platform.py` did not exist. [#27](https://github.com/lem-app/lem/pull/27) merged the platform module on 1 Aug 2026; `harbor_wrapper.py` now imports `HARBOR_SCRIPT` from it and Docker routes through `DOCKER_HOST`. Issue #10 is still open but the defect is gone from `main` | #10 (merged, unclosed) |
+| Quick Start commands (`README.md:39,44`) | **Fixed since this document was drafted.** They referenced a `lem-app/` directory that does not exist; [#24](https://github.com/lem-app/lem/pull/24) corrected every occurrence in `README.md` and `CONTRIBUTING.md`. The only `lem-app/` strings left on `main` are the GitHub org in clone/issue URLs, which are correct | #21 (partly merged, unclosed) |
 
 Three findings are **proven cross-account compromises requiring nothing but a free account**:
 
@@ -153,13 +155,26 @@ Not everything is broken, and the working parts are the ones worth building on:
 |---|---|
 | GitHub stars | **3** |
 | Forks / watchers | **0 / 0** |
-| Total commits | **36** |
+| Total commits | **56** |
 | Distinct human contributors | **1** (all commits by Blake Martz) |
 | Repo created | 2025-10-26 |
-| CI | **None.** No `.github/` directory (#20) |
-| Server test coverage | **19%** against a stated >80% bar; 5 tests failing on `main` (#20, #22) |
-| Relay test coverage | **0%** — `tests/` holds only `__init__.py` (#20) |
+| CI | **Exists as of 1 Aug 2026** — `.github/workflows/ci.yml`, merged by [#26](https://github.com/lem-app/lem/pull/26). Gates format, lint, mypy, pytest and a per-service coverage ratchet across `server`/`cloud-signaling`/`cloud-relay`; `tsc --build --noEmit`, eslint, prettier, build and vitest across both web apps; plus SPDX license-header and DCO jobs |
+| Server tests | **200 passed, 0 failed** (re-measured on `main` @ `652373b`) |
+| Server test coverage | **53%** against a stated >80% bar; CI ratchet floor is 50 |
+| Signalling test coverage | **67%** (ratchet floor 65) |
+| Relay test coverage | **0%** — `cloud/relay/tests/` still holds only `__init__.py`; CI emits a "no tests collected" warning rather than failing (ratchet floor 0) |
 | Hosted signalling / relay | **Do not exist.** `signal.lem.gg` and `relay.lem.gg` (referenced in `web/remote/.env.production.example`) do not resolve in DNS |
+
+> **Rebase note (1 Aug 2026).** The CI, test and coverage rows above were re-measured against
+> `main` @ `652373b` after this branch was rebased. When this document was first written its
+> merge-base was `28baea7`, where there genuinely was no `.github/` directory, 5 failing tests
+> and 19% server coverage. [#24](https://github.com/lem-app/lem/pull/24) (green baseline),
+> [#26](https://github.com/lem-app/lem/pull/26) (CI) and
+> [#27](https://github.com/lem-app/lem/pull/27) (platform/Docker) all merged within the same few
+> hours as this document's final revision. **The security findings below are unaffected** — they
+> rest on code that is still on `main`, re-verified during the rebase: the local API still has no
+> auth dependency, `crypto.py`'s ed25519 helpers still have zero call sites, and
+> `tunnel/router.py:127` still resolves exactly one service ID.
 
 **Strategic reading:** Lem is pre-launch, not early-stage. There are no users to lose and no
 moat to defend. Every framing in this document should therefore be about *earning the first
@@ -191,7 +206,7 @@ to fix it.
 | **[Pangolin](https://github.com/fosrl/pangolin)** | Self-hosted tunnel + reverse proxy | No | Yes | Yes | No | AGPL-3 CE + commercial | **21,954 stars**; YC 2025; $4–9/user/mo |
 | **[NetBird](https://github.com/netbirdio/netbird)** | WireGuard overlay + SSO/MFA | No | Yes | Yes | No | **BSD-3 client / AGPL server** — Lem's exact split | **27,973 stars**; $10M Series A (Jan 2026) |
 | **[Cosmos Server](https://github.com/azukaar/Cosmos-Server)** | *"All in one secure reverse-proxy, container manager with app store, integrated VPN, authentication provider"* | **Yes** | **Yes** | **Yes** | Yes (general self-hosting) | Source-available | **6,084 stars**; release posts reliably clear 170 pts in r/selfhosted (509 for v0.16) |
-| **[Pinokio](https://desktop.pinokio.co/)** | "AI browser" / one-click app launcher | Yes — JSON install scripts | **LAN only** — v8 (8 Jul 2026) added a "Home Server" with QR phone access | No | Yes | MIT (shell) | 7.8k stars but **41,670 Discord members**; 41k Windows downloads in 2 weeks |
+| **[Pinokio](https://desktop.pinokio.co/)** | "AI browser" / one-click app launcher | Yes — JSON install scripts | **LAN only** — v8 (8 Jul 2026) added a "Home Server" with QR phone access | No | Yes | MIT (shell) | 7,803 stars but **~62 Discord members**; 41k Windows downloads in 2 weeks |
 | **[Jan](https://jan.ai/docs/desktop/api-server)** | Desktop app + local API server | Models only | LAN only | **Yes — API keys, trusted-host allowlist, CORS; binds `127.0.0.1` by default** | No | Apache-2.0 + attribution request | 43.8k stars; claims 6.1M downloads |
 | **[LocalAI](https://localai.io/docs/features/authentication/)** | OpenAI-compatible inference engine | Models only | No first-party remote product | **Yes — OIDC, GitHub OAuth, per-user API keys and quotas** | No | MIT | 48.1k stars; 5.84M Docker pulls |
 | **[Backyard AI](https://backyard.ai/blog/mobile-tethering)** (ex-Faraday) | Desktop app + **"Mobile Tethering"**, Feb 2024 | Yes | **Yes — and they killed it** (§2.6) | Yes | No | Proprietary | Desktop **"deprecated and no longer supported"**; now sells hosted inference at $12–35/mo |
@@ -269,8 +284,9 @@ competitive fact in this document:
 - Transport is **Tailscale**, in an announced partnership: *"All communication and data
   transfer between devices is always end-to-end encrypted, thanks to Tailscale."*
 - Setup is: install app, follow in-app instructions. No tunnel configuration.
-- LM Link pricing is not documented on their site; LM Studio's desktop product is free for
-  personal and internal business use, so **assume free**.
+- **LM Link is free, with a documented 5-device cap.** [lmstudio.ai/pricing](https://lmstudio.ai/pricing)
+  lists *"LM Link for up to 5 devices"* in the free tier. This is not an undocumented gap — it
+  is a stated limit, and it matters (see below).
 
 **What this means:** "your phone talking to the GPU in your house, no cloud, no subscription"
 is no longer an unclaimed pitch. A well-funded incumbent ships it, for free, with better
@@ -285,6 +301,16 @@ networking than Lem will build.
   n8n, SearXNG, Dify, LibreChat, Langflow, vLLM, or the other 80-odd services in Harbor's
   catalog.
 - **It is iOS-only** so far (iPhone/iPad).
+- **It is capped at 5 devices, and the cap is where the household pitch strains.** Five is
+  generous for one person and tight for exactly the buyer §3 identifies — the person setting
+  this up for a household. Two adults, two teenagers and a tablet is five before the owner's own
+  laptop and phone are counted. More importantly, a *stated* free-tier limit is a monetization
+  lever held in reserve: a metered dimension already exists in the product and already has a
+  number attached to it, which is how a free tier becomes a paid one without a strategy change.
+  Lem has no per-device limit and, being self-hostable end to end, structurally cannot acquire
+  one imposed by a vendor. That is a small, concrete, checkable differentiator — worth stating
+  plainly rather than leaving as a footnote, and worth not overclaiming either: five devices
+  covers most households.
 - **Its transport depends on a commercial third party.** A Tailscale pricing or policy change
   is LM Studio's problem, not Lem's.
 
@@ -313,13 +339,18 @@ exposure*, and it is currently answered with tutorials rather than products.
 than the positive ones:**
 
 1. **The "app store for local AI" has weak — arguably negative — demand in this specific
-   audience.** Harbor's own r/LocalLLaMA reception has declined release over release, it has
-   ~100 Discord members against 3,150 stars, and a competing project's author publicly
-   described Harbor's catalog breadth as *"overwhelming."* The catalog demand that clearly
-   exists is for **models** and for a **small set of working defaults** — not for 137 services.
-   Contrast Cosmos Server, whose comparable pitch reliably clears 170 points *in r/selfhosted*.
-   **Breadth may be a liability with the local-AI crowd and an asset with the self-hosting
-   crowd**, which is a positioning decision, not a feature decision.
+   audience.** The verified part: Harbor has **~100 Discord members against 3,150 stars**
+   (GitHub API and Discord invite API), and Pinokio has **~62 against 7,803** — under 1%. A
+   catalog with thousands of stars behind it is not attracting a community proportionate to its
+   visibility. *Reported but not independently verified* — Reddit blocks fetching, the same
+   limitation disclosed for the buyer-persona claims in §3 — is that Harbor's r/LocalLLaMA
+   reception has declined release over release and that a competing project's author described
+   its catalog breadth as *"overwhelming."* **Treat those two as unconfirmed;** the argument
+   below stands on the star/Discord ratios alone. The catalog demand that clearly exists is for
+   **models** and for a **small set of working defaults** — not for 137 services. Contrast
+   Cosmos Server, whose comparable pitch reliably clears 170 points *in r/selfhosted*
+   (archive-verified). **Breadth may be a liability with the local-AI crowd and an asset with
+   the self-hosting crowd**, which is a positioning decision, not a feature decision.
 2. **Willingness to pay is close to unevidenced.** One paid $6 mobile client is the whole
    corpus. Every adjacent project — Harbor, Pinokio, LocalAI, Jan — has no monetization at
    all. When Open WebUI added commercial licensing the response included a 641-point thread
@@ -403,10 +434,17 @@ below does not rest on them alone — see the corroboration that follows.)*
   general self-hosting. Its release post scored **509 points with 180 comments in
   r/selfhosted** (archive-verified), and it has **6,084 GitHub stars**. The concept sells — in
   the self-hosting community.
-- **Harbor's** r/LocalLLaMA reception has gone the other way over time, and it has ~100 Discord
-  members against 3,150 stars (§7 Risk 1).
-- **Pinokio** — the "app store for AI" — has **41,670 Discord members** against 7,803 stars.
-  Its users are not the GitHub-star demographic.
+- **Engaged community is a small fraction of stars in this category.** Harbor has **~100 Discord
+  members against 3,150 stars** — a 3% ratio, confirmed against the GitHub and Discord invite
+  APIs. Pinokio, the "app store for AI", is *lower still*: **~62 Discord members against 7,803
+  stars**, under 1%. A star is a bookmark, not a user, and the gap is large enough that star
+  counts should not be used to size either the opportunity or the threat (§7).
+
+*(Also reported, and also not independently verified: that Harbor's r/LocalLLaMA reception has
+declined release over release, and that a competing project's author described its catalog
+breadth as "overwhelming." Both come from the same research pass and the same blocked-Reddit
+limitation as the quotes above, and neither should be relied on as fact. The Discord and star
+ratios in the bullet above are the verified part of this argument and carry it on their own.)*
 
 **So the real user is: the technically confident person who is the de-facto IT department for
 other people.** They own the GPU and can handle Docker — but the *value* they are buying is
@@ -502,26 +540,44 @@ and trust argument, not an acquisition argument. Do not lead with it.
 Framed against the README's v0.1 / v1.0 structure. Every item names the issues it depends on.
 **Nothing in Wave 2 or later should start before Wave 0 and Wave 1 are done.**
 
-### Wave 0 — Stop the bleeding (blocks everything)
+### Wave 0 — Stop the bleeding — **substantially done as of 1 Aug 2026**
 
-| Item | Issues | Why first |
+Wave 0 originally led with "build CI." **That premise expired during review.** Re-derived
+against `main` @ `652373b`:
+
+| Item | Issues | Status |
 |---|---|---|
-| CI that runs the gates CLAUDE.md already mandates | **#20** | Five PRs merged with failing tests, 19% coverage, and a `tsc --noEmit` that checks zero files. Without this, every fix below silently regresses. |
-| Green baseline: failing tests, packaging, lint, types, README paths | **#20, #21, #22** | `main` does not pass its own quality bar. |
-| Correct the README's false security claims | **#17** | A false security claim is worse than a missing feature. This is a documentation change and can ship today. |
+| ~~CI that runs the gates CLAUDE.md already mandates~~ | **#20** | **DONE** — [#26](https://github.com/lem-app/lem/pull/26) merged `.github/workflows/ci.yml`: ruff format/check, mypy, pytest with a per-service coverage ratchet, `tsc --build --noEmit` (the zero-file `tsc --noEmit` defect this row cited is fixed), eslint, prettier, build, vitest, SPDX headers, DCO. Issue #20 is still open but the work has landed. |
+| ~~Green baseline: failing tests, packaging, lint, types, README paths~~ | **#20, #21, #22** | **DONE** — [#24](https://github.com/lem-app/lem/pull/24) fixed the 5 Python and 2 TypeScript failures and the phantom `lem-app/` paths. `main` is **200 passed, 0 failed**, server coverage **53%**. Residual formatting/lint sweep tracked in **#28**. |
+| Correct the README's false security claims | **#17** | **STILL OPEN, and now the only remaining Wave 0 item.** A false security claim is worse than a missing feature. Costs nothing and can ship today. Related: **#47** on the AGPL §13 overstatement (§6). |
+
+**What the re-derivation changed: nothing about the priority order, and everything about what is
+blocking.** Wave 0 existed to make the codebase safe to change before touching the security
+work; that gate is now open rather than closed. The recommendation in §10 — close #15, #16 and
+#7 first — is therefore **not merely still correct, it is now unblocked and overdue**. The
+argument for it never rested on CI status; it rests on code that is still on `main` today.
+
+**Wave 1 is already in flight.** Three PRs are open against these exact issues and should be
+reviewed and landed rather than re-planned:
+[#25](https://github.com/lem-app/lem/pull/25) (#7, #8, #14, #29),
+[#45](https://github.com/lem-app/lem/pull/45) (#15, #16, #17, #18, #19),
+[#46](https://github.com/lem-app/lem/pull/46) (frontend correctness).
+**Reviewing #45 is the single highest-value use of maintainer time right now**, because #15 and
+#16 are the two proven cross-account compromises and #45 claims to close both.
 
 ### Wave 1 — Earn the right to say "secure" (v0.1)
 
 | Item | Issues | Why |
 |---|---|---|
-| Local API authentication + CSRF; bind `127.0.0.1` | **#7** | 30 unauthenticated routes that control Docker, on a server every documented launch path binds to `0.0.0.0`. |
-| Session authorization on the relay | **#15** | Proven cross-account traffic read/inject. |
-| Device-ownership enforcement in signalling | **#16** | Proven forced cross-account bridging. |
-| Ed25519 proof-of-possession, or delete the claim | **#17** | The advertised auth mechanism has zero call sites. |
-| SSRF fix in the tunnel HTTP proxy | **#8** | Turns the user's machine into an internal-network pivot. |
-| Fail-closed secrets; no default JWT key; drop the credentialed CORS wildcard | **#18** | The default HS256 secret is in the public repo; anyone can forge a JWT for any `user_id`. |
-| Secret file permissions | **#14** | Private key and JWT world-readable. |
-| Platform module adoption; stop destructive image removal; unblock the event loop | **#10, #9, #11, #13** | Linux and WSL2 are entirely broken today. |
+| Local API authentication + CSRF; bind `127.0.0.1` | **#7** (PR #25 open) | 30 unauthenticated routes that control Docker, on a server every documented launch path binds to `0.0.0.0`. Still true on `main`. |
+| Session authorization on the relay | **#15** (PR #45 open) | Proven cross-account traffic read/inject. |
+| Device-ownership enforcement in signalling | **#16** (PR #45 open) | Proven forced cross-account bridging. |
+| Ed25519 proof-of-possession, or delete the claim | **#17** (PR #45 open) | The advertised auth mechanism has zero call sites. Still true on `main`: `load_keypair_from_b64` and `public_key_from_b64` remain uncalled. |
+| SSRF fix in the tunnel HTTP proxy | **#8** (PR #25 open) | Turns the user's machine into an internal-network pivot. |
+| Fail-closed secrets; no default JWT key; drop the credentialed CORS wildcard | **#18** (PR #45 open) | The default HS256 secret is in the public repo; anyone can forge a JWT for any `user_id`. |
+| Secret file permissions | **#14** (PR #25 open) | Private key and JWT world-readable. |
+| Tunnel must not bypass local API auth | **#29** (PR #25) | Found by adversarial review of #25 after this document was drafted; not in the original audit. |
+| ~~Platform module adoption; stop destructive image removal; unblock the event loop~~ | **#10, #9, #11, #13** | **DONE** — [#27](https://github.com/lem-app/lem/pull/27) merged the platform module, fixed the unanchored `docker rmi` substring match, moved blocking `subprocess.run` calls onto `asyncio.to_thread`, and added orphaned-job recovery. Linux and WSL2 are **no longer** broken. The four issues are still open on GitHub but the code has landed. |
 
 **Wave 1 gate: do not publish, demo, or announce anything until #15, #16, and #7 are closed.**
 A public demo of remote pairing is precisely the scenario that exposes them.
@@ -578,7 +634,7 @@ worse than they look:
 - **The comparison price is zero.** Tailscale's Personal tier is
   [free forever, unlimited devices, up to 6 users](https://tailscale.com/pricing). Cloudflare
   Tunnel has been [free since 2021](https://blog.cloudflare.com/tunnel-for-everyone/).
-  LM Link appears to be free. **You cannot charge for a commodity whose best-in-class
+  [LM Link is free for up to 5 devices](https://lmstudio.ai/pricing). **You cannot charge for a commodity whose best-in-class
   substitutes are free.**
 - **The one company that tried monetizing around this abandoned it** (§2.6). Backyard AI gave
   tethering away free, then deprecated the desktop app entirely and moved to selling hosted
@@ -647,13 +703,18 @@ an option worth preserving, and it is the one Lem is currently spending.
 
 ### AGPL does less than the README implies
 
-`AGPL-FAQ.md` overstates the protection. AGPL §13 obligations fire only on **modification** —
-*"**If you modify the Program**, your modified version must prominently offer all users
-interacting with it remotely… the Corresponding Source"*
-([AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.en.html)). **Anyone may take Lem verbatim,
-run it as a paid commercial service, and owe nothing beyond an offer of already-public
-source.** AGPL stops proprietary *forks*; it does not stop *competition*. This is precisely why
-MongoDB invented SSPL and why Sentry's FSL FAQ calls AGPL insufficient.
+> **Tracked as [#47](https://github.com/lem-app/lem/issues/47).** The documentation defect —
+> `README.md` and `AGPL-FAQ.md` describing §13's obligation as unconditional when it is
+> conditioned on modification — is filed there, along with the CLA-timing question, stated
+> without a recommended answer. **That issue is the canonical write-up; this section keeps only
+> the strategic consequence.** Do not fix the wording in two places.
+
+The strategic consequence: AGPL §13 obligations fire only on **modification**, so **anyone may
+take Lem verbatim, run it as a paid commercial service, and owe nothing beyond an offer of
+already-public source.** AGPL stops proprietary *forks*; it does not stop *competition*. This is
+precisely why MongoDB invented SSPL and why Sentry's FSL FAQ calls AGPL insufficient. Any
+business plan in this section that assumes the licence deters a hosted competitor is assuming
+something the licence does not do.
 
 There is a cost on the other side too: [Google forbids AGPL code
 entirely](https://opensource.google/documentation/reference/using/agpl-policy), including
@@ -667,7 +728,7 @@ worth serious consideration.
 from future rug pulls or license changes." `AGPL-FAQ.md:313-317` simultaneously offers
 **"proprietary/dual-licensing."**
 
-These are in tension, and the tension has a deadline. Today all 36 commits are by one author,
+These are in tension, and the tension has a deadline. Today all 56 commits are by one author,
 so he holds the entire copyright and can dual-license freely. **The moment an external
 contributor's code merges under DCO, that code cannot be relicensed without their
 permission** — DCO certifies origin, it does not assign or grant relicensing rights.
@@ -708,7 +769,10 @@ decision alone, and `AGPL-FAQ.md` currently promises both outcomes at once.
    single biggest removable barrier to a first user. Budget it as marketing spend. Requires
    #18 and #19 — **and the abuse controls in §7 Risk 6, which are not optional.**
 4. **Decide the CLA/DCO question and publish the decision before accepting external
-   contributions.** The only decision here with a hard deadline.
+   contributions.** The only decision here with a hard deadline. Tracked with the options laid
+   out and no recommendation in [#47](https://github.com/lem-app/lem/issues/47); correcting the
+   `README.md` / `AGPL-FAQ.md` wording is a docs bug worth fixing regardless of how the CLA
+   question is answered.
 5. **Evaluate NetBird's licence split** — permissive client, AGPL server. It preserves the
    copyleft where it matters (the hosted components), removes the AGPL blocker for enterprise
    and app-store distribution, and is what the closest comparable converged on independently.
@@ -811,16 +875,20 @@ Correct `README.md:65-67` today — that costs nothing.
 
 ### Risk 4 — Bus factor of 1 *(likelihood: certain · impact: existential)*
 
-36 commits, one human author, no CI, 19% server coverage, 0% relay coverage, no `.github/`.
-The project cannot survive its maintainer taking three months off. It also cannot credibly
-sell a team tier, a support contract, or a security-differentiated product in that state.
+56 commits, one human author, 53% server coverage against a stated 80% bar, and **0% relay
+coverage** — `cloud/relay/tests/` still holds only `__init__.py`, and CI warns rather than fails
+on it. CI itself now exists (#26), which removes one leg of this risk without touching the
+others. The project cannot survive its maintainer taking three months off. It also cannot
+credibly sell a team tier, a support contract, or a security-differentiated product in that
+state.
 
 Compounding: Lem is a single maintainer building *five* components (local server, two web
 apps, signalling, relay) plus wrapping a sixth (Harbor). That is not a scope a solo maintainer
 sustains against a competitor with $88M and one against a maintainer who ships a 40-service
 integration suite.
 
-*Mitigation:* CI first (#20) so contributions are safe to accept. Then aggressively narrow
+*Mitigation:* CI is done (#26), so contributions are now safe to accept — the remaining half of
+that mitigation is **relay tests**, the one component still at 0%. Then aggressively narrow
 scope — every component not on the critical path to §4's thesis is a liability. Consider
 whether the two web apps should be one.
 
@@ -893,9 +961,14 @@ ships.**
   [Ollama Cloud](https://ollama.com/cloud) — Free / $20 Pro / $100 Max / $25-per-seat Team,
   running on *their* GPUs, which is strategically opposite. That is the opening; §2.6 explains
   why the gradient makes it likely to stay open, and why that is not entirely good news.
-- **Stars are a bad proxy for users in this category.** LocalAI has 48.1k stars and a 3.2k
-  Discord; Pinokio has 7.8k stars and a **41.7k** Discord; Harbor has 3.1k stars and ~100.
-  Do not calibrate ambition — or threat — from star counts.
+- **Stars are a bad proxy for users in this category.** The two data points verified directly
+  against the GitHub and Discord invite APIs: **Harbor, 3,150 stars → ~100 Discord members
+  (3%)**; **Pinokio, 7,803 stars → ~62 (0.8%)**. Both catalogs have thousands of stars and a
+  community that would fit in a lecture theatre. (LocalAI's ~48.1k stars against a reported
+  ~3.2k Discord is consistent with this but was not re-verified, so do not lean on it.) A star
+  is a bookmark. Do not calibrate ambition — or threat — from star counts, in either direction:
+  Harbor's 3,150 stars overstate how hard it will be to out-execute, and Lem's 3 understate
+  nothing at all.
 
 ---
 
@@ -906,7 +979,7 @@ ships.**
 | 1 | Install experience is the top adoption blocker | **Refined** | Real, and Lem is worse than its own dependency: `https://lem.gg/install` returns **404**, and under a pipe `${BASH_SOURCE[0]}` evaluates to `main`, so the script silently treats the user's CWD as the repo root and exits 1 telling them to `git clone`. But Harbor already ships a working piped installer — so fixing this achieves **parity, not advantage**. It is the entry fee, not the moat, and it is not the *top* priority: the security debt is, because that is a liability rather than a missed opportunity. |
 | 2 | The moat is the intersection of management and remote access | **Refuted as stated; refined** | [LM Studio shipped LM Link on 4 Jun 2026](https://lmstudio.ai/blog/locally-lm-link) — runtime + iPhone app + Tailscale transport — and **Harbor already has `harbor tunnel`, `harbor qr`, and a desktop GUI**. Pinokio v8 added a phone-accessible "Home Server" on 8 Jul 2026. Both flanks of the intersection are occupied, and a third entrant arrived last month. The genuinely unoccupied position is narrower: **authenticated, identity-bound access to a multi-service catalog**. Harbor's tunnel warns *"⚠️ Ensure to configure authentication for the service"*, Pinokio's server is LAN-only, and LM Link reaches only LM Studio's own models. That three-way gap is the whole opportunity. |
 | 3 | The killer demo is mobile; go mobile-first PWA | **Confirmed as direction; refuted as differentiator** | LM Studio already ships the demo, free. Open WebUI is already a PWA. So do it — `web/remote/` has ~10 responsive utility classes, no manifest, and no service worker, which is indefensible for a product whose headline is phone access — but do not market it as the wedge, because it is table stakes as of June 2026. |
-| 4 | The 89-service catalog is an underexploited "app store" | **Refuted twice over** | (a) It is **Harbor's** catalog, not Lem's, and it is bigger than 89 — Harbor's wiki lists ~137; the 89 is what Lem's scanner finds in the pinned v0.3.20 checkout, alongside 252 cross-service integration files (verified locally). Harbor's own desktop App already presents it. (b) **More damaging: the demand is not there.** Harbor's r/LocalLLaMA reception has declined release over release, it has ~100 Discord members against 3,150 stars, and a competing maintainer called its breadth *"overwhelming"* — while the comparable pitch in r/selfhosted (Cosmos Server) reliably clears 170 points. This audience wants a few things that work. **Lem's exploitable edge is not the catalog at all — it is generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for every other. |
+| 4 | The 89-service catalog is an underexploited "app store" | **Refuted twice over** | (a) It is **Harbor's** catalog, not Lem's, and it is bigger than 89 — Harbor's wiki lists ~137; the 89 is what Lem's scanner finds in the pinned v0.3.20 checkout, alongside 252 cross-service integration files (verified locally). Harbor's own desktop App already presents it. (b) **More damaging: the demand is not there.** Harbor has ~100 Discord members against 3,150 stars and Pinokio ~62 against 7,803 — both under 3%, both API-verified — while the comparable pitch in r/selfhosted (Cosmos Server) reliably clears 170 points. *(Reported but not verified — Reddit blocks fetching: that Harbor's r/LocalLLaMA reception declined release over release and that a competing maintainer called its breadth "overwhelming." The verdict does not depend on either.)* This audience wants a few things that work. **Lem's exploitable edge is not the catalog at all — it is generic routing over it**: `server/app/tunnel/router.py:127` resolves exactly one service ID and returns `None` for every other. |
 | 5 | Hosted signalling/relay is the natural revenue line | **Refuted on economics; keep as infrastructure** | Cloudflare TURN is [$0.05/GB after 1 TB free](https://developers.cloudflare.com/realtime/turn/) and LLM text is tiny, so there is almost no cost to mark up; meanwhile [Tailscale is free forever for 6 users](https://tailscale.com/pricing) and Cloudflare Tunnel has been free since 2021. Worse, relay users are precisely those with the worst networks. Decisively: **Backyard AI gave exactly this away free in Feb 2024, then deprecated the whole desktop product and moved to selling hosted inference at $12–35/mo** (§2.6). Run the relay free as onboarding infrastructure. The plausible business is a **team tier**, blocked on #15/#16 and on bus factor. |
 
 ---
@@ -927,7 +1000,8 @@ YAGNI, applied to strategy. Each of these should be actively declined:
    relay honest, and stop.
 6. **Device sharing / collaborators before Wave 1.** Building a sharing feature on an
    authorization layer that #15 and #16 prove is absent would multiply the blast radius.
-7. **Enterprise or team sales.** Not with a bus factor of 1, 19% coverage, and no CI.
+7. **Enterprise or team sales.** Not with a bus factor of 1, 53% server coverage against a
+   stated 80% bar, and a relay at 0%.
 8. **A second frontend framework, a desktop app, or a rewrite.** The scope is already too
    wide for one maintainer.
 9. **Launching on r/LocalLLaMA.** Not a feature, but the same category of mistake. That
