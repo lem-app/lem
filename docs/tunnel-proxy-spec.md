@@ -1,6 +1,10 @@
 # Tunnel Proxy Spec: Same-Origin Service Worker + Tunnel Protocol v3
 
-**Status**: Approved design, not yet implemented
+**Status**: **Implemented through Phase 6** (§9). This document was written as a design and is
+still largely phrased that way — **much of it describes the pre-implementation codebase in the
+present tense, and many `file:line` citations have drifted**. §9's phase list and §8.4 are kept
+current; treat the rest as design rationale, not as a description of the code. The full inventory
+of stale passages is [#83](https://github.com/lem-app/lem/issues/83).
 **Tracks**: [#6](https://github.com/lem-app/lem/issues/6) (remote app viewing is broken), [#3](https://github.com/lem-app/lem/issues/3) (protocol v3)
 **Composes with**: PR [#24](https://github.com/lem-app/lem/pull/24) (`fix/green-baseline`), PR [#25](https://github.com/lem-app/lem/pull/25) (`fix/local-api-security`)
 **Audience**: the engineer implementing it. Every decision below is settled; build from it, do not re-derive it.
@@ -8,6 +12,13 @@
 ---
 
 ## 1. Why this document exists
+
+> **All three defects below are fixed.** This section is the original problem statement, kept for
+> the reasoning; every "today" in it means *before Phase 4*. Defect 1 was fixed by Phase 4
+> (`ClientViewer` frames the same-origin `/app/<deviceId>/<serviceId>/` path), defects 2 and 3 by
+> Phase 5 (`WS_CONNECT_ACK` on both sides; `websocket-intercept.ts` deleted in favour of the
+> SW-spliced shim), and the untrue UI strings by Phase 6. The `file:line` citations here point at
+> the pre-Phase-4 tree and no longer resolve — see the status note at the top.
 
 Lem's headline promise is "access your home AI setup from work or travel". Today the remote
 dashboard can call JSON APIs on your machine and nothing else. Opening a service shows you
@@ -1782,10 +1793,19 @@ design:**
    >
    > The walk's boundaries are stated in the test rather than left to be discovered: values held
    > in **closures** are invisible to any property walk — which is exactly the mechanism that
-   > makes `session.ts` correct — and properties on **function objects** are excluded because
-   > including them costs 23 s without terminating against jsdom's constructor graph, versus
-   > ~120 ms without. Out-of-band stores that are not object properties are instrumented
-   > separately. An honest boundary beats a sweep that reads as exhaustive and is not.
+   > makes `session.ts` correct — and properties on **function objects** are excluded on cost
+   > (removing that guard makes the walk fail to terminate against jsdom's constructor graph;
+   > the test says which line to delete to see it). Out-of-band stores that are not object
+   > properties are instrumented separately. An honest boundary beats a sweep that reads as
+   > exhaustive and is not.
+   >
+   > The walk performs **no `instanceof` type test** before enumerating a collection, because
+   > that question is answerable by the object being inspected and was wrong three ways: a
+   > poisoned `Symbol.hasInstance`, a `Proxy` wrapping a `Map`, and — a live bug rather than an
+   > attack — **any `Map` from another realm**, which matters because this dashboard frames
+   > services by construction (§3.1). A collection that presents as one but cannot be read is
+   > **reported rather than skipped**: it cannot be proven to hold the token, but it must not be
+   > certified clean either.
 
    **The `HttpOnly` refresh cookie is a prerequisite, not part of this phase — and it does not
    exist.** An `HttpOnly` cookie can only be set by a server response header, so the signaling

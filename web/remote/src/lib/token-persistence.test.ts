@@ -68,6 +68,31 @@
  * `for...of` walk would have left such a token sitting in plain sight behind
  * this file's `catch` while `.get()` kept working.
  *
+ * There is also **no type test before enumerating**. Asking "is this a Map?"
+ * with `instanceof` and then reading it fails at the question, three ways:
+ * `Map[Symbol.hasInstance]` can be poisoned so a real Map answers no; a `Proxy`
+ * over a Map answers yes and then cannot be read; and - the one that was a live
+ * bug rather than an attack - **a Map from another realm answers no**, because
+ * `instanceof` compares against this realm's `Map.prototype`. This dashboard
+ * frames services by construction (spec §3.1), so cross-realm collections are
+ * routine. The gated version was silently stepping over `console._times`,
+ * `console[Symbol(counts)]` and `performance[Symbol(kEvents)]`, which are real
+ * Maps with real contents; that was found by measuring, not by reasoning.
+ *
+ * Instead the captured built-in is simply attempted on every object, and
+ * success is the test - it only succeeds on a genuine `[[MapData]]` slot, which
+ * is precisely the property that matters and the one thing that cannot be
+ * forged.
+ *
+ * When it fails on something that still *presents* as a collection - a `Proxy`
+ * wrapping a Map, which is an ordinary method-binding or logging pattern and is
+ * fully functional for the code holding it - the walk **reports it** rather
+ * than skipping it. We cannot unwrap it and so cannot prove it holds the token;
+ * we can decline to certify it clean, which is the honest answer. The false
+ * positive cost of that was measured before adopting it: with the check
+ * duck-typed on `get`/`set`/`has` it was **5** (led by `globalThis.Reflect`,
+ * which is not a collection); keyed on `Symbol.toStringTag` it is **0**.
+ *
  * **Not covered. Every one of these is pinned by a test that asserts the miss**,
  * so closing a gap fails loudly and forces this list to be updated, rather than
  * letting the boundary drift while the file still reads as exhaustive:
@@ -80,10 +105,13 @@
  *   list their contents. Unlike `Map`/`Set` this is not a hole that more code
  *   would close; it is closer in kind to a closure.
  * - **Properties hung on function objects.** Excluded for cost, and the number
- *   is real: including functions makes the walk cross 20,000 nodes in **23
- *   seconds** without terminating, because jsdom's constructor graph fans out
- *   through every interface prototype. Excluding them, the same walk completes
- *   in **671 nodes and ~120 ms**. A 23-second unbounded test is not a test.
+ *   is real, and reproducible rather than quoted: delete the `typeof value ===
+ *   'function'` guard in {@link reachableFromGlobals} and run this file. It
+ *   crosses tens of thousands of objects without terminating - jsdom's
+ *   constructor graph fans out through every interface prototype - against well
+ *   under a second with the guard in place. A test that does not terminate is
+ *   not a test. (Figures are deliberately not frozen here; the object count has
+ *   moved twice in as many review rounds, so the command is the durable part.)
  * - **Any encoding of the token.** The leaf test is a literal substring match,
  *   so `btoa(token)`, URI-encoding or a XOR all defeat it. Detecting arbitrary
  *   transformations is undecidable in general; chasing them one at a time would
@@ -209,6 +237,79 @@ const SET_FOR_EACH = Set.prototype.forEach as (
   callback: (value: unknown) => void
 ) => void
 /* eslint-enable @typescript-eslint/unbound-method */
+
+/**
+ * Read a `Map`'s entries through the captured built-in, or `null` if this
+ * object has no `[[MapData]]` slot.
+ *
+ * Entries are buffered inside the `try` so that a throw from the *caller's*
+ * handling can never be mistaken for "not a Map".
+ */
+function readMapEntries(value: object): [unknown, unknown][] | null {
+  const entries: [unknown, unknown][] = []
+  try {
+    MAP_FOR_EACH.call(value, (entryValue: unknown, entryKey: unknown) => {
+      entries.push([entryKey, entryValue])
+    })
+  } catch {
+    return null
+  }
+  return entries
+}
+
+/** As {@link readMapEntries}, for `[[SetData]]`. */
+function readSetEntries(value: object): unknown[] | null {
+  const entries: unknown[] = []
+  try {
+    SET_FOR_EACH.call(value, (entry: unknown) => {
+      entries.push(entry)
+    })
+  } catch {
+    return null
+  }
+  return entries
+}
+
+/**
+ * Does this object *present itself* as a `Map`/`Set` while having no internal
+ * slot to read?
+ *
+ * Uses `Symbol.toStringTag` via `Object.prototype.toString`, not `instanceof`
+ * (tamperable) and not duck-typing on method names. Duck-typing was tried first
+ * and measured: requiring `get`/`set`/`has` produced **five** false positives in
+ * the real jsdom + vitest graph, led by `globalThis.Reflect`, which has all
+ * three and is not a collection. The tag is the precise question - "does this
+ * claim to be a Map" - and a `Proxy` over a real Map forwards it, because the
+ * lookup goes through the same `get` trap that makes the wrapper functional.
+ *
+ * A wrapper that deliberately suppresses its tag escapes this, and sits in the
+ * same intent tier as the `ownKeys` trap already documented as a boundary.
+ */
+function presentsAsCollection(value: object): boolean {
+  try {
+    const tag = Object.prototype.toString.call(value)
+    return tag === '[object Map]' || tag === '[object Set]'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Is this the `prototype` object of a class rather than an instance?
+ *
+ * `Map.prototype`, `Set.prototype` and every subclass prototype present the
+ * collection methods but hold no data, and this walk really does reach them
+ * (`process.allowedNodeEnvironmentFlags.__proto__`, vitest's
+ * `DefaultMap.prototype`). An own `constructor` is what distinguishes them: a
+ * prototype has one, an instance - or a proxy wrapping an instance - does not.
+ */
+function isPrototypeObject(value: object): boolean {
+  try {
+    return Object.getOwnPropertyDescriptor(value, 'constructor') !== undefined
+  } catch {
+    return false
+  }
+}
 
 /**
  * Top-level globals that exist only because these tests run in Node under
@@ -357,39 +458,42 @@ function reachableFromGlobals(needle: string): string[] {
     // documented as a boundary.
     //
     // Enumeration goes through the **built-in** `forEach`, captured at module
-    // load, rather than `for...of`. A `for...of` loop calls the object's own
-    // `Symbol.iterator`, which a subclass can override to throw - leaving the
-    // token sitting in plain sight behind this `catch` while `.get()` keeps
-    // working. `Map.prototype.forEach` reads the [[MapData]] internal slot
-    // directly, so overriding the iterator does not hide anything from it.
+    // load, rather than `for...of`, and with **no `instanceof` gate at all**.
     //
-    // The guard remains because `instanceof` is true for a *subclass prototype*
-    // too - `process.allowedNodeEnvironmentFlags.__proto__` and vitest's
-    // `DefaultMap.prototype` are both reached by this walk, are both
-    // `instanceof`, and both throw here because a prototype has no backing
-    // store. Nothing is hidden by skipping them: a prototype holds no instance
-    // data, so there is no token in there to miss.
-    try {
-      if (object instanceof Map) {
-        let index = 0
-        MAP_FOR_EACH.call(object, (entryValue: unknown, entryKey: unknown) => {
-          queue.push({ value: entryKey, path: `${path}.<mapKey ${index}>`, depth: depth + 1 })
-          queue.push({
-            value: entryValue,
-            path: `${path}.get(${String(entryKey)})`,
-            depth: depth + 1,
-          })
-          index += 1
+    // There is no type test here on purpose. Asking "is this a Map?" with a
+    // tamperable operator and *then* enumerating fails at the question, in both
+    // directions: `Map[Symbol.hasInstance]` can be poisoned so a real Map
+    // answers no, and a `Proxy` wrapping a Map answers yes but cannot be
+    // enumerated. Attempting the captured built-in and letting success be the
+    // test removes the question. `Map.prototype.forEach` only succeeds on a
+    // genuine `[[MapData]]` internal slot, which is exactly the property we
+    // care about and is the one thing that cannot be forged.
+    const mapEntries = readMapEntries(object)
+    const setEntries = mapEntries === null ? readSetEntries(object) : null
+
+    if (mapEntries !== null) {
+      mapEntries.forEach(([entryKey, entryValue], index) => {
+        queue.push({ value: entryKey, path: `${path}.<mapKey ${index}>`, depth: depth + 1 })
+        queue.push({
+          value: entryValue,
+          path: `${path}.get(${String(entryKey)})`,
+          depth: depth + 1,
         })
-      } else if (object instanceof Set) {
-        let index = 0
-        SET_FOR_EACH.call(object, (entry: unknown) => {
-          queue.push({ value: entry, path: `${path}.<setEntry ${index}>`, depth: depth + 1 })
-          index += 1
-        })
-      }
-    } catch {
-      // Not a real Map/Set instance - see above.
+      })
+    } else if (setEntries !== null) {
+      setEntries.forEach((entry, index) => {
+        queue.push({ value: entry, path: `${path}.<setEntry ${index}>`, depth: depth + 1 })
+      })
+    } else if (presentsAsCollection(object) && !isPrototypeObject(object)) {
+      // It behaves like a collection to application code but has no internal
+      // slot, so its contents cannot be read - a `Proxy` around a real Map is
+      // the ordinary way to land here, and a method-binding or logging wrapper
+      // is a perfectly normal thing to write.
+      //
+      // We cannot unwrap it, so we cannot prove it holds the token. We can
+      // refuse to certify it clean, which is the honest result. Silently
+      // skipping it would turn a bypass into a green tick.
+      found.push(`${path} <unenumerable collection: cannot be read, not certified clean>`)
     }
   }
 
@@ -664,6 +768,95 @@ describe('the reachability walk itself (positive controls)', () => {
     expect(hostile.get('session')).toBe(NEEDLE)
 
     expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemHostile.get(session)')
+  })
+
+  // The type gate used to be `instanceof`, which the object being inspected can
+  // answer for itself. Poisoning `Symbol.hasInstance` made an ordinary,
+  // untampered Map invisible - the walker simply stopped recognising it. There
+  // is no gate any more: the captured built-in is attempted on everything, and
+  // only a genuine [[MapData]] slot lets it succeed.
+  it('finds a token in a real Map even when Map[Symbol.hasInstance] is poisoned', () => {
+    const original = Object.getOwnPropertyDescriptor(Map, Symbol.hasInstance)
+    Object.defineProperty(Map, Symbol.hasInstance, { value: () => false, configurable: true })
+
+    try {
+      const real = new Map([['session', NEEDLE]])
+      // The poisoning is real: a gated walker would now skip this entirely.
+      expect(real instanceof Map).toBe(false)
+      plantGlobal('__lemPoisoned', real)
+
+      expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemPoisoned.get(session)')
+    } finally {
+      if (original) Object.defineProperty(Map, Symbol.hasInstance, original)
+      else Reflect.deleteProperty(Map, Symbol.hasInstance)
+    }
+  })
+
+  // Removing the gate fixed a live correctness bug as well as a tampering one,
+  // and this is the case that matters most here: **a Map from another realm**.
+  // `instanceof` compares against *this* realm's `Map.prototype`, so a Map made
+  // in an iframe is not `instanceof Map` and was skipped in silence - contents
+  // and all. This dashboard frames services by construction (spec §3.1), so
+  // cross-realm objects are routine, not hypothetical.
+  //
+  // Found by measurement, not by reasoning: with the gate restored, the walk
+  // reports `console._times`, `console[Symbol(counts)]` and
+  // `performance[Symbol(kEvents)]` as unreadable - real Node-realm Maps that
+  // the gated walk had been stepping over for two rounds.
+  it('finds a token in a Map created in another realm', () => {
+    const frame = document.createElement('iframe')
+    document.body.append(frame)
+
+    try {
+      const foreign = frame.contentWindow as (Window & typeof globalThis) | null
+      if (foreign === null) throw new Error('jsdom gave the iframe no contentWindow')
+
+      const foreignMap = new foreign.Map<string, string>([['session', NEEDLE]])
+      // The premise: this really is invisible to `instanceof`.
+      expect(foreignMap instanceof Map).toBe(false)
+      // ...and really is a working Map holding the token.
+      expect(foreignMap.get('session')).toBe(NEEDLE)
+
+      plantGlobal('__lemForeign', foreignMap)
+
+      expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemForeign.get(session)')
+    } finally {
+      frame.remove()
+    }
+  })
+
+  // A `Proxy` whose `get` trap rebinds methods to the real target is an
+  // ordinary pattern - method-binding wrappers, logging, validation. It is
+  // fully functional for application code and completely opaque to the walker,
+  // because `.call()` bypasses the trap and the proxy has no internal slot.
+  //
+  // We cannot unwrap it, so we cannot prove it holds the token. Reporting it is
+  // the honest answer; skipping it silently would be a green tick over a
+  // bypass.
+  it('refuses to certify a Proxy-wrapped Map, rather than skipping it silently', () => {
+    const target = new Map([['session', NEEDLE]])
+    const wrapper = new Proxy(target, {
+      // Receiver is the *target*, not the proxy - which is what a real binding
+      // wrapper does, and what makes accessors like `size` keep working.
+      get(inner, key) {
+        const value = Reflect.get(inner, key, inner) as unknown
+        if (typeof value !== 'function') return value
+        return (value as (...args: unknown[]) => unknown).bind(inner)
+      },
+    })
+    plantGlobal('__lemWrapped', wrapper)
+
+    // The wrapper genuinely works - this is not a broken object nobody would
+    // write. Application code holding it is entirely happy.
+    expect(wrapper.get('session')).toBe(NEEDLE)
+    expect(wrapper.size).toBe(1)
+
+    const found = reachableFromGlobals(NEEDLE)
+
+    // Not "found the token" - we cannot see it. "Cannot certify this clean."
+    expect(found).toContain(
+      'globalThis.__lemWrapped <unenumerable collection: cannot be read, not certified clean>'
+    )
   })
 
   it('finds a token in a Set whose Symbol.iterator has been sabotaged', () => {
