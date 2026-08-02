@@ -102,6 +102,45 @@ export default defineConfig([
     },
   },
   {
+    // The reachability expander must not be able to express a brand check.
+    //
+    // Every slot read in the sweep goes through the probe registry in
+    // `reachability-probes.ts`, where a probe cannot exist without the
+    // `presentsAs` fallback that stops an unreadable wrapper becoming silence.
+    // Twice a read shipped without one, and a reviewer then showed that nothing
+    // forced a *new* read to join the registry at all - a private-field brand
+    // check spliced into `expandObject` type-checked, linted clean, and was
+    // invisible to both registry tests.
+    //
+    // A brand check is, by construction, "attempt an operation that throws
+    // unless the brand is present". Banning `try`/`catch`, `.prototype` access
+    // and private identifiers in this one file therefore makes brand checks
+    // *inexpressible* here rather than merely discouraged, and the captured
+    // built-ins it would otherwise reuse are module-private to the probes file.
+    // Adding a read now means adding a probe.
+    files: ['src/test/reachability.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'TryStatement',
+          message:
+            'No try/catch in the reachability expander: a brand check is "call something that throws unless the brand is present", so this is what keeps slot reads in the probe registry (reachability-probes.ts), where a fallback is mandatory.',
+        },
+        {
+          selector: "MemberExpression[property.name='prototype']",
+          message:
+            'No built-in prototype capture in the reachability expander. Slot-reading primitives live in reachability-probes.ts and are module-private on purpose.',
+        },
+        {
+          selector: 'PrivateIdentifier',
+          message:
+            'No private-field brand checks in the reachability expander - add a SlotProbe in reachability-probes.ts instead, which forces a `presentsAs` fallback.',
+        },
+      ],
+    },
+  },
+  {
     // ESLint's own flat config is plain JS and outside every tsconfig.
     files: ['eslint.config.js'],
     extends: [tseslint.configs.disableTypeChecked],

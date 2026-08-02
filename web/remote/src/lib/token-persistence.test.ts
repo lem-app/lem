@@ -549,6 +549,49 @@ describe('the reachability walk itself (positive controls)', () => {
     })
   }
 
+  // The probe registry is only the *only* path if the materials for an ad-hoc
+  // slot read are unreachable from the expander. They are module-private to
+  // `reachability-probes.ts`; this pins that, because widening the export
+  // surface is how the guarantee would quietly erode.
+  //
+  // The other half - that a brand check cannot be *written* in the expander,
+  // since it has no try/catch, no `.prototype` and no private identifiers - is
+  // enforced by lint in `eslint.config.js`.
+  it('keeps every slot-reading primitive private to the probes module', async () => {
+    const probes: Record<string, unknown> = await import('../test/reachability-probes')
+
+    // Anything here is safe to hand out: it either reads an already-obtained
+    // descriptor, or is the registry itself.
+    expect(Object.keys(probes).sort()).toEqual(
+      [
+        'PROTOTYPE_HOPS',
+        'SLOT_PROBES',
+        'SLOT_PROBE_NAMES',
+        'descriptorsOf',
+        'hasOwnProtoProperty',
+        'isHarnessRootValue',
+        'readPropertyValue',
+      ].sort()
+    )
+
+    // Named explicitly so the failure says *why*: these are the captured
+    // built-ins a new ad-hoc brand check would reach for.
+    for (const forbidden of [
+      'MAP_FOR_EACH',
+      'SET_FOR_EACH',
+      'WEAKMAP_HAS',
+      'WEAKSET_HAS',
+      'STRING_VALUE_OF',
+      'TYPED_ARRAY_ACCESSORS',
+      'DATA_VIEW_ACCESSORS',
+      'ARRAY_BUFFER_BYTE_LENGTH',
+      'readBytes',
+      'presenter',
+    ]) {
+      expect(probes, `${forbidden} must stay module-private`).not.toHaveProperty(forbidden)
+    }
+  })
+
   it('has a Proxy case for every registered slot probe', () => {
     expect(Object.keys(PROXY_CASES).sort()).toEqual([...SLOT_PROBE_NAMES].sort())
   })
