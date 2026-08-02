@@ -82,11 +82,22 @@
  *
  * ## Why the walk follows fiber fields rather than every property
  *
- * `stateNode` points back at DOM elements, and a generic walk would go
- * element -> ownerDocument -> defaultView and re-enumerate the whole global
- * graph. Following the structural links a real attacker follows - `return`,
- * `child`, `sibling`, `alternate` - and deep-searching only the data payloads
- * is both cheaper and a more faithful model of the attack.
+ * The walk follows the structural links a real attacker follows - `return`,
+ * `child`, `sibling`, `alternate` - and deep-searches the data payloads. It
+ * does not enumerate `stateNode`, which points back at DOM elements, so it does
+ * not re-derive the whole global graph the sibling sweep already covers.
+ *
+ * It does **not**, however, refuse to look at a DOM node it finds inside a
+ * payload. It used to, via `instanceof Node`, and that was a silent bypass:
+ * `instanceof` answers *yes* for a `Proxy` wrapping a node, so a token parked
+ * on such a wrapper in component state was skipped. jsdom's DOM is not backed
+ * by engine slots, so there is no unforgeable probe to replace it with either -
+ * a trap-less `Proxy` passes a `nodeType` check just as happily.
+ *
+ * So the skip was removed rather than repaired. Measured cost of walking those
+ * payloads properly: a few hundred milliseconds on this suite. Buying back a
+ * whole category of silence for that is trivially worth it, and it leaves this
+ * file with no `instanceof`-based decision anywhere.
  *
  * Every assertion has a positive control: {@link LeakyParent} reproduces the
  * pre-fix arrangement, and the walk must find it. Without that, "found
@@ -110,18 +121,22 @@ vi.mock('../api/auth', () => ({
   register: vi.fn(),
 }))
 
-/** Depth limit when deep-searching a single props/state payload. */
-const PAYLOAD_DEPTH = 10
+/**
+ * Depth limit when deep-searching a single props/state payload.
+ *
+ * Raised from 10 to match the globals sweep's cap, and for the same measured
+ * reason: the visited set bounds the walk, not this number, so a larger value
+ * costs nothing. React hook chains and fiber payloads nest deeply, which makes
+ * this the sweep where a low cap was most likely to bite. Still finite, and
+ * named as a boundary in the shared taxonomy.
+ */
+const PAYLOAD_DEPTH = 16
 
 /** Fiber fields that carry component data rather than tree structure. */
 const PAYLOAD_FIELDS = ['memoizedProps', 'pendingProps', 'memoizedState', 'updateQueue']
 
 /** Fiber fields that link one fiber to another. */
 const LINK_FIELDS = ['return', 'child', 'sibling', 'alternate']
-
-function isDomNode(value: unknown): boolean {
-  return typeof Node !== 'undefined' && value instanceof Node
-}
 
 /**
  * Record every path within one payload at which `needle` appears.
@@ -147,11 +162,6 @@ function deepFind(
     return
   }
   if (value === null || typeof value !== 'object') return
-  // Following a DOM node leads back to `document` and then the whole global
-  // graph, which `token-persistence.test.ts` already covers. This is a *scope*
-  // decision about which sweep owns which territory, not a claim that DOM nodes
-  // are safe.
-  if (isDomNode(value)) return
   if (seen.has(value)) return
   seen.add(value)
   if (depth >= PAYLOAD_DEPTH) return
@@ -278,6 +288,25 @@ describe('the fiber walk itself (positive controls)', () => {
       if (original) Object.defineProperty(Map, Symbol.hasInstance, original)
       else Reflect.deleteProperty(Map, Symbol.hasInstance)
     }
+  })
+
+  // The DOM skip is a *scope* decision - the globals sweep owns that territory -
+  // but it used to be made with `instanceof Node`, which answers **yes** for a
+  // `Proxy` wrapping a node. A token parked on such a wrapper in component
+  // state was therefore skipped in silence. The slot-style probe answers no, so
+  // the wrapper is walked.
+  it('finds a token on a Proxy-wrapped DOM node held in component state', () => {
+    function NodeHolder(): ReactElement {
+      const [wrapped] = useState(() => {
+        const element = document.createElement('div')
+        Reflect.set(element, 'stashed', NEEDLE)
+        return new Proxy(element, {})
+      })
+      return <span>{typeof wrapped}</span>
+    }
+    render(<NodeHolder />)
+
+    expect(reachableFromFibers(NEEDLE).length).toBeGreaterThan(0)
   })
 
   // Under `for...of` this threw rather than reporting, taking the walk with it.

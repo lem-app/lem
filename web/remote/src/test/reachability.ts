@@ -61,7 +61,13 @@
  * - `isHarnessRootValue` - `===` against objects captured at load.
  * - `hasWeakCollectionSlot` returning `true` - internal-slot probe.
  * - `readMapEntries` / `readSetEntries` succeeding - internal-slot probe.
- * - `readBoxedString` - internal-slot probe (`[[StringData]]`).
+ * - `readBoxedString` - internal-slot probe (`[[StringData]]`), with a
+ *   `presentsAsBoxedString` fallback so a `Proxy` around one is reported rather
+ *   than passed over. Every slot probe here now has such a fallback; this was
+ *   the one that did not, and it produced complete silence.
+ * - `readBytes` - internal-slot accessors (`[[ViewedArrayBuffer]]` /
+ *   `[[ArrayBufferData]]`), so it works across realms and a `Proxy` cannot
+ *   satisfy it.
  * - The `__proto__` skip, which applies **only** to the inherited accessor and
  *   rests on a structural argument (`descriptorsOf` already merges the chain).
  *   An *own* property named `__proto__` is ordinary data and is walked - it was
@@ -83,7 +89,10 @@
  *
  * - `PROTOTYPE_HOPS` - a property defined further up a prototype chain.
  * - The caller's depth cap (`MAX_DEPTH` in the globals sweep, `PAYLOAD_DEPTH`
- *   in the fiber sweep) - a value nested deeper than that.
+ *   in the fiber sweep; both 16) - a value nested deeper than that.
+ * - `MAX_DECODED_BYTES` - bytes in a buffer larger than this are not decoded.
+ *   A JWT is a few hundred bytes, so the cap exists only to stop a
+ *   multi-megabyte buffer turning the sweep into an allocation storm.
  *
  * ### D. Irreducible - no unforgeable alternative exists
  *
@@ -102,12 +111,19 @@
  * - `presentsAsCollection`'s `catch` - a trap can throw from `getPrototypeOf`.
  *   This one costs only a **report**, not a false all-clear, so it sits on the
  *   acceptable side of the asymmetry.
- * - **Any re-encoding of the token**: `btoa`, a `TextEncoder` byte array, or
- *   splitting it across two properties. The leaf test is a substring match on
- *   strings; detecting arbitrary transformations is undecidable, and chasing
- *   them one at a time would rebuild the losing enumeration this design
- *   replaced. Bytes are worth singling out here - this codebase moves the token
- *   as bytes constantly, so it is the likeliest accidental miss.
+ * - **Re-encodings other than raw bytes**: `btoa`, URI-encoding, a XOR, or
+ *   splitting the token across two properties. The leaf test is a substring
+ *   match on strings; detecting arbitrary transformations is undecidable, and
+ *   chasing them one at a time would rebuild the losing enumeration this design
+ *   replaced.
+ *
+ *   **Raw bytes are the exception and are covered**, because they are the one
+ *   re-encoding that needs no intent at all: this codebase moves the token as
+ *   bytes constantly, so a `TextEncoder` round trip is the likeliest accidental
+ *   hiding place there is. Buffers are decoded as UTF-8 and UTF-16LE and handed
+ *   back as strings. This was first ruled irreducible and then reversed, on the
+ *   evidence that detection is cheap and costs no false positives - the same
+ *   test that got `Map`/`Set` covered.
  * - **Values in internal slots with no synchronous accessor**, such as a
  *   resolved `Promise`.
  * - **Closures.** Invisible to any property walk - and the mechanism that makes
@@ -156,6 +172,55 @@ const WEAKSET_HAS = WeakSet.prototype.has as (this: unknown, key: object) => boo
 const STRING_VALUE_OF = String.prototype.valueOf as (this: unknown) => string
 /* eslint-enable @typescript-eslint/unbound-method */
 
+/** A slot-reading accessor trio for a buffer-backed view. */
+interface ViewAccessors {
+  buffer: (this: unknown) => unknown
+  byteOffset: (this: unknown) => unknown
+  byteLength: (this: unknown) => unknown
+}
+
+// Unbound on purpose, as with the collection methods above: these getters are
+// invoked with an explicit receiver via `.call`, which is what makes them a
+// slot probe rather than a property read.
+/* eslint-disable @typescript-eslint/unbound-method */
+function captureViewAccessors(prototype: object): ViewAccessors | null {
+  const get = (name: string): ((this: unknown) => unknown) | undefined =>
+    Object.getOwnPropertyDescriptor(prototype, name)?.get
+  const buffer = get('buffer')
+  const byteOffset = get('byteOffset')
+  const byteLength = get('byteLength')
+  if (!buffer || !byteOffset || !byteLength) return null
+  return { buffer, byteOffset, byteLength }
+}
+
+/** `%TypedArray%.prototype` - the shared prototype of every typed array. */
+const TYPED_ARRAY_ACCESSORS = captureViewAccessors(
+  Object.getPrototypeOf(Uint8Array.prototype) as object
+)
+const DATA_VIEW_ACCESSORS = captureViewAccessors(DataView.prototype)
+const ARRAY_BUFFER_BYTE_LENGTH =
+  Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get ?? null
+/* eslint-enable @typescript-eslint/unbound-method */
+
+/**
+ * Encodings a token could plausibly be sitting in as raw bytes.
+ *
+ * UTF-8 is what `TextEncoder` produces and is the realistic accidental case;
+ * UTF-16LE covers a buffer built from JavaScript string memory. Decoding is
+ * lossy-tolerant on purpose - garbage decodes simply will not contain the
+ * needle.
+ */
+const BYTE_DECODERS = ['utf-8', 'utf-16le'] as const
+
+/**
+ * Above this, bytes are not decoded.
+ *
+ * A JWT is a few hundred bytes, so this is enormous headroom; the cap exists
+ * only so a multi-megabyte buffer somewhere in the graph cannot turn the sweep
+ * into an allocation storm. It is a finite limit and is named in the taxonomy.
+ */
+const MAX_DECODED_BYTES = 1 << 20
+
 /**
  * The primitive inside a boxed `String`, or `null` if this is not one.
  *
@@ -166,8 +231,9 @@ const STRING_VALUE_OF = String.prototype.valueOf as (this: unknown) => string
  *
  * Fixed rather than documented, because the fix is an internal-slot probe and
  * so belongs in the unforgeable group: `String.prototype.valueOf` reads
- * `[[StringData]]` and throws on anything without it, including a `Proxy`
- * wrapping a boxed String - which is then reported by the ordinary path.
+ * `[[StringData]]` and throws on anything without it. A `Proxy` wrapping a
+ * boxed String fails the probe and is handled by {@link presentsAsBoxedString},
+ * which reports it as unreadable rather than passing over it in silence.
  */
 function readBoxedString(value: object): string | null {
   try {
@@ -175,6 +241,72 @@ function readBoxedString(value: object): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Does this object present itself as a boxed `String` while having no slot?
+ *
+ * The fallback that `readBoxedString` lacked. Every other internal-slot check
+ * here has one - `Map`, `Set` and the weak collections all report an object
+ * that claims to be one and cannot be read - and its absence meant a `Proxy`
+ * around a boxed String produced **complete silence**, which is precisely what
+ * the asymmetry rule exists to prevent.
+ *
+ * Identity signal first, then the tag, exactly as {@link presentsAsCollection}.
+ */
+function presentsAsBoxedString(value: object): boolean {
+  try {
+    let proto: object | null = Object.getPrototypeOf(value) as object | null
+    let hops = 0
+    while (proto !== null && hops < PROTOTYPE_HOPS) {
+      if (proto === String.prototype) return true
+      proto = Object.getPrototypeOf(proto) as object | null
+      hops += 1
+    }
+    return Object.prototype.toString.call(value) === '[object String]'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The bytes behind a typed array, `DataView` or `ArrayBuffer`, or `null`.
+ *
+ * **Realm-agnostic and unforgeable**, and both words are load-bearing. The
+ * obvious `value instanceof Uint8Array` does not work: `TextEncoder` output is
+ * not `instanceof` this file's `Uint8Array` in this environment, so a check
+ * written that way silently never fires. That is the **fourth** appearance of
+ * the realm-mismatch class in this project - after the cross-realm `Map` here,
+ * `instanceof Blob` in Phase 5 and `instanceof ArrayBuffer` in Phase 4 - and it
+ * was found by accident while building something else, which is the whole
+ * argument for not using `instanceof` at all.
+ *
+ * These captured accessors read `[[ViewedArrayBuffer]]` / `[[ArrayBufferData]]`
+ * and throw without them, so they work across realms and a `Proxy` cannot
+ * satisfy them.
+ */
+function readBytes(value: object): Uint8Array | null {
+  for (const accessors of [TYPED_ARRAY_ACCESSORS, DATA_VIEW_ACCESSORS]) {
+    if (accessors === null) continue
+    try {
+      const buffer = accessors.buffer.call(value) as ArrayBufferLike
+      const byteOffset = accessors.byteOffset.call(value) as number
+      const byteLength = accessors.byteLength.call(value) as number
+      return new Uint8Array(buffer, byteOffset, byteLength)
+    } catch {
+      // Not that kind of view; try the next.
+    }
+  }
+
+  if (ARRAY_BUFFER_BYTE_LENGTH !== null) {
+    try {
+      const byteLength = ARRAY_BUFFER_BYTE_LENGTH.call(value) as number
+      return new Uint8Array(value as ArrayBufferLike, 0, byteLength)
+    } catch {
+      // Not an ArrayBuffer either.
+    }
+  }
+  return null
 }
 
 /** A stable object to probe weak collections with; never stored anywhere. */
@@ -424,6 +556,23 @@ export function expandObject(object: object, path: string): Expansion {
     children.push({ value: boxed, path: `${path}.valueOf()` })
   }
 
+  // Same idea for bytes. The token crosses this codebase as bytes constantly,
+  // so a `TextEncoder` round trip is the likeliest way it ends up somewhere
+  // unnoticed - which is why this is covered rather than documented away.
+  const bytes = readBytes(object)
+  if (bytes !== null && bytes.byteLength <= MAX_DECODED_BYTES) {
+    for (const encoding of BYTE_DECODERS) {
+      try {
+        children.push({
+          value: new TextDecoder(encoding).decode(bytes),
+          path: `${path}.<decoded ${encoding}>`,
+        })
+      } catch {
+        // An unsupported decoder in this runtime yields nothing to search.
+      }
+    }
+  }
+
   for (const [key, descriptor] of descriptorsOf(object)) {
     // The `__proto__` *accessor* (inherited from `Object.prototype`) is a
     // redundant edge, not a hiding place: `descriptorsOf` already merges the
@@ -495,6 +644,13 @@ export function expandObject(object: object, path: string): Expansion {
     // ...and on an internal-slot probe.
     !hasWeakCollectionSlot(object)
   ) {
+    return { children, opaque: `${path} ${OPAQUE_NOTE}` }
+  }
+
+  // The same fallback for boxed Strings. Without it, a `Proxy` around one was
+  // complete silence - the only internal-slot check in this file that had no
+  // "presents as, cannot be read" path.
+  if (boxed === null && presentsAsBoxedString(object) && object !== String.prototype) {
     return { children, opaque: `${path} ${OPAQUE_NOTE}` }
   }
 

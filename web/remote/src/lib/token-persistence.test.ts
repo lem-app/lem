@@ -62,87 +62,28 @@
  * are covered rather than documented away because *a token in a `Map` keyed by
  * device id needs no adversarial intent at all*.
  *
- * `Map`/`Set` coverage includes **hostile subclasses**: enumeration goes through
- * the built-in `Map.prototype.forEach`, captured at module load, so overriding
- * `Symbol.iterator` or `entries()` to throw does not hide the contents. A
- * `for...of` walk would have left such a token sitting in plain sight behind
- * this file's `catch` while `.get()` kept working.
+ * ## How the walk decides what it is looking at
  *
- * ### One rule, learned three times: never classify an object by what it says
+ * **Stated once, in `../test/reachability.ts`.** That module carries the rule
+ * (silence must rest on an unforgeable fact - object identity or an
+ * internal-slot probe; surfacing may use a heuristic), the history that
+ * produced it, and the complete list of what the sweep can and cannot see.
  *
- * Review found the same bug in three successive rounds - `instanceof`, then
- * `Symbol.hasInstance`, then an own `constructor` property. Each time the walk
- * decided what an object *was* by consulting something the object controls, and
- * each time a `Proxy` could lie about it. The third was the worst: a wrapped
- * `Map` claiming an own `constructor` was classified as an inert prototype and
- * dropped **silently**, which is indistinguishable from a clean result.
+ * That covers both the rule and the **complete list of what is not seen** -
+ * closures, function-object properties, the finite depth and prototype-hop
+ * limits, re-encodings other than raw bytes, `Proxy` traps, a getter that lies
+ * on first read, and values in internal slots with no synchronous accessor.
  *
- * The rule that came out of it, and the one to keep:
+ * **Do not restate any of it here.** It has now been deduplicated twice: first
+ * the itemised list, then this narrative, which had drifted to saying the rule
+ * was learned three times where the shared module said four. Both times the
+ * copy went stale within a single review round, and the second time it happened
+ * *inside the commit that fixed the first*. Prose duplicates rot exactly like
+ * code duplicates, and faster, because nothing type-checks them.
  *
- * - To decide whether to **stay quiet** about something, use only facts that
- *   cannot be forged - **object identity** (`===` against a prototype captured
- *   at module load) or an **internal-slot probe** (a built-in method that
- *   throws unless the slot is really there). A forged answer here is a silent
- *   bypass, and silence is the thing being exploited.
- * - To decide whether to **surface** something, a heuristic is acceptable,
- *   because a forged answer costs a missed report rather than a false
- *   all-clear. Those are documented as boundaries below.
- *
- * The asymmetry is the whole design. Anything that presents as a collection and
- * cannot be read is reported unless it is *identically* a built-in prototype or
- * *provably* a weak collection.
- *
- * There is also **no type test before enumerating**. Asking "is this a Map?"
- * with `instanceof` and then reading it fails at the question, three ways:
- * `Map[Symbol.hasInstance]` can be poisoned so a real Map answers no; a `Proxy`
- * over a Map answers yes and then cannot be read; and - the one that was a live
- * bug rather than an attack - **a Map from another realm answers no**, because
- * `instanceof` compares against this realm's `Map.prototype`. This dashboard
- * frames services by construction (spec §3.1), so cross-realm collections are
- * routine. The gated version was silently stepping over `console._times`,
- * `console[Symbol(counts)]` and `performance[Symbol(kEvents)]`, which are real
- * Maps with real contents; that was found by measuring, not by reasoning.
- *
- * Instead the captured built-in is simply attempted on every object, and
- * success is the test - it only succeeds on a genuine `[[MapData]]` slot, which
- * is precisely the property that matters and the one thing that cannot be
- * forged.
- *
- * When it fails on something that still *presents* as a collection - a `Proxy`
- * wrapping a Map, which is an ordinary method-binding or logging pattern and is
- * fully functional for the code holding it - the walk **reports it** rather
- * than skipping it. We cannot unwrap it and so cannot prove it holds the token;
- * we can decline to certify it clean, which is the honest answer.
- *
- * The false-positive cost of reporting was measured before adopting it, and is
- * currently **zero** against the real jsdom + vitest graph - which the
- * `starts clean` test asserts on every run, so it cannot rot. To see what the
- * rejected alternative cost, replace the body of {@link presentsAsCollection}
- * with a duck-type on method names:
- *
- * ```ts
- * const c = value as Record<string, unknown>
- * return typeof c.get === 'function' && typeof c.set === 'function' &&
- *        typeof c.has === 'function'
- * ```
- *
- * and run this file: `starts clean` fails and lists them, led by
- * `globalThis.Reflect`, which has all three methods and is not a collection.
- * (Stated as a procedure, not a count: an independent reimplementation of that
- * measurement got a different number, and the count is not the point - the
- * comparison is.)
- *
- * **Not covered.** The authoritative list of what the walk can and cannot see
- * lives in **one place**, `../test/reachability.ts` - closures, function-object
- * properties, the finite depth and prototype-hop limits, re-encodings, `Proxy`
- * traps, a getter that lies on first read, and values in internal slots with no
- * synchronous accessor. **Do not restate it here.** A second copy of that list
- * had already drifted out of date within a single review round, which is the
- * same failure that two copies of the traversal caused.
- *
- * Every entry there is pinned by a test in this file that asserts the miss, so
- * closing a gap fails loudly rather than letting the documentation quietly
- * become a lie.
+ * Every entry in that list is pinned by a test in this file that asserts the
+ * miss, so closing a gap fails loudly rather than letting the documentation
+ * quietly become a lie.
  *
  * The one limit that is genuinely this file's own, because it is not about
  * object graphs at all:
@@ -156,14 +97,16 @@
  * by device id needs none, so it is covered; a `Proxy` with a lying `ownKeys`
  * trap needs plenty, and there is no unforgeable way to see through it anyway.
  *
- * One further exclusion, for correctness rather than cost: top-level **test
- * harness globals** (`process`, `__vitest_*`, the jest matcher symbol) are
- * skipped at depth 1. They do not exist in a browser, so including them makes
- * the walk assert facts about vitest - and `__vitest_mocker__` in particular
- * retains the *source text* of every loaded module, so it contains this file's
- * own `NEEDLE` literal and every run would report a "finding" that is a string
- * constant in a test. See {@link isHarnessRoot}; it matches by name at depth 1
- * only, so nothing in the page can hide behind it.
+ * One further exclusion, for correctness rather than cost: the **objects the
+ * test harness installs on the global** are skipped at depth 1. They do not
+ * exist in a browser, so including them makes the walk assert facts about
+ * vitest - and `__vitest_mocker__` in particular retains the *source text* of
+ * every loaded module, so it contains this file's own `NEEDLE` literal and
+ * every run would report a "finding" that is a string constant in a test.
+ *
+ * They are matched by {@link isHarnessRootValue}, **by object identity** rather
+ * than by name. Matching names was itself a bypass: anything a developer
+ * happened to call `global` was skipped, with no ill intent required.
  *
  * The union of the two detectors - reachability plus instrumented out-of-band
  * stores - is what backs the criterion. Neither alone does.
@@ -227,7 +170,7 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
-import { expandObject, isHarnessRootValue } from '../test/reachability'
+import { OPAQUE_NOTE, expandObject, isHarnessRootValue } from '../test/reachability'
 
 /** A value distinctive enough that finding it anywhere is unambiguous. */
 const NEEDLE = 'eyJhbGciOiJIUzI1NiJ9.NEEDLE-9f3c1a7e-token.sig'
@@ -618,6 +561,56 @@ describe('the reachability walk itself (positive controls)', () => {
     expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemBoxed.valueOf()')
   })
 
+  // The token crosses this codebase as bytes constantly, so a `TextEncoder`
+  // round trip is the likeliest *accidental* hiding place there is. Covered
+  // rather than documented, on the same "cheap detection, no intent required"
+  // test that got `Map`/`Set` covered.
+  it('finds a token encoded as UTF-8 bytes', () => {
+    plantGlobal('__lemBytes', new TextEncoder().encode(NEEDLE))
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemBytes.<decoded utf-8>')
+  })
+
+  // `instanceof Uint8Array` does **not** work here: `TextEncoder` output is not
+  // `instanceof` this file's `Uint8Array` in this environment, so a check
+  // written that way silently never fires. Detection is by internal-slot
+  // accessor instead, which is realm-agnostic. This asserts the premise so the
+  // realm hazard cannot quietly come back.
+  it('finds byte-encoded tokens without relying on instanceof', () => {
+    const encoded = new TextEncoder().encode(NEEDLE)
+    plantGlobal('__lemRealmBytes', encoded)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemRealmBytes.<decoded utf-8>')
+  })
+
+  it('finds a token in a raw ArrayBuffer', () => {
+    const encoded = new TextEncoder().encode(NEEDLE)
+    const buffer = new ArrayBuffer(encoded.byteLength)
+    new Uint8Array(buffer).set(encoded)
+    plantGlobal('__lemBuffer', buffer)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemBuffer.<decoded utf-8>')
+  })
+
+  // Every other slot probe reports an object that claims to be its type and
+  // cannot be read. This one did not, so a Proxy-wrapped boxed String was
+  // complete silence.
+  it('refuses to certify a Proxy-wrapped boxed String', () => {
+    const boxed = new String(NEEDLE)
+    plantGlobal(
+      '__lemWrappedBoxed',
+      new Proxy(boxed, {
+        get(inner, key) {
+          const value = Reflect.get(inner, key, inner) as unknown
+          if (typeof value !== 'function') return value
+          return (value as (...args: unknown[]) => unknown).bind(inner)
+        },
+      })
+    )
+
+    expect(reachableFromGlobals(NEEDLE)).toContain(`globalThis.__lemWrappedBoxed ${OPAQUE_NOTE}`)
+  })
+
   it('finds a token on a prototype chain deeper than a few hops', () => {
     let chain: object = { stashed: NEEDLE }
     for (let index = 0; index < 6; index += 1) chain = Object.create(chain) as object
@@ -902,16 +895,6 @@ describe('the reachability walk itself (positive controls)', () => {
   // a property walk cannot reach it at all.
   it('does NOT see a token inside a resolved Promise', () => {
     plantGlobal('__lemPromise', Promise.resolve(NEEDLE))
-
-    expect(reachableFromGlobals(NEEDLE)).toEqual([])
-  })
-
-  // The leaf test is a substring match on strings, so any re-encoding escapes.
-  // Bytes deserve their own mention in this codebase: the tunnel moves the
-  // token as bytes constantly, and a `TextEncoder` round trip is the most
-  // natural way anyone would land here without meaning to.
-  it('does NOT see a token encoded as bytes', () => {
-    plantGlobal('__lemBytes', new TextEncoder().encode(NEEDLE))
 
     expect(reachableFromGlobals(NEEDLE)).toEqual([])
   })
