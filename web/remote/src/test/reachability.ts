@@ -82,10 +82,34 @@
  *    reviewer defeated 1 and 2 by splicing a private-field brand check straight
  *    into `expandObject`, bypassing the registry entirely; 3 exists because of
  *    that, and blocks it.
+ * 4. **This module may import from `./reachability-probes` and nothing else**,
+ *    enforced by `no-restricted-imports`. Rule 3 is a per-file AST check, so it
+ *    never saw through an import boundary: the same brand check moved into a
+ *    helper module and imported went through completely clean. Extracting a
+ *    helper when a lint rule complains is ordinary practice rather than
+ *    evasion, which is what made that gap worth closing - the distance between
+ *    the blocked technique and the working one was one `import` statement.
  *
- * **What none of that claims**: nobody can edit `reachability-probes.ts` and
- * add an unpaired read there. What is closed is the route that was actually
- * taken five times out of five - extending the walker in place.
+ * ### Where this stops, stated plainly
+ *
+ * The residual is that a contributor can edit the lint allowlist in
+ * `eslint.config.js`, or add an unpaired read to `reachability-probes.ts`
+ * directly. Neither is prevented, and neither can be: at some point the
+ * boundary stops being mechanical and becomes **social** - a reviewer noticing
+ * a suspicious diff.
+ *
+ * That is a real difference in kind from where this started, and it is the
+ * honest place to stop. What is closed is the route taken five times out of
+ * five: extending the walker in place, or reaching a slot read through a
+ * helper. Both of those looked like ordinary work and produced silence. What
+ * remains looks like what it is, in a diff someone has to approve.
+ *
+ * ### And keep the proportion in view
+ *
+ * This is **test infrastructure**, not a runtime control. Its job is to catch a
+ * future contributor who accidentally leaves the token somewhere, and the
+ * closing note below says exactly that. Hardening it further buys less than
+ * almost anything else this repository could spend the same effort on.
  * - The `__proto__` skip, which applies **only** to the inherited accessor and
  *   rests on a structural argument (`descriptorsOf` already merges the chain).
  *   An *own* property named `__proto__` is ordinary data and is walked - it was

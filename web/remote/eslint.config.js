@@ -120,6 +120,28 @@ export default defineConfig([
     // Adding a read now means adding a probe.
     files: ['src/test/reachability.ts'],
     rules: {
+      // The syntax bans below are per-file AST rules, so they never see through
+      // an import boundary: the same brand check moved into a helper module and
+      // imported goes through clean. Extracting a helper when a lint rule
+      // complains is ordinary practice, not evasion, so the distance between
+      // the blocked technique and the working one was one `import` statement.
+      //
+      // This allowlist closes that. The expander may import from the probes
+      // module and nothing else; combined with the probes module's own export
+      // allowlist (asserted in `token-persistence.test.ts`), the only reads
+      // reachable from here are the registered ones.
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: String.raw`^(?!\./reachability-probes$)`,
+              message:
+                'The reachability expander may only import from ./reachability-probes. A slot read reached through any other module bypasses the probe registry, and with it the mandatory `presentsAs` fallback - add a SlotProbe instead.',
+            },
+          ],
+        },
+      ],
       'no-restricted-syntax': [
         'error',
         {
