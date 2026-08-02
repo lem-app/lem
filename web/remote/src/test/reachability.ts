@@ -45,48 +45,92 @@
  *   there costs a missed report, not a false all-clear, and those are recorded
  *   as documented boundaries in the suites.
  *
- * ## Silence audit
+ * ## What this sweep can and cannot see
  *
- * Every path in this module that results in *not looking further*, and what it
- * rests on. Re-run this audit whenever you add one.
+ * This is the primary artifact of the hardening work, and it is meant to be a
+ * **complete and honest statement**, not a summary. Every place the walk stops
+ * looking is listed. If you add one, add it here; if you find one that is not
+ * here, that omission is itself the bug - two of the entries below were found
+ * by auditing *these categories* rather than the code.
  *
- * Resting on an **unforgeable** fact - safe to be quiet:
+ * ### A. Silence resting on an unforgeable fact - safe
+ *
+ * Nothing in this group can be talked out of looking.
  *
  * - `isBuiltinCollectionPrototype` - `===` against references captured at load.
- * - `hasWeakCollectionSlot` returning `true` - internal-slot probe.
- * - `readMapEntries`/`readSetEntries` succeeding - internal-slot probe.
  * - `isHarnessRootValue` - `===` against objects captured at load.
- * - `expandObject`'s `__proto__` skip - a structural argument (the chain is
- *   already merged by `descriptorsOf`), pinned by a positive-control test that
- *   a token on a prototype is still found through an instance.
- * - A descriptor with neither `value` nor `get` - a setter-only property holds
- *   no readable value. Nothing to miss.
+ * - `hasWeakCollectionSlot` returning `true` - internal-slot probe.
+ * - `readMapEntries` / `readSetEntries` succeeding - internal-slot probe.
+ * - `readBoxedString` - internal-slot probe (`[[StringData]]`).
+ * - The `__proto__` skip, which applies **only** to the inherited accessor and
+ *   rests on a structural argument (`descriptorsOf` already merges the chain).
+ *   An *own* property named `__proto__` is ordinary data and is walked - it was
+ *   not, once, and that was a real bypass.
+ * - A descriptor with neither `value` nor `get`: a setter-only property holds
+ *   no readable value.
  *
- * Resting on a **cost** decision, documented as a boundary in both suites:
+ * ### B. Silence resting on a cost decision - documented, deliberate
  *
- * - `expandObject`'s `typeof child === 'function'` skip.
+ * - The `typeof child === 'function'` skip. Delete that line and the walk fails
+ *   to terminate against jsdom's constructor graph. Properties hung on function
+ *   objects are therefore not seen.
  *
- * Resting on something a `Proxy` **could** forge - irreducible, because the
- * language offers no unforgeable alternative, and all already documented as the
- * "lying `ownKeys` trap" boundary with a pinned test:
+ * ### C. Finite limits - reachable data beyond them is not seen
  *
- * - `descriptorsOf`'s `Reflect.ownKeys` / `getOwnPropertyDescriptor` failures:
- *   a trap can hide a property outright, and there is no other way to ask.
- * - `expandObject`'s "getter threw" skip: a `get` trap can throw to hide.
- * - `presentsAsCollection` returning `false` from its `catch`: a trap can throw
- *   from `getPrototypeOf`. This one only costs a **report**, not a false
- *   all-clear, so it is on the acceptable side of the asymmetry.
+ * Both were raised after an audit found real misses, and both were measured as
+ * effectively free (the visited set bounds the walk, not these numbers). Raising
+ * them does not make them infinite, which is why they are named:
+ *
+ * - `PROTOTYPE_HOPS` - a property defined further up a prototype chain.
+ * - The caller's depth cap (`MAX_DEPTH` in the globals sweep, `PAYLOAD_DEPTH`
+ *   in the fiber sweep) - a value nested deeper than that.
+ *
+ * ### D. Irreducible - no unforgeable alternative exists
+ *
+ * Stated rather than defended against. Each has a test asserting the miss, so
+ * the boundary cannot silently drift.
+ *
+ * - **A getter that returns a decoy on first read.** A getter is arbitrary
+ *   code: reading twice defeats a two-read decoy and loses to a three-read one,
+ *   so *no finite read count is safe*. And accessors must be followed - that is
+ *   what surfaces `history.state`, `window.name` and `location.href`, which was
+ *   load-bearing in an earlier round. An attacker in a framed iframe simply
+ *   reads twice.
+ * - **A `Proxy` hiding properties** via `ownKeys` /
+ *   `getOwnPropertyDescriptor`, or a `get` trap that throws. There is no other
+ *   way to ask an object what it has.
+ * - `presentsAsCollection`'s `catch` - a trap can throw from `getPrototypeOf`.
+ *   This one costs only a **report**, not a false all-clear, so it sits on the
+ *   acceptable side of the asymmetry.
+ * - **Any re-encoding of the token**: `btoa`, a `TextEncoder` byte array, or
+ *   splitting it across two properties. The leaf test is a substring match on
+ *   strings; detecting arbitrary transformations is undecidable, and chasing
+ *   them one at a time would rebuild the losing enumeration this design
+ *   replaced. Bytes are worth singling out here - this codebase moves the token
+ *   as bytes constantly, so it is the likeliest accidental miss.
+ * - **Values in internal slots with no synchronous accessor**, such as a
+ *   resolved `Promise`.
+ * - **Closures.** Invisible to any property walk - and the mechanism that makes
+ *   `session.ts` correct, which is why the clean case passes at all.
  * - The final `opaque: null`: an object that neither enumerates as a collection
  *   nor presents as one is indistinguishable from the tens of thousands of
  *   plain objects in the graph.
  *
- * The distinction that matters: nothing in the first group can be talked out of
- * looking. The third group can, but only by a wrapper that has already given up
- * being usable as the thing it wraps.
+ * The honest summary: this sweep is strong against *accidents* and against
+ * *storage*, and it is not a defence against code that is actively hiding from
+ * it. It was built to answer "did we leave the token somewhere", and that is
+ * the question it answers.
  */
 
-/** Prototype links climbed per object, to reach platform accessors. */
-export const PROTOTYPE_HOPS = 4
+/**
+ * Prototype links climbed per object, to reach platform accessors.
+ *
+ * Raised from 4 after an audit found a token on a 6-deep prototype chain was
+ * missed. Measured across 4/8/12: no difference in suite wall time, because the
+ * cost is bounded by the visited set rather than by this number. Still finite,
+ * and named as a boundary below - a deep enough chain still escapes.
+ */
+export const PROTOTYPE_HOPS = 12
 
 /** Appended to a path the walk could not read. Not a find - a refusal. */
 export const OPAQUE_NOTE = '<unenumerable collection: cannot be read, not certified clean>'
@@ -107,7 +151,31 @@ const SET_FOR_EACH = Set.prototype.forEach as (
 // these two are used for.
 const WEAKMAP_HAS = WeakMap.prototype.has as (this: unknown, key: object) => boolean
 const WEAKSET_HAS = WeakSet.prototype.has as (this: unknown, key: object) => boolean
+// Reads `[[StringData]]`, so it unwraps a boxed String and throws on anything
+// else - see `readBoxedString`.
+const STRING_VALUE_OF = String.prototype.valueOf as (this: unknown) => string
 /* eslint-enable @typescript-eslint/unbound-method */
+
+/**
+ * The primitive inside a boxed `String`, or `null` if this is not one.
+ *
+ * `new String(token)` is an **object**, so the walk's `typeof value ===
+ * 'string'` leaf test never fires on it, and its own properties are the
+ * individual characters - no single one of which contains the needle. It was
+ * therefore invisible. Found by auditing the taxonomy rather than the code.
+ *
+ * Fixed rather than documented, because the fix is an internal-slot probe and
+ * so belongs in the unforgeable group: `String.prototype.valueOf` reads
+ * `[[StringData]]` and throws on anything without it, including a `Proxy`
+ * wrapping a boxed String - which is then reported by the ordinary path.
+ */
+function readBoxedString(value: object): string | null {
+  try {
+    return STRING_VALUE_OF.call(value)
+  } catch {
+    return null
+  }
+}
 
 /** A stable object to probe weak collections with; never stored anywhere. */
 const WEAK_PROBE_KEY: object = Object.freeze({})
@@ -349,17 +417,31 @@ export interface Expansion {
 export function expandObject(object: object, path: string): Expansion {
   const children: Child[] = []
 
+  // A boxed String is an object, so the caller's string leaf-test never fires
+  // on it. Hand back the primitive so it does.
+  const boxed = readBoxedString(object)
+  if (boxed !== null) {
+    children.push({ value: boxed, path: `${path}.valueOf()` })
+  }
+
   for (const [key, descriptor] of descriptorsOf(object)) {
-    // `__proto__` is a **redundant edge, not a hiding place**, so skipping it
-    // loses no coverage: `descriptorsOf` already merges the whole prototype
-    // chain into this same descriptor set and reads each one with `object` as
-    // the receiver, so a token parked on a prototype is found while walking the
-    // instance. Following it as data only re-reaches class prototypes as
-    // objects in their own right - which is how vitest's `DefaultMap.prototype`
-    // and `process.allowedNodeEnvironmentFlags.__proto__` turned up as
-    // unreadable collections. Silence here rests on that structural argument,
-    // not on anything the object claims about itself.
-    if (key === '__proto__') continue
+    // The `__proto__` *accessor* (inherited from `Object.prototype`) is a
+    // redundant edge, not a hiding place: `descriptorsOf` already merges the
+    // whole prototype chain into this same descriptor set and reads each entry
+    // with `object` as the receiver, so a token parked on a prototype is found
+    // while walking the instance. Following it only re-reaches class prototypes
+    // as objects in their own right - which is how vitest's
+    // `DefaultMap.prototype` and `process.allowedNodeEnvironmentFlags.__proto__`
+    // turned up as unreadable collections.
+    //
+    // An **own** property named `__proto__` is a different thing entirely.
+    // `Object.defineProperty(o, '__proto__', { value })` creates ordinary data
+    // and never touches the real `[[Prototype]]` slot, so the redundancy
+    // argument does not apply to it and skipping it hid a token in plain sight.
+    // Skip only the inherited accessor; walk an own one like any other key.
+    if (key === '__proto__' && Object.getOwnPropertyDescriptor(object, '__proto__') === undefined) {
+      continue
+    }
 
     let child: unknown
     if ('value' in descriptor) {

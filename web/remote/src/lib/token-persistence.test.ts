@@ -132,42 +132,29 @@
  * measurement got a different number, and the count is not the point - the
  * comparison is.)
  *
- * **Not covered. Every one of these is pinned by a test that asserts the miss**,
- * so closing a gap fails loudly and forces this list to be updated, rather than
- * letting the boundary drift while the file still reads as exhaustive:
+ * **Not covered.** The authoritative list of what the walk can and cannot see
+ * lives in **one place**, `../test/reachability.ts` - closures, function-object
+ * properties, the finite depth and prototype-hop limits, re-encodings, `Proxy`
+ * traps, a getter that lies on first read, and values in internal slots with no
+ * synchronous accessor. **Do not restate it here.** A second copy of that list
+ * had already drifted out of date within a single review round, which is the
+ * same failure that two copies of the traversal caused.
  *
- * - **Closures.** A value captured in a closure is invisible to any property
- *   walk. This is not a defect to fix - it is precisely the mechanism
- *   `session.ts` uses, and it is why the clean case passes. A token parked in a
- *   closure reachable from a global (`window.get = () => token`) is missed.
- * - **`WeakMap` / `WeakSet`.** Non-enumerable *by specification*: no caller can
- *   list their contents. Unlike `Map`/`Set` this is not a hole that more code
- *   would close; it is closer in kind to a closure. A **genuine** one is
- *   therefore passed over quietly - but membership is settled by probing the
- *   internal slot ({@link hasWeakCollectionSlot}), never by asking the object,
- *   so a `Proxy` wrapping a weak collection has no slot of its own and **is**
- *   reported.
- * - **Properties hung on function objects.** Excluded for cost, and the number
- *   is real, and reproducible rather than quoted: delete the `typeof value ===
- *   'function'` guard in {@link reachableFromGlobals} and run this file. It
- *   crosses tens of thousands of objects without terminating - jsdom's
- *   constructor graph fans out through every interface prototype - against well
- *   under a second with the guard in place. A test that does not terminate is
- *   not a test. (Figures are deliberately not frozen here; the object count has
- *   moved twice in as many review rounds, so the command is the durable part.)
- * - **Any encoding of the token.** The leaf test is a literal substring match,
- *   so `btoa(token)`, URI-encoding or a XOR all defeat it. Detecting arbitrary
- *   transformations is undecidable in general; chasing them one at a time would
- *   rebuild the same losing enumeration this file exists to replace.
- * - **A `Proxy` with a lying `ownKeys` trap.** Returning `[]` for a
- *   non-existent configurable property violates no ES invariant, so the walker
- *   cannot enumerate what the trap hides.
+ * Every entry there is pinned by a test in this file that asserts the miss, so
+ * closing a gap fails loudly rather than letting the documentation quietly
+ * become a lie.
+ *
+ * The one limit that is genuinely this file's own, because it is not about
+ * object graphs at all:
+ *
  * - **Out-of-band stores that are not object properties**: IndexedDB, the Cache
- *   API and `document.cookie`. These are covered instead by {@link installProbe}
- *   below, which instruments the APIs directly.
+ *   API and `document.cookie`. These are covered by {@link installProbe} below,
+ *   which instruments those APIs directly.
  *
- * The last three all require deliberate intent; `Map`/`Set` did not, which is
- * the line used to decide what gets covered and what gets documented.
+ * The line used to decide what gets *covered* versus *documented*: whether
+ * reaching the hiding place needs deliberate intent. A token in a `Map` keyed
+ * by device id needs none, so it is covered; a `Proxy` with a lying `ownKeys`
+ * trap needs plenty, and there is no unforgeable way to see through it anyway.
  *
  * One further exclusion, for correctness rather than cost: top-level **test
  * harness globals** (`process`, `__vitest_*`, the jest matcher symbol) are
@@ -255,8 +242,15 @@ const NEEDLE = 'eyJhbGciOiJIUzI1NiJ9.NEEDLE-9f3c1a7e-token.sig'
 // be found and applied twice. It was applied once. Add traversal behaviour to
 // the shared module, never to a suite.
 
-/** How far from `globalThis` the walk follows references. */
-const MAX_DEPTH = 8
+/**
+ * How far from `globalThis` the walk follows references.
+ *
+ * Raised from 8 after an audit found a token nested 9 deep was missed. Measured
+ * at 8/10/12/16: wall time is flat, because the visited set bounds the walk
+ * rather than this number. Still finite, and named as a boundary - a deep
+ * enough nest still escapes.
+ */
+const MAX_DEPTH = 16
 
 /**
  * Hard ceiling on objects visited. Exceeding it **fails**; it never degrades to
@@ -597,6 +591,41 @@ describe('the reachability walk itself (positive controls)', () => {
     )
   })
 
+  // `Object.defineProperty(o, '__proto__', ...)` creates ordinary own data and
+  // never touches the real `[[Prototype]]` slot, so the "already covered by the
+  // merged chain" argument does not apply to it - it was never in any chain.
+  // Skipping it hid a token in plain sight.
+  it('finds a token in an own data property literally named __proto__', () => {
+    const holder = {}
+    Object.defineProperty(holder, '__proto__', {
+      value: NEEDLE,
+      enumerable: true,
+      configurable: true,
+    })
+    plantGlobal('__lemProtoNamed', holder)
+
+    // The premise: this really is own data, and the real prototype is untouched.
+    expect(Object.getPrototypeOf(holder)).toBe(Object.prototype)
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemProtoNamed.__proto__')
+  })
+
+  // `new String(token)` is an *object*, so the walk's string leaf-test never
+  // fires, and its own properties are single characters. Found by auditing the
+  // taxonomy rather than the code; fixed with an internal-slot probe.
+  it('finds a token inside a boxed String object', () => {
+    plantGlobal('__lemBoxed', new String(NEEDLE))
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemBoxed.valueOf()')
+  })
+
+  it('finds a token on a prototype chain deeper than a few hops', () => {
+    let chain: object = { stashed: NEEDLE }
+    for (let index = 0; index < 6; index += 1) chain = Object.create(chain) as object
+    plantGlobal('__lemDeepChain', chain)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemDeepChain.stashed')
+  })
+
   // The walk skips the `__proto__` edge as redundant. This is the positive
   // control for that argument: a token parked on a *prototype* must still be
   // found while walking an instance, because `descriptorsOf` merges the whole
@@ -845,6 +874,64 @@ describe('the reachability walk itself (positive controls)', () => {
   // configurable property without violating any ES invariant, so the walker
   // cannot enumerate what the trap chooses to hide. Requires deliberate intent,
   // which puts it in the same class as the closure and function boundaries.
+  // A getter is arbitrary code, so it can serve a decoy on the read the walk
+  // makes and the real value on the next one. Reading twice defeats a two-read
+  // decoy and loses to a three-read one; **no finite read count is safe**, and
+  // we cannot stop following accessors - that is exactly what surfaces
+  // `history.state`, `window.name` and `location.href`.
+  //
+  // Irreducible, therefore stated rather than defended against. A hostile
+  // framed iframe simply reads twice.
+  it('does NOT see a token behind a getter that lies on first read', () => {
+    let reads = 0
+    const holder = {}
+    Object.defineProperty(holder, 'token', {
+      get: () => (reads++ === 0 ? 'harmless' : NEEDLE),
+      enumerable: true,
+      configurable: true,
+    })
+    plantGlobal('__lemCountingGetter', holder)
+
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+
+    // The value really is there for anyone who asks a second time.
+    expect((holder as { token: string }).token).toBe(NEEDLE)
+  })
+
+  // A resolved value lives in an internal slot with no synchronous accessor, so
+  // a property walk cannot reach it at all.
+  it('does NOT see a token inside a resolved Promise', () => {
+    plantGlobal('__lemPromise', Promise.resolve(NEEDLE))
+
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+  })
+
+  // The leaf test is a substring match on strings, so any re-encoding escapes.
+  // Bytes deserve their own mention in this codebase: the tunnel moves the
+  // token as bytes constantly, and a `TextEncoder` round trip is the most
+  // natural way anyone would land here without meaning to.
+  it('does NOT see a token encoded as bytes', () => {
+    plantGlobal('__lemBytes', new TextEncoder().encode(NEEDLE))
+
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+  })
+
+  it('does NOT see a token split across two properties', () => {
+    plantGlobal('__lemSplit', { head: NEEDLE.slice(0, 12), tail: NEEDLE.slice(12) })
+
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+  })
+
+  // MAX_DEPTH is finite. Raising it is nearly free (measured), but no value
+  // makes it unbounded, so the limit is named rather than implied away.
+  it('does NOT see a token nested deeper than MAX_DEPTH', () => {
+    let nest: Record<string, unknown> = { token: NEEDLE }
+    for (let index = 0; index < MAX_DEPTH + 4; index += 1) nest = { next: nest }
+    plantGlobal('__lemVeryDeep', nest)
+
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+  })
+
   it('does NOT see a token behind a lying Proxy ownKeys trap', () => {
     const target = { hidden: NEEDLE }
     plantGlobal(
