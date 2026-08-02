@@ -60,6 +60,19 @@
  * The reproducible check either way: put the token back into `useAuth`'s state
  * and the storage suite stays green while this one fails three assertions.
  *
+ * ### Separate suites, **one** traversal
+ *
+ * Separate *setup* was always right. Separate *machinery* never was, and this
+ * file proved it the hard way: it kept a private `instanceof` + `for...of` copy
+ * of the collection walk, so three consecutive rounds of hardening landed next
+ * door and never arrived here. An ordinary `useState(() => new Map(...))` was
+ * invisible to this walk, and a hostile-iterator subclass crashed it, long
+ * after both were fixed in the sibling suite.
+ *
+ * The traversal now lives in `../test/reachability.ts` and both suites call it.
+ * **Put traversal behaviour there, not here.** The three tests marked as such
+ * below are the standing check that it really is shared.
+ *
  * ## The fix this file pins
  *
  * `useAuth()` returns `isAuthenticated`, never the token. Code that needs the
@@ -85,6 +98,7 @@ import { act, render, cleanup } from '@testing-library/react'
 import { useState, type ReactElement } from 'react'
 import { useAuth } from '../hooks/useAuth'
 import { clearToken, storeToken } from './session'
+import { OPAQUE_NOTE, expandObject } from '../test/reachability'
 
 // `vi.hoisted` so the constant exists before the hoisted `vi.mock` factory runs.
 const { NEEDLE } = vi.hoisted(() => ({ NEEDLE: 'eyJhbGciOiJIUzI1NiJ9.FIBER-NEEDLE-4c1f.sig' }))
@@ -109,7 +123,17 @@ function isDomNode(value: unknown): boolean {
   return typeof Node !== 'undefined' && value instanceof Node
 }
 
-/** Record every path within one payload at which `needle` appears. */
+/**
+ * Record every path within one payload at which `needle` appears.
+ *
+ * Object expansion - properties, prototype chain, and `Map`/`Set` contents -
+ * comes from the **shared** `expandObject`, so every hardening fix made for the
+ * globals sweep applies here automatically. This file previously carried its
+ * own `instanceof` + `for...of` copy, which meant three rounds of fixes never
+ * reached it: an ordinary `useState(() => new Map(...))` was invisible to this
+ * walk, and a hostile-iterator subclass crashed it. That duplication was the
+ * defect, not the individual misses.
+ */
 function deepFind(
   value: unknown,
   needle: string,
@@ -124,39 +148,18 @@ function deepFind(
   }
   if (value === null || typeof value !== 'object') return
   // Following a DOM node leads back to `document` and then the whole global
-  // graph, which `token-persistence.test.ts` already covers.
+  // graph, which `token-persistence.test.ts` already covers. This is a *scope*
+  // decision about which sweep owns which territory, not a claim that DOM nodes
+  // are safe.
   if (isDomNode(value)) return
   if (seen.has(value)) return
   seen.add(value)
   if (depth >= PAYLOAD_DEPTH) return
 
-  if (value instanceof Map) {
-    let index = 0
-    for (const [entryKey, entryValue] of value) {
-      deepFind(entryKey, needle, `${path}.<mapKey ${index}>`, depth + 1, seen, out)
-      deepFind(entryValue, needle, `${path}.get(${String(entryKey)})`, depth + 1, seen, out)
-      index += 1
-    }
-    return
-  }
-  if (value instanceof Set) {
-    let index = 0
-    for (const entry of value) {
-      deepFind(entry, needle, `${path}.<setEntry ${index}>`, depth + 1, seen, out)
-      index += 1
-    }
-    return
-  }
-
-  for (const key of Reflect.ownKeys(value)) {
-    let child: unknown
-    try {
-      child = (value as Record<PropertyKey, unknown>)[key]
-    } catch {
-      continue
-    }
-    if (typeof child === 'function') continue
-    deepFind(child, needle, `${path}.${String(key)}`, depth + 1, seen, out)
+  const { children, opaque } = expandObject(value, path)
+  if (opaque !== null) out.push(opaque)
+  for (const child of children) {
+    deepFind(child.value, needle, child.path, depth + 1, seen, out)
   }
 }
 
@@ -247,6 +250,76 @@ describe('the fiber walk itself (positive controls)', () => {
 
   it('finds nothing in an empty document', () => {
     expect(reachableFromFibers(NEEDLE)).toEqual([])
+  })
+
+  // The three cases below are the ones that proved this file had its own,
+  // unhardened copy of the traversal. Each was already covered next door and
+  // none of it had reached here. They are kept as the standing check that the
+  // machinery really is shared: if someone reintroduces a private walk in this
+  // file, these fail.
+
+  // No tricks at all - a Map in component state is an ordinary thing to write.
+  // Under the old `instanceof` gate with `Map[Symbol.hasInstance]` poisoned,
+  // this was silently invisible.
+  it('finds a token in a Map held in component state, with hasInstance poisoned', () => {
+    const original = Object.getOwnPropertyDescriptor(Map, Symbol.hasInstance)
+    Object.defineProperty(Map, Symbol.hasInstance, { value: () => false, configurable: true })
+
+    try {
+      function MapHolder(): ReactElement {
+        const [sessions] = useState(() => new Map([['session', NEEDLE]]))
+        return <span>{sessions.size}</span>
+      }
+      render(<MapHolder />)
+
+      expect(new Map() instanceof Map).toBe(false)
+      expect(reachableFromFibers(NEEDLE).length).toBeGreaterThan(0)
+    } finally {
+      if (original) Object.defineProperty(Map, Symbol.hasInstance, original)
+      else Reflect.deleteProperty(Map, Symbol.hasInstance)
+    }
+  })
+
+  // Under `for...of` this threw rather than reporting, taking the walk with it.
+  it('finds a token in a state Map whose Symbol.iterator is sabotaged', () => {
+    class HostileMap<K, V> extends Map<K, V> {
+      [Symbol.iterator](): MapIterator<[K, V]> {
+        throw new Error('enumeration refused')
+      }
+    }
+
+    function HostileHolder(): ReactElement {
+      const [sessions] = useState(() => {
+        const map = new HostileMap<string, string>()
+        map.set('session', NEEDLE)
+        return map
+      })
+      return <span>{sessions.get('session')?.length}</span>
+    }
+    render(<HostileHolder />)
+
+    expect(reachableFromFibers(NEEDLE).length).toBeGreaterThan(0)
+  })
+
+  // A Proxy-wrapped Map in state cannot be read, so it must be reported rather
+  // than passed over - the same refusal-to-certify the globals sweep makes.
+  it('refuses to certify a Proxy-wrapped Map held in component state', () => {
+    function WrappedHolder(): ReactElement {
+      const [sessions] = useState(() => {
+        const inner = new Map([['session', NEEDLE]])
+        return new Proxy(inner, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target) as unknown
+            if (typeof value !== 'function') return value
+            return (value as (...args: unknown[]) => unknown).bind(target)
+          },
+        })
+      })
+      return <span>{sessions.get('session')?.length}</span>
+    }
+    render(<WrappedHolder />)
+
+    expect(reachableFromFibers(NEEDLE).some((path) => path.includes(OPAQUE_NOTE))).toBe(true)
   })
 
   it('finds a token held in component state and passed as a prop', () => {

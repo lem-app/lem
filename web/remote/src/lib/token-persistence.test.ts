@@ -240,259 +240,39 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
+import { expandObject, isHarnessRootValue } from '../test/reachability'
 
 /** A value distinctive enough that finding it anywhere is unambiguous. */
 const NEEDLE = 'eyJhbGciOiJIUzI1NiJ9.NEEDLE-9f3c1a7e-token.sig'
 
 // -- reachability from a global root -----------------------------------------
+//
+// The traversal machinery lives in `../test/reachability.ts`, shared with
+// `fiber-reachability.test.tsx`. It is deliberately NOT duplicated here: the
+// two suites differ in *setup* (that one renders a component tree, this one
+// does not), which is why both exist - but they must not differ in how they
+// walk, and for three rounds of review they did, so every hardening fix had to
+// be found and applied twice. It was applied once. Add traversal behaviour to
+// the shared module, never to a suite.
 
 /** How far from `globalThis` the walk follows references. */
 const MAX_DEPTH = 8
 
 /**
  * Hard ceiling on objects visited. Exceeding it **fails**; it never degrades to
- * a quiet partial scan reported as "clean". The observed cost of a full walk is
- * ~670 objects, so this is roughly 300x headroom - if it is ever hit, something
+ * a quiet partial scan reported as "clean". A full walk visits well under a
+ * thousand objects, so this is ample headroom - if it is ever hit, something
  * structural changed and a human should look, not a green tick.
  */
 const MAX_NODES = 200_000
 
-/** Prototype links climbed per object, to reach platform accessors. */
-const PROTOTYPE_HOPS = 4
-
 /**
- * The built-in `forEach` for each collection, captured at module load.
- *
- * Held by reference so that neither a subclass overriding `Symbol.iterator`
- * nor later tampering with `Map.prototype` can change what the walk enumerates.
- * These functions read the [[MapData]] / [[SetData]] internal slots directly.
- */
-// Unbound on purpose: these are invoked with an explicit receiver via `.call`,
-// which is the entire mechanism - a bound or instance-resolved method could be
-// replaced by the object being inspected.
-/* eslint-disable @typescript-eslint/unbound-method */
-const MAP_FOR_EACH = Map.prototype.forEach as (
-  this: unknown,
-  callback: (value: unknown, key: unknown) => void
-) => void
-const SET_FOR_EACH = Set.prototype.forEach as (
-  this: unknown,
-  callback: (value: unknown) => void
-) => void
-// `has` is the cheapest method with a `RequireInternalSlot` step, which is all
-// these two are used for - see `hasWeakCollectionSlot`.
-const WEAKMAP_HAS = WeakMap.prototype.has as (this: unknown, key: object) => boolean
-const WEAKSET_HAS = WeakSet.prototype.has as (this: unknown, key: object) => boolean
-/* eslint-enable @typescript-eslint/unbound-method */
-
-/** A stable object to probe weak collections with; never stored anywhere. */
-const WEAK_PROBE_KEY: object = Object.freeze({})
-
-/**
- * Does this object hold a genuine `[[WeakMapData]]`/`[[WeakSetData]]` slot?
- *
- * Probed rather than asked: `WeakMap.prototype.has` performs
- * `RequireInternalSlot` before it looks at the key, so it throws on anything
- * that is not really a weak collection. A `Proxy` around one fails the probe,
- * because `.call()` bypasses its traps and the proxy has no slot of its own -
- * which is what we want, since such a wrapper *is* worth reporting.
- *
- * A real one is not. Weak collections are non-enumerable **by specification**,
- * for every caller, so finding one says nothing about whether it holds a token
- * and reporting them would be noise on an irreducible boundary rather than a
- * signal. jsdom and vitest between them put several on the graph
- * (`document[Symbol(impl)]._workingNodeIterators._refMap`,
- * `globalThis[Symbol(matchers-object)]`).
- */
-function hasWeakCollectionSlot(value: object): boolean {
-  try {
-    WEAKMAP_HAS.call(value, WEAK_PROBE_KEY)
-    return true
-  } catch {
-    // Not a WeakMap; try the other one.
-  }
-  try {
-    WEAKSET_HAS.call(value, WEAK_PROBE_KEY)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Read a `Map`'s entries through the captured built-in, or `null` if this
- * object has no `[[MapData]]` slot.
- *
- * Entries are buffered inside the `try` so that a throw from the *caller's*
- * handling can never be mistaken for "not a Map".
- */
-function readMapEntries(value: object): [unknown, unknown][] | null {
-  const entries: [unknown, unknown][] = []
-  try {
-    MAP_FOR_EACH.call(value, (entryValue: unknown, entryKey: unknown) => {
-      entries.push([entryKey, entryValue])
-    })
-  } catch {
-    return null
-  }
-  return entries
-}
-
-/** As {@link readMapEntries}, for `[[SetData]]`. */
-function readSetEntries(value: object): unknown[] | null {
-  const entries: unknown[] = []
-  try {
-    SET_FOR_EACH.call(value, (entry: unknown) => {
-      entries.push(entry)
-    })
-  } catch {
-    return null
-  }
-  return entries
-}
-
-/**
- * The built-in collection prototypes, captured at module load.
- *
- * Held for **reference comparison only**. Three rounds of review found the same
- * bug three times - `instanceof`, then `Symbol.hasInstance`, then an own
- * `constructor` property - and every one of them classified an object using
- * something the object controls, which a `Proxy` can lie about. Object identity
- * is the one thing it cannot: a proxy wrapping `Map` is a *different object*
- * from `Map.prototype` no matter what its traps say.
- */
-const BUILTIN_COLLECTION_PROTOTYPES: readonly object[] = [
-  Map.prototype,
-  Set.prototype,
-  WeakMap.prototype,
-  WeakSet.prototype,
-]
-
-/**
- * Is this object one of the built-in collection prototypes *itself*?
- *
- * The only thing excluded from reporting, and excluded by `===` alone. These
- * hold no instance data, so there is genuinely nothing to miss in them.
- *
- * A subclass prototype is **not** identity-equal to a built-in and is therefore
- * *not* excluded - it gets reported like any other unreadable collection. That
- * is deliberate: the previous `constructor`-based check quietened subclass
- * prototypes and, in doing so, let a `Proxy` with a lying
- * `getOwnPropertyDescriptor` trap disappear completely. A little noise that
- * cannot be forged beats silence that can.
- */
-function isBuiltinCollectionPrototype(value: object): boolean {
-  return BUILTIN_COLLECTION_PROTOTYPES.includes(value)
-}
-
-/**
- * Does this object present itself as a `Map`/`Set` while having no internal
- * slot to read?
- *
- * Two signals, the identity one first:
- *
- * 1. **Its prototype chain contains a captured built-in collection prototype,
- *    by `===`.** A `Proxy` forwards `getPrototypeOf` to its target unless it
- *    installs a trap specifically to lie about it.
- * 2. Its `Symbol.toStringTag` says `Map`/`Set`. A functional wrapper forwards
- *    this through the same `get` trap that makes it usable.
- *
- * Note the asymmetry, which is the point: this decides whether to **surface**
- * something, so a forged answer costs a missed report - a documented boundary.
- * {@link isBuiltinCollectionPrototype} decides whether to **stay quiet**, so a
- * forged answer there would be a silent bypass, and it is identity-only.
- *
- * An object that neither enumerates as a collection nor presents as one is
- * indistinguishable from a plain object, and there are tens of thousands of
- * those in the graph. That limit is irreducible, not an oversight.
- */
-function presentsAsCollection(value: object): boolean {
-  try {
-    let proto: object | null = Object.getPrototypeOf(value) as object | null
-    let hops = 0
-    while (proto !== null && hops < PROTOTYPE_HOPS) {
-      if (BUILTIN_COLLECTION_PROTOTYPES.includes(proto)) return true
-      proto = Object.getPrototypeOf(proto) as object | null
-      hops += 1
-    }
-
-    const tag = Object.prototype.toString.call(value)
-    return tag === '[object Map]' || tag === '[object Set]'
-  } catch {
-    return false
-  }
-}
-
-/**
- * Top-level globals that exist only because these tests run in Node under
- * vitest, and that a browser never has.
- *
- * This is a **modelling** decision, not a convenience: the question the walk
- * asks is "can code in the framed realm reach the token", and code in a browser
- * cannot reach `process` or `__vitest_worker__` because they do not exist. Left
- * in, the walk asserts facts about vitest instead - concretely,
- * `__vitest_worker__` holds the **source text of every loaded module**, so it
- * contains this file's own `NEEDLE` literal and every run would "find" a token
- * that is nothing but a string constant in a test.
- *
- * Kept deliberately narrow: matched by name, at depth 1 only, so a production
- * value can never hide behind it. Anything reachable by a second path is still
- * found by that path.
- */
-const HARNESS_ONLY_ROOTS = new Set(['process', 'global'])
-
-/** Vitest hangs several registries off `__vitest_*` globals; none exist in a browser. */
-const HARNESS_ROOT_PATTERN = /^__vitest/
-
-/** True for a top-level global that belongs to the test harness, not the page. */
-function isHarnessRoot(key: string | symbol): boolean {
-  if (typeof key === 'symbol') return (key.description ?? '').includes('jest-matchers')
-  return HARNESS_ONLY_ROOTS.has(key) || HARNESS_ROOT_PATTERN.test(key)
-}
-
-/** Every own and inherited property descriptor, nearest definition winning. */
-function descriptorsOf(obj: object): Map<string | symbol, PropertyDescriptor> {
-  const collected = new Map<string | symbol, PropertyDescriptor>()
-  let current: object | null = obj
-  let hops = 0
-
-  while (current !== null && hops < PROTOTYPE_HOPS) {
-    // Symbol keys are kept deliberately: jsdom hangs its implementation objects
-    // off symbols, and dropping them would blind the walk to the whole DOM.
-    let keys: (string | symbol)[]
-    try {
-      keys = Reflect.ownKeys(current)
-    } catch {
-      break
-    }
-    for (const key of keys) {
-      if (collected.has(key)) continue
-      let descriptor: PropertyDescriptor | undefined
-      try {
-        descriptor = Object.getOwnPropertyDescriptor(current, key)
-      } catch {
-        continue
-      }
-      if (descriptor !== undefined) collected.set(key, descriptor)
-    }
-    try {
-      // `getPrototypeOf` is typed `any` by the standard lib.
-      current = Object.getPrototypeOf(current) as object | null
-    } catch {
-      break
-    }
-    hops += 1
-  }
-
-  return collected
-}
-
-/**
- * Every path from `globalThis` at which `needle` is reachable as a string.
+ * Every path from `globalThis` at which `needle` is reachable as a string, plus
+ * any object the walk could not read and therefore declines to certify clean.
  *
  * Breadth-first, so the shallowest (most damning) path is reported first.
  * Accessors are invoked with the object as receiver, which is what surfaces
- * `document.body`, `history.state`, `location.href` and `window.name` — they
+ * `document.body`, `history.state`, `location.href` and `window.name` - they
  * are prototype accessors, not own data properties, and an own-properties-only
  * walk would silently miss all of them.
  *
@@ -517,17 +297,10 @@ function reachableFromGlobals(needle: string): string[] {
       continue
     }
 
-    // Only objects and functions have properties worth following; everything
-    // else is a leaf that is not a string.
-    const traversable = value !== null && (typeof value === 'object' || typeof value === 'function')
-    if (!traversable) continue
-
-    // THE function exclusion. Deleting this single line genuinely re-enables
-    // descent into function objects (and makes the walk take ~23 s against
-    // jsdom's constructor graph) - it is not shadowed by the check above, so a
-    // reverter testing the documented boundary gets a true signal rather than a
-    // silent no-op. See the module comment for the measurement.
-    if (typeof value === 'function') continue
+    // Only objects have properties worth following; everything else is a leaf
+    // that is not a string. (Functions are excluded inside `expandObject`, in
+    // the one place that boundary is enforced.)
+    if (value === null || typeof value !== 'object') continue
 
     const object: object = value
     if (visited.has(object)) continue
@@ -541,75 +314,16 @@ function reachableFromGlobals(needle: string): string[] {
     }
     if (depth >= MAX_DEPTH) continue
 
-    for (const [key, descriptor] of descriptorsOf(object)) {
+    const { children, opaque } = expandObject(object, path)
+    if (opaque !== null) found.push(opaque)
+
+    for (const child of children) {
       // Depth 0 is `globalThis` itself, so this only ever skips a top-level
-      // harness global - see HARNESS_ONLY_ROOTS.
-      if (depth === 0 && isHarnessRoot(key)) continue
-
-      let child: unknown
-      if ('value' in descriptor) {
-        child = descriptor.value
-      } else if (descriptor.get) {
-        try {
-          child = descriptor.get.call(object)
-        } catch {
-          // Getters that throw hold nothing we could have stored.
-          continue
-        }
-      } else {
-        continue
-      }
-
-      queue.push({ value: child, path: `${path}.${String(key)}`, depth: depth + 1 })
-    }
-
-    // `Map` and `Set` hold their contents in internal slots, not in own
-    // properties, so `Reflect.ownKeys` cannot see them. A token in a `Map`
-    // keyed by device or session id is an ordinary thing to write - no
-    // adversarial intent required - which is why this is traversed rather than
-    // documented as a boundary.
-    //
-    // Enumeration goes through the **built-in** `forEach`, captured at module
-    // load, rather than `for...of`, and with **no `instanceof` gate at all**.
-    //
-    // There is no type test here on purpose. Asking "is this a Map?" with a
-    // tamperable operator and *then* enumerating fails at the question, in both
-    // directions: `Map[Symbol.hasInstance]` can be poisoned so a real Map
-    // answers no, and a `Proxy` wrapping a Map answers yes but cannot be
-    // enumerated. Attempting the captured built-in and letting success be the
-    // test removes the question. `Map.prototype.forEach` only succeeds on a
-    // genuine `[[MapData]]` internal slot, which is exactly the property we
-    // care about and is the one thing that cannot be forged.
-    const mapEntries = readMapEntries(object)
-    const setEntries = mapEntries === null ? readSetEntries(object) : null
-
-    if (mapEntries !== null) {
-      mapEntries.forEach(([entryKey, entryValue], index) => {
-        queue.push({ value: entryKey, path: `${path}.<mapKey ${index}>`, depth: depth + 1 })
-        queue.push({
-          value: entryValue,
-          path: `${path}.get(${String(entryKey)})`,
-          depth: depth + 1,
-        })
-      })
-    } else if (setEntries !== null) {
-      setEntries.forEach((entry, index) => {
-        queue.push({ value: entry, path: `${path}.<setEntry ${index}>`, depth: depth + 1 })
-      })
-    } else if (
-      presentsAsCollection(object) &&
-      !isBuiltinCollectionPrototype(object) &&
-      !hasWeakCollectionSlot(object)
-    ) {
-      // It behaves like a collection to application code but has no internal
-      // slot, so its contents cannot be read - a `Proxy` around a real Map is
-      // the ordinary way to land here, and a method-binding or logging wrapper
-      // is a perfectly normal thing to write.
-      //
-      // We cannot unwrap it, so we cannot prove it holds the token. We can
-      // refuse to certify it clean, which is the honest result. Silently
-      // skipping it would turn a bypass into a green tick.
-      found.push(`${path} <unenumerable collection: cannot be read, not certified clean>`)
+      // harness global - and it skips by *object identity*, not by name, so a
+      // later `window.global = new Map(...)` is a different object and is
+      // walked. See `isHarnessRootValue`.
+      if (depth === 0 && isHarnessRootValue(child.value)) continue
+      queue.push({ value: child.value, path: child.path, depth: depth + 1 })
     }
   }
 
@@ -864,6 +578,38 @@ describe('the reachability walk itself (positive controls)', () => {
   // that throws from it would hide its contents behind the walk's `catch` while
   // `.get()` kept working perfectly. Going through the built-in `forEach`
   // defeats that, because it reads the internal slot rather than the iterator.
+  // The fourth forgeable-classification bug, and the one that needed no ill
+  // intent at all: harness roots used to be excluded by *string name*, so
+  // anything a developer happened to call `global` was silently skipped. They
+  // are excluded by object identity now, so a later assignment is a different
+  // object and gets walked.
+  it('finds a token on a global whose name matches a harness root', () => {
+    plantGlobal('global', new Map([['session', NEEDLE]]))
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.global.get(session)')
+  })
+
+  it('finds a token on a global named like a vitest internal', () => {
+    plantGlobal('__vitest_totally_legitimate__', { session: NEEDLE })
+
+    expect(reachableFromGlobals(NEEDLE)).toContain(
+      'globalThis.__vitest_totally_legitimate__.session'
+    )
+  })
+
+  // The walk skips the `__proto__` edge as redundant. This is the positive
+  // control for that argument: a token parked on a *prototype* must still be
+  // found while walking an instance, because `descriptorsOf` merges the whole
+  // chain. If this ever fails, the skip has become a hiding place.
+  it('finds a token stored on an object prototype, reached through an instance', () => {
+    const proto = { stashed: NEEDLE }
+    const instance = Object.create(proto) as Record<string, unknown>
+    instance.harmless = 'nothing to see'
+    plantGlobal('__lemInherited', instance)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain('globalThis.__lemInherited.stashed')
+  })
+
   it('finds a token in a Map whose Symbol.iterator has been sabotaged', () => {
     class HostileMap<K, V> extends Map<K, V> {
       [Symbol.iterator](): MapIterator<[K, V]> {
