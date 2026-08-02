@@ -68,6 +68,30 @@
  * `for...of` walk would have left such a token sitting in plain sight behind
  * this file's `catch` while `.get()` kept working.
  *
+ * ### One rule, learned three times: never classify an object by what it says
+ *
+ * Review found the same bug in three successive rounds - `instanceof`, then
+ * `Symbol.hasInstance`, then an own `constructor` property. Each time the walk
+ * decided what an object *was* by consulting something the object controls, and
+ * each time a `Proxy` could lie about it. The third was the worst: a wrapped
+ * `Map` claiming an own `constructor` was classified as an inert prototype and
+ * dropped **silently**, which is indistinguishable from a clean result.
+ *
+ * The rule that came out of it, and the one to keep:
+ *
+ * - To decide whether to **stay quiet** about something, use only facts that
+ *   cannot be forged - **object identity** (`===` against a prototype captured
+ *   at module load) or an **internal-slot probe** (a built-in method that
+ *   throws unless the slot is really there). A forged answer here is a silent
+ *   bypass, and silence is the thing being exploited.
+ * - To decide whether to **surface** something, a heuristic is acceptable,
+ *   because a forged answer costs a missed report rather than a false
+ *   all-clear. Those are documented as boundaries below.
+ *
+ * The asymmetry is the whole design. Anything that presents as a collection and
+ * cannot be read is reported unless it is *identically* a built-in prototype or
+ * *provably* a weak collection.
+ *
  * There is also **no type test before enumerating**. Asking "is this a Map?"
  * with `instanceof` and then reading it fails at the question, three ways:
  * `Map[Symbol.hasInstance]` can be poisoned so a real Map answers no; a `Proxy`
@@ -88,10 +112,25 @@
  * wrapping a Map, which is an ordinary method-binding or logging pattern and is
  * fully functional for the code holding it - the walk **reports it** rather
  * than skipping it. We cannot unwrap it and so cannot prove it holds the token;
- * we can decline to certify it clean, which is the honest answer. The false
- * positive cost of that was measured before adopting it: with the check
- * duck-typed on `get`/`set`/`has` it was **5** (led by `globalThis.Reflect`,
- * which is not a collection); keyed on `Symbol.toStringTag` it is **0**.
+ * we can decline to certify it clean, which is the honest answer.
+ *
+ * The false-positive cost of reporting was measured before adopting it, and is
+ * currently **zero** against the real jsdom + vitest graph - which the
+ * `starts clean` test asserts on every run, so it cannot rot. To see what the
+ * rejected alternative cost, replace the body of {@link presentsAsCollection}
+ * with a duck-type on method names:
+ *
+ * ```ts
+ * const c = value as Record<string, unknown>
+ * return typeof c.get === 'function' && typeof c.set === 'function' &&
+ *        typeof c.has === 'function'
+ * ```
+ *
+ * and run this file: `starts clean` fails and lists them, led by
+ * `globalThis.Reflect`, which has all three methods and is not a collection.
+ * (Stated as a procedure, not a count: an independent reimplementation of that
+ * measurement got a different number, and the count is not the point - the
+ * comparison is.)
  *
  * **Not covered. Every one of these is pinned by a test that asserts the miss**,
  * so closing a gap fails loudly and forces this list to be updated, rather than
@@ -103,7 +142,11 @@
  *   closure reachable from a global (`window.get = () => token`) is missed.
  * - **`WeakMap` / `WeakSet`.** Non-enumerable *by specification*: no caller can
  *   list their contents. Unlike `Map`/`Set` this is not a hole that more code
- *   would close; it is closer in kind to a closure.
+ *   would close; it is closer in kind to a closure. A **genuine** one is
+ *   therefore passed over quietly - but membership is settled by probing the
+ *   internal slot ({@link hasWeakCollectionSlot}), never by asking the object,
+ *   so a `Proxy` wrapping a weak collection has no slot of its own and **is**
+ *   reported.
  * - **Properties hung on function objects.** Excluded for cost, and the number
  *   is real, and reproducible rather than quoted: delete the `typeof value ===
  *   'function'` guard in {@link reachableFromGlobals} and run this file. It
@@ -236,7 +279,45 @@ const SET_FOR_EACH = Set.prototype.forEach as (
   this: unknown,
   callback: (value: unknown) => void
 ) => void
+// `has` is the cheapest method with a `RequireInternalSlot` step, which is all
+// these two are used for - see `hasWeakCollectionSlot`.
+const WEAKMAP_HAS = WeakMap.prototype.has as (this: unknown, key: object) => boolean
+const WEAKSET_HAS = WeakSet.prototype.has as (this: unknown, key: object) => boolean
 /* eslint-enable @typescript-eslint/unbound-method */
+
+/** A stable object to probe weak collections with; never stored anywhere. */
+const WEAK_PROBE_KEY: object = Object.freeze({})
+
+/**
+ * Does this object hold a genuine `[[WeakMapData]]`/`[[WeakSetData]]` slot?
+ *
+ * Probed rather than asked: `WeakMap.prototype.has` performs
+ * `RequireInternalSlot` before it looks at the key, so it throws on anything
+ * that is not really a weak collection. A `Proxy` around one fails the probe,
+ * because `.call()` bypasses its traps and the proxy has no slot of its own -
+ * which is what we want, since such a wrapper *is* worth reporting.
+ *
+ * A real one is not. Weak collections are non-enumerable **by specification**,
+ * for every caller, so finding one says nothing about whether it holds a token
+ * and reporting them would be noise on an irreducible boundary rather than a
+ * signal. jsdom and vitest between them put several on the graph
+ * (`document[Symbol(impl)]._workingNodeIterators._refMap`,
+ * `globalThis[Symbol(matchers-object)]`).
+ */
+function hasWeakCollectionSlot(value: object): boolean {
+  try {
+    WEAKMAP_HAS.call(value, WEAK_PROBE_KEY)
+    return true
+  } catch {
+    // Not a WeakMap; try the other one.
+  }
+  try {
+    WEAKSET_HAS.call(value, WEAK_PROBE_KEY)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /**
  * Read a `Map`'s entries through the captured built-in, or `null` if this
@@ -271,41 +352,72 @@ function readSetEntries(value: object): unknown[] | null {
 }
 
 /**
- * Does this object *present itself* as a `Map`/`Set` while having no internal
- * slot to read?
+ * The built-in collection prototypes, captured at module load.
  *
- * Uses `Symbol.toStringTag` via `Object.prototype.toString`, not `instanceof`
- * (tamperable) and not duck-typing on method names. Duck-typing was tried first
- * and measured: requiring `get`/`set`/`has` produced **five** false positives in
- * the real jsdom + vitest graph, led by `globalThis.Reflect`, which has all
- * three and is not a collection. The tag is the precise question - "does this
- * claim to be a Map" - and a `Proxy` over a real Map forwards it, because the
- * lookup goes through the same `get` trap that makes the wrapper functional.
- *
- * A wrapper that deliberately suppresses its tag escapes this, and sits in the
- * same intent tier as the `ownKeys` trap already documented as a boundary.
+ * Held for **reference comparison only**. Three rounds of review found the same
+ * bug three times - `instanceof`, then `Symbol.hasInstance`, then an own
+ * `constructor` property - and every one of them classified an object using
+ * something the object controls, which a `Proxy` can lie about. Object identity
+ * is the one thing it cannot: a proxy wrapping `Map` is a *different object*
+ * from `Map.prototype` no matter what its traps say.
  */
-function presentsAsCollection(value: object): boolean {
-  try {
-    const tag = Object.prototype.toString.call(value)
-    return tag === '[object Map]' || tag === '[object Set]'
-  } catch {
-    return false
-  }
+const BUILTIN_COLLECTION_PROTOTYPES: readonly object[] = [
+  Map.prototype,
+  Set.prototype,
+  WeakMap.prototype,
+  WeakSet.prototype,
+]
+
+/**
+ * Is this object one of the built-in collection prototypes *itself*?
+ *
+ * The only thing excluded from reporting, and excluded by `===` alone. These
+ * hold no instance data, so there is genuinely nothing to miss in them.
+ *
+ * A subclass prototype is **not** identity-equal to a built-in and is therefore
+ * *not* excluded - it gets reported like any other unreadable collection. That
+ * is deliberate: the previous `constructor`-based check quietened subclass
+ * prototypes and, in doing so, let a `Proxy` with a lying
+ * `getOwnPropertyDescriptor` trap disappear completely. A little noise that
+ * cannot be forged beats silence that can.
+ */
+function isBuiltinCollectionPrototype(value: object): boolean {
+  return BUILTIN_COLLECTION_PROTOTYPES.includes(value)
 }
 
 /**
- * Is this the `prototype` object of a class rather than an instance?
+ * Does this object present itself as a `Map`/`Set` while having no internal
+ * slot to read?
  *
- * `Map.prototype`, `Set.prototype` and every subclass prototype present the
- * collection methods but hold no data, and this walk really does reach them
- * (`process.allowedNodeEnvironmentFlags.__proto__`, vitest's
- * `DefaultMap.prototype`). An own `constructor` is what distinguishes them: a
- * prototype has one, an instance - or a proxy wrapping an instance - does not.
+ * Two signals, the identity one first:
+ *
+ * 1. **Its prototype chain contains a captured built-in collection prototype,
+ *    by `===`.** A `Proxy` forwards `getPrototypeOf` to its target unless it
+ *    installs a trap specifically to lie about it.
+ * 2. Its `Symbol.toStringTag` says `Map`/`Set`. A functional wrapper forwards
+ *    this through the same `get` trap that makes it usable.
+ *
+ * Note the asymmetry, which is the point: this decides whether to **surface**
+ * something, so a forged answer costs a missed report - a documented boundary.
+ * {@link isBuiltinCollectionPrototype} decides whether to **stay quiet**, so a
+ * forged answer there would be a silent bypass, and it is identity-only.
+ *
+ * An object that neither enumerates as a collection nor presents as one is
+ * indistinguishable from a plain object, and there are tens of thousands of
+ * those in the graph. That limit is irreducible, not an oversight.
  */
-function isPrototypeObject(value: object): boolean {
+function presentsAsCollection(value: object): boolean {
   try {
-    return Object.getOwnPropertyDescriptor(value, 'constructor') !== undefined
+    let proto: object | null = Object.getPrototypeOf(value) as object | null
+    let hops = 0
+    while (proto !== null && hops < PROTOTYPE_HOPS) {
+      if (BUILTIN_COLLECTION_PROTOTYPES.includes(proto)) return true
+      proto = Object.getPrototypeOf(proto) as object | null
+      hops += 1
+    }
+
+    const tag = Object.prototype.toString.call(value)
+    return tag === '[object Map]' || tag === '[object Set]'
   } catch {
     return false
   }
@@ -484,7 +596,11 @@ function reachableFromGlobals(needle: string): string[] {
       setEntries.forEach((entry, index) => {
         queue.push({ value: entry, path: `${path}.<setEntry ${index}>`, depth: depth + 1 })
       })
-    } else if (presentsAsCollection(object) && !isPrototypeObject(object)) {
+    } else if (
+      presentsAsCollection(object) &&
+      !isBuiltinCollectionPrototype(object) &&
+      !hasWeakCollectionSlot(object)
+    ) {
       // It behaves like a collection to application code but has no internal
       // slot, so its contents cannot be read - a `Proxy` around a real Map is
       // the ordinary way to land here, and a method-binding or logging wrapper
@@ -856,6 +972,67 @@ describe('the reachability walk itself (positive controls)', () => {
     // Not "found the token" - we cannot see it. "Cannot certify this clean."
     expect(found).toContain(
       'globalThis.__lemWrapped <unenumerable collection: cannot be read, not certified clean>'
+    )
+  })
+
+  // Round 5's finding, and the third instance of one root cause: the walk used
+  // to skip "class prototypes" by looking for an own `constructor`, which a
+  // `Proxy` can simply claim to have. That made a wrapped Map vanish
+  // *completely* - not reported, not flagged, indistinguishable from clean.
+  // Exclusion is now by object identity against captured built-ins, which no
+  // trap can forge: a proxy is a different object from `Map.prototype`.
+  it('reports a Proxy that lies about being a class prototype', () => {
+    const target = new Map([['session', NEEDLE]])
+    const wrapper = new Proxy(target, {
+      get(inner, key) {
+        const value = Reflect.get(inner, key, inner) as unknown
+        if (typeof value !== 'function') return value
+        return (value as (...args: unknown[]) => unknown).bind(inner)
+      },
+      // The lie: "I have an own `constructor`, so I am an inert prototype."
+      getOwnPropertyDescriptor(inner, key) {
+        if (key === 'constructor') {
+          return { value: Map, writable: true, enumerable: false, configurable: true }
+        }
+        return Reflect.getOwnPropertyDescriptor(inner, key)
+      },
+    })
+    plantGlobal('__lemFakePrototype', wrapper)
+
+    // The lie works against the old check, and the wrapper still functions.
+    expect(Object.getOwnPropertyDescriptor(wrapper, 'constructor')).toBeDefined()
+    expect(wrapper.get('session')).toBe(NEEDLE)
+
+    expect(reachableFromGlobals(NEEDLE)).toContain(
+      'globalThis.__lemFakePrototype <unenumerable collection: cannot be read, not certified clean>'
+    )
+  })
+
+  // The weak-collection probe must not become the next hiding place: a real
+  // WeakMap is quiet (non-enumerable by spec, for everyone), but a Proxy around
+  // one has no slot of its own and is reported.
+  it('reports a Proxy wrapping a WeakMap, while a real WeakMap stays quiet', () => {
+    const key = { id: 'dev-7f3a' }
+    const real = new WeakMap<object, string>([[key, NEEDLE]])
+    plantGlobal('__lemRealWeak', real)
+    plantGlobal('__lemRealWeakKey', key)
+
+    // A genuine WeakMap is not reported - nobody can enumerate one.
+    expect(reachableFromGlobals(NEEDLE)).toEqual([])
+
+    plantGlobal(
+      '__lemWrappedWeak',
+      new Proxy(real, {
+        get(inner, prop) {
+          const value = Reflect.get(inner, prop, inner) as unknown
+          if (typeof value !== 'function') return value
+          return (value as (...args: unknown[]) => unknown).bind(inner)
+        },
+      })
+    )
+
+    expect(reachableFromGlobals(NEEDLE)).toContain(
+      'globalThis.__lemWrappedWeak <unenumerable collection: cannot be read, not certified clean>'
     )
   })
 

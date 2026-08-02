@@ -1799,13 +1799,20 @@ design:**
    > properties are instrumented separately. An honest boundary beats a sweep that reads as
    > exhaustive and is not.
    >
-   > The walk performs **no `instanceof` type test** before enumerating a collection, because
-   > that question is answerable by the object being inspected and was wrong three ways: a
-   > poisoned `Symbol.hasInstance`, a `Proxy` wrapping a `Map`, and — a live bug rather than an
-   > attack — **any `Map` from another realm**, which matters because this dashboard frames
-   > services by construction (§3.1). A collection that presents as one but cannot be read is
-   > **reported rather than skipped**: it cannot be proven to hold the token, but it must not be
-   > certified clean either.
+   > The walk never classifies an object by anything the object controls. Review found that
+   > mistake three rounds running — `instanceof`, then `Symbol.hasInstance`, then an own
+   > `constructor` property — and a `Proxy` can lie about all three; the last one made a wrapped
+   > `Map` vanish silently, which is worse than a wrong answer. The rule that came out of it:
+   > **deciding to stay quiet requires an unforgeable fact** (object identity against a prototype
+   > captured at module load, or an internal-slot probe that throws unless the slot is real),
+   > while deciding to *surface* something may use a heuristic, because a forged answer there
+   > costs a missed report rather than a false all-clear.
+   >
+   > Dropping the type test also fixed a live bug rather than only an attack: **a `Map` from
+   > another realm** is not `instanceof Map`, and this dashboard frames services by construction
+   > (§3.1), so cross-realm collections are routine. A collection that presents as one but cannot
+   > be read is **reported rather than skipped** — it cannot be proven to hold the token, but it
+   > must not be certified clean either.
 
    **The `HttpOnly` refresh cookie is a prerequisite, not part of this phase — and it does not
    exist.** An `HttpOnly` cookie can only be set by a server response header, so the signaling
