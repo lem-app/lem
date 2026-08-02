@@ -57,17 +57,17 @@
  *
  * Nothing in this group can be talked out of looking.
  *
- * - `isBuiltinCollectionPrototype` - `===` against references captured at load.
+ * - Every `SlotProbe.read` succeeding - an internal-slot probe in each case
+ *   (`[[MapData]]`, `[[SetData]]`, `[[WeakMapData]]`/`[[WeakSetData]]`,
+ *   `[[StringData]]`, `[[ViewedArrayBuffer]]`/`[[ArrayBufferData]]`). All are
+ *   realm-agnostic, and a `Proxy` can satisfy none of them.
+ * - `SlotProbe.excluded` - `===` against built-in prototypes captured at load.
  * - `isHarnessRootValue` - `===` against objects captured at load.
- * - `hasWeakCollectionSlot` returning `true` - internal-slot probe.
- * - `readMapEntries` / `readSetEntries` succeeding - internal-slot probe.
- * - `readBoxedString` - internal-slot probe (`[[StringData]]`), with a
- *   `presentsAsBoxedString` fallback so a `Proxy` around one is reported rather
- *   than passed over. Every slot probe here now has such a fallback; this was
- *   the one that did not, and it produced complete silence.
- * - `readBytes` - internal-slot accessors (`[[ViewedArrayBuffer]]` /
- *   `[[ArrayBufferData]]`), so it works across realms and a `Proxy` cannot
- *   satisfy it.
+ *
+ * Each probe's mandatory `presentsAs` is what stops a failed slot read becoming
+ * silence: a `Proxy` wrapping a real one is **reported**, not passed over. That
+ * pairing is enforced by the type and by a suite test that enumerates
+ * {@link SLOT_PROBE_NAMES}, because forgetting it has already happened twice.
  * - The `__proto__` skip, which applies **only** to the inherited accessor and
  *   rests on a structural argument (`descriptorsOf` already merges the chain).
  *   An *own* property named `__proto__` is ordinary data and is walked - it was
@@ -108,9 +108,9 @@
  * - **A `Proxy` hiding properties** via `ownKeys` /
  *   `getOwnPropertyDescriptor`, or a `get` trap that throws. There is no other
  *   way to ask an object what it has.
- * - `presentsAsCollection`'s `catch` - a trap can throw from `getPrototypeOf`.
- *   This one costs only a **report**, not a false all-clear, so it sits on the
- *   acceptable side of the asymmetry.
+ * - A `presentsAs` returning `false` from its `catch` - a trap can throw from
+ *   `getPrototypeOf`. This costs only a **report**, not a false all-clear, so
+ *   it sits on the acceptable side of the asymmetry.
  * - **Re-encodings other than raw bytes**: `btoa`, URI-encoding, a XOR, or
  *   splitting the token across two properties. The leaf test is a substring
  *   match on strings; detecting arbitrary transformations is undecidable, and
@@ -168,7 +168,7 @@ const SET_FOR_EACH = Set.prototype.forEach as (
 const WEAKMAP_HAS = WeakMap.prototype.has as (this: unknown, key: object) => boolean
 const WEAKSET_HAS = WeakSet.prototype.has as (this: unknown, key: object) => boolean
 // Reads `[[StringData]]`, so it unwraps a boxed String and throws on anything
-// else - see `readBoxedString`.
+// else - see the `boxed-string` probe.
 const STRING_VALUE_OF = String.prototype.valueOf as (this: unknown) => string
 /* eslint-enable @typescript-eslint/unbound-method */
 
@@ -220,109 +220,6 @@ const BYTE_DECODERS = ['utf-8', 'utf-16le'] as const
  * into an allocation storm. It is a finite limit and is named in the taxonomy.
  */
 const MAX_DECODED_BYTES = 1 << 20
-
-/**
- * The primitive inside a boxed `String`, or `null` if this is not one.
- *
- * `new String(token)` is an **object**, so the walk's `typeof value ===
- * 'string'` leaf test never fires on it, and its own properties are the
- * individual characters - no single one of which contains the needle. It was
- * therefore invisible. Found by auditing the taxonomy rather than the code.
- *
- * Fixed rather than documented, because the fix is an internal-slot probe and
- * so belongs in the unforgeable group: `String.prototype.valueOf` reads
- * `[[StringData]]` and throws on anything without it. A `Proxy` wrapping a
- * boxed String fails the probe and is handled by {@link presentsAsBoxedString},
- * which reports it as unreadable rather than passing over it in silence.
- */
-function readBoxedString(value: object): string | null {
-  try {
-    return STRING_VALUE_OF.call(value)
-  } catch {
-    return null
-  }
-}
-
-/**
- * Does this object present itself as a boxed `String` while having no slot?
- *
- * The fallback that `readBoxedString` lacked. Every other internal-slot check
- * here has one - `Map`, `Set` and the weak collections all report an object
- * that claims to be one and cannot be read - and its absence meant a `Proxy`
- * around a boxed String produced **complete silence**, which is precisely what
- * the asymmetry rule exists to prevent.
- *
- * Identity signal first, then the tag, exactly as {@link presentsAsCollection}.
- */
-function presentsAsBoxedString(value: object): boolean {
-  try {
-    let proto: object | null = Object.getPrototypeOf(value) as object | null
-    let hops = 0
-    while (proto !== null && hops < PROTOTYPE_HOPS) {
-      if (proto === String.prototype) return true
-      proto = Object.getPrototypeOf(proto) as object | null
-      hops += 1
-    }
-    return Object.prototype.toString.call(value) === '[object String]'
-  } catch {
-    return false
-  }
-}
-
-/**
- * The bytes behind a typed array, `DataView` or `ArrayBuffer`, or `null`.
- *
- * **Realm-agnostic and unforgeable**, and both words are load-bearing. The
- * obvious `value instanceof Uint8Array` does not work: `TextEncoder` output is
- * not `instanceof` this file's `Uint8Array` in this environment, so a check
- * written that way silently never fires. That is the **fourth** appearance of
- * the realm-mismatch class in this project - after the cross-realm `Map` here,
- * `instanceof Blob` in Phase 5 and `instanceof ArrayBuffer` in Phase 4 - and it
- * was found by accident while building something else, which is the whole
- * argument for not using `instanceof` at all.
- *
- * These captured accessors read `[[ViewedArrayBuffer]]` / `[[ArrayBufferData]]`
- * and throw without them, so they work across realms and a `Proxy` cannot
- * satisfy them.
- */
-function readBytes(value: object): Uint8Array | null {
-  for (const accessors of [TYPED_ARRAY_ACCESSORS, DATA_VIEW_ACCESSORS]) {
-    if (accessors === null) continue
-    try {
-      const buffer = accessors.buffer.call(value) as ArrayBufferLike
-      const byteOffset = accessors.byteOffset.call(value) as number
-      const byteLength = accessors.byteLength.call(value) as number
-      return new Uint8Array(buffer, byteOffset, byteLength)
-    } catch {
-      // Not that kind of view; try the next.
-    }
-  }
-
-  if (ARRAY_BUFFER_BYTE_LENGTH !== null) {
-    try {
-      const byteLength = ARRAY_BUFFER_BYTE_LENGTH.call(value) as number
-      return new Uint8Array(value as ArrayBufferLike, 0, byteLength)
-    } catch {
-      // Not an ArrayBuffer either.
-    }
-  }
-  return null
-}
-
-/** A stable object to probe weak collections with; never stored anywhere. */
-const WEAK_PROBE_KEY: object = Object.freeze({})
-
-/**
- * The built-in collection prototypes, captured at module load, for reference
- * comparison only. A `Proxy` wrapping `Map` is a different object from
- * `Map.prototype` no matter what its traps claim.
- */
-const BUILTIN_COLLECTION_PROTOTYPES: readonly object[] = [
-  Map.prototype,
-  Set.prototype,
-  WeakMap.prototype,
-  WeakSet.prototype,
-]
 
 /**
  * The *objects* the test harness puts on the global, captured by reference at
@@ -411,119 +308,290 @@ export function descriptorsOf(obj: object): Map<string | symbol, PropertyDescrip
 }
 
 /**
- * Read a `Map`'s entries through the captured built-in, or `null` if this
- * object has no `[[MapData]]` slot.
+ * Prototypes of every buffer-backed view, captured for identity comparison.
  *
- * There is deliberately **no type test first**. Asking "is this a Map?" fails
- * at the question - a poisoned `Symbol.hasInstance` says no for a real one, a
- * `Proxy` says yes for something unreadable, and a Map from another realm says
- * no because `instanceof` compares against *this* realm's prototype. Attempting
- * the built-in and letting success be the test removes the question: it only
- * succeeds on a genuine slot, which cannot be forged.
- *
- * Entries are buffered inside the `try` so a throw from the caller's handling
- * can never be mistaken for "not a Map".
+ * `%TypedArray%.prototype` is the shared prototype of all nine typed-array
+ * kinds, so one entry covers them all.
  */
-export function readMapEntries(value: object): [unknown, unknown][] | null {
-  const entries: [unknown, unknown][] = []
-  try {
-    MAP_FOR_EACH.call(value, (entryValue: unknown, entryKey: unknown) => {
-      entries.push([entryKey, entryValue])
-    })
-  } catch {
-    return null
-  }
-  return entries
-}
+const BYTE_VIEW_PROTOTYPES: readonly object[] = [
+  Object.getPrototypeOf(Uint8Array.prototype) as object,
+  DataView.prototype,
+  ArrayBuffer.prototype,
+  ...(typeof SharedArrayBuffer === 'function' ? [SharedArrayBuffer.prototype as object] : []),
+]
 
-/** As {@link readMapEntries}, for `[[SetData]]`. */
-export function readSetEntries(value: object): unknown[] | null {
-  const entries: unknown[] = []
-  try {
-    SET_FOR_EACH.call(value, (entry: unknown) => {
-      entries.push(entry)
-    })
-  } catch {
-    return null
-  }
-  return entries
-}
+/** `Object.prototype.toString` tags for the same set. */
+const BYTE_TAGS: readonly string[] = [
+  '[object Int8Array]',
+  '[object Uint8Array]',
+  '[object Uint8ClampedArray]',
+  '[object Int16Array]',
+  '[object Uint16Array]',
+  '[object Int32Array]',
+  '[object Uint32Array]',
+  '[object Float32Array]',
+  '[object Float64Array]',
+  '[object BigInt64Array]',
+  '[object BigUint64Array]',
+  '[object DataView]',
+  '[object ArrayBuffer]',
+  '[object SharedArrayBuffer]',
+]
 
 /**
- * Does this object hold a genuine `[[WeakMapData]]`/`[[WeakSetData]]` slot?
+ * The bytes behind a typed array, `DataView` or `ArrayBuffer`, or `null`.
  *
- * Silence rests on an internal-slot probe. `WeakMap.prototype.has` performs
- * `RequireInternalSlot` before it looks at the key, so it throws on anything
- * that is not really a weak collection - including a `Proxy` around one, whose
- * traps `.call()` bypasses and which has no slot of its own. Such a wrapper
- * therefore still gets reported.
+ * **Realm-agnostic and unforgeable**, and both words are load-bearing. The
+ * obvious `value instanceof Uint8Array` does not work: `TextEncoder` output is
+ * not `instanceof` this file's `Uint8Array` in this environment, so a check
+ * written that way silently never fires. That is the fourth appearance of the
+ * realm-mismatch class in this project - after the cross-realm `Map` here,
+ * `instanceof Blob` in Phase 5 and `instanceof ArrayBuffer` in Phase 4 - and it
+ * was found by accident while building something else, which is the whole
+ * argument for not using `instanceof` at all.
  *
- * A real one does not: weak collections are non-enumerable **by
- * specification**, for every caller, so finding one says nothing about whether
- * it holds a token.
+ * These captured accessors read `[[ViewedArrayBuffer]]` / `[[ArrayBufferData]]`
+ * and throw without them, so they work across realms and a `Proxy` cannot
+ * satisfy them. A detached buffer yields zero bytes, which is correct: there is
+ * genuinely nothing left in it.
  */
-export function hasWeakCollectionSlot(value: object): boolean {
-  try {
-    WEAKMAP_HAS.call(value, WEAK_PROBE_KEY)
-    return true
-  } catch {
-    // Not a WeakMap; try the other one.
-  }
-  try {
-    WEAKSET_HAS.call(value, WEAK_PROBE_KEY)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Is this object one of the built-in collection prototypes *itself*?
- *
- * Silence rests on identity - `===` against references captured at load. These
- * hold no instance data, so there is nothing to miss in them.
- *
- * A subclass prototype is **not** identity-equal to a built-in and so is *not*
- * excluded; it is reported like any other unreadable collection. The previous
- * `constructor`-based check quietened subclass prototypes and, in doing so, let
- * a `Proxy` with a lying `getOwnPropertyDescriptor` trap disappear entirely.
- */
-export function isBuiltinCollectionPrototype(value: object): boolean {
-  return BUILTIN_COLLECTION_PROTOTYPES.includes(value)
-}
-
-/**
- * Does this object present itself as a `Map`/`Set` while having no slot to read?
- *
- * This one decides whether to **surface**, so a heuristic is acceptable: a
- * forged answer costs a missed report rather than a false all-clear. It still
- * leads with the identity signal.
- *
- * 1. Its prototype chain contains a captured built-in collection prototype, by
- *    `===`. A `Proxy` forwards `getPrototypeOf` unless it traps it specifically.
- * 2. Its `Symbol.toStringTag` says `Map`/`Set`. A functional wrapper forwards
- *    this through the same `get` trap that makes it usable.
- *
- * An object that neither enumerates as a collection nor presents as one is
- * indistinguishable from a plain object, and there are tens of thousands of
- * those in the graph. That limit is irreducible.
- */
-export function presentsAsCollection(value: object): boolean {
-  try {
-    let proto: object | null = Object.getPrototypeOf(value) as object | null
-    let hops = 0
-    while (proto !== null && hops < PROTOTYPE_HOPS) {
-      if (BUILTIN_COLLECTION_PROTOTYPES.includes(proto)) return true
-      proto = Object.getPrototypeOf(proto) as object | null
-      hops += 1
+function readBytes(value: object): Uint8Array | null {
+  for (const accessors of [TYPED_ARRAY_ACCESSORS, DATA_VIEW_ACCESSORS]) {
+    if (accessors === null) continue
+    try {
+      const buffer = accessors.buffer.call(value) as ArrayBufferLike
+      const byteOffset = accessors.byteOffset.call(value) as number
+      const byteLength = accessors.byteLength.call(value) as number
+      return new Uint8Array(buffer, byteOffset, byteLength)
+    } catch {
+      // Not that kind of view; try the next.
     }
+  }
 
-    const tag = Object.prototype.toString.call(value)
-    return tag === '[object Map]' || tag === '[object Set]'
-  } catch {
-    return false
+  if (ARRAY_BUFFER_BYTE_LENGTH !== null) {
+    try {
+      const byteLength = ARRAY_BUFFER_BYTE_LENGTH.call(value) as number
+      return new Uint8Array(value as ArrayBufferLike, 0, byteLength)
+    } catch {
+      // Not an ArrayBuffer either.
+    }
+  }
+  return null
+}
+
+/**
+ * An internal-slot probe, paired with the fallback that keeps it honest.
+ *
+ * ## Why this is a registry and not five loose functions
+ *
+ * Twice now a slot probe has shipped **without** a "presents as this, cannot be
+ * read" fallback - boxed `String` in one round, byte views in the very next -
+ * and each time the result was a `Proxy` wrapping a real instance becoming
+ * *completely silent*: no value, no report, indistinguishable from clean. The
+ * second one landed one round after the first was fixed, which means
+ * remembering was already demonstrably not working.
+ *
+ * So the pairing is structural. `presentsAs` is a **required** field: a probe
+ * that does not declare one is a type error, not a review finding. And
+ * {@link SLOT_PROBE_NAMES} is exported so the suites can assert that every
+ * registered probe has a Proxy-wrapping test - adding a probe without one fails
+ * CI rather than waiting for a reviewer to notice.
+ *
+ * This is the same move that fixed the duplicated traversal: when a class of
+ * defect recurs, the recurrence is the defect.
+ */
+interface SlotProbe {
+  /** Stable identifier, used by the suites to enumerate coverage. */
+  readonly name: string
+  /**
+   * Children to walk, or `null` if this object does not have the slot.
+   *
+   * An **empty array** is meaningful and different from `null`: it means "this
+   * really is one of these, and there is legitimately nothing to read" - the
+   * weak collections, which are non-enumerable by specification.
+   */
+  readonly read: (value: object, path: string) => Child[] | null
+  /**
+   * Does this object present as this kind while failing {@link read}?
+   *
+   * Required. This is the half that turns an unreadable wrapper into a report
+   * instead of silence, and it is the half that has been forgotten twice.
+   */
+  readonly presentsAs: (value: object) => boolean
+  /**
+   * Objects that present as this kind but are excluded from reporting, matched
+   * by **identity only** - the built-in prototypes, which hold no instance data.
+   */
+  readonly excluded: readonly object[]
+}
+
+/** Does `value` inherit from any of `prototypes`, by identity? */
+function inheritsFrom(value: object, prototypes: readonly object[]): boolean {
+  let proto: object | null = Object.getPrototypeOf(value) as object | null
+  let hops = 0
+  while (proto !== null && hops < PROTOTYPE_HOPS) {
+    if (prototypes.includes(proto)) return true
+    proto = Object.getPrototypeOf(proto) as object | null
+    hops += 1
+  }
+  return false
+}
+
+/**
+ * The shared shape of every `presentsAs`: an identity signal on the prototype
+ * chain first, then `Symbol.toStringTag`.
+ *
+ * This one decides whether to **surface**, so a heuristic is acceptable - a
+ * forged answer costs a missed report, not a false all-clear. A `Proxy`
+ * forwards both signals unless it traps them specifically, and a wrapper that
+ * suppresses them has given up being usable as the thing it wraps.
+ */
+function presenter(prototypes: readonly object[], tags: readonly string[]) {
+  return (value: object): boolean => {
+    try {
+      if (inheritsFrom(value, prototypes)) return true
+      return tags.includes(Object.prototype.toString.call(value))
+    } catch {
+      return false
+    }
   }
 }
+
+/** A stable object to probe weak collections with; never stored anywhere. */
+const WEAK_PROBE_KEY: object = Object.freeze({})
+
+/**
+ * Every slot probe, each with its mandatory fallback.
+ *
+ * There is deliberately **no type test before reading**. Asking "is this a
+ * Map?" fails at the question - a poisoned `Symbol.hasInstance` says no for a
+ * real one, a `Proxy` says yes for something unreadable, and an object from
+ * another realm says no because `instanceof` compares against *this* realm's
+ * prototype. Attempting the captured built-in and letting success be the test
+ * removes the question: it only succeeds on a genuine slot, which is the one
+ * thing that cannot be forged.
+ */
+const SLOT_PROBES: readonly SlotProbe[] = [
+  {
+    name: 'map',
+    read: (value, path) => {
+      const entries: [unknown, unknown][] = []
+      try {
+        // Buffered inside the `try` so a throw from our own handling can never
+        // be mistaken for "not a Map".
+        MAP_FOR_EACH.call(value, (entryValue: unknown, entryKey: unknown) => {
+          entries.push([entryKey, entryValue])
+        })
+      } catch {
+        return null
+      }
+      return entries.flatMap(([entryKey, entryValue], index) => [
+        { value: entryKey, path: `${path}.<mapKey ${index}>` },
+        { value: entryValue, path: `${path}.get(${String(entryKey)})` },
+      ])
+    },
+    presentsAs: presenter([Map.prototype], ['[object Map]']),
+    excluded: [Map.prototype],
+  },
+  {
+    name: 'set',
+    read: (value, path) => {
+      const entries: unknown[] = []
+      try {
+        SET_FOR_EACH.call(value, (entry: unknown) => {
+          entries.push(entry)
+        })
+      } catch {
+        return null
+      }
+      return entries.map((entry, index) => ({
+        value: entry,
+        path: `${path}.<setEntry ${index}>`,
+      }))
+    },
+    presentsAs: presenter([Set.prototype], ['[object Set]']),
+    excluded: [Set.prototype],
+  },
+  {
+    name: 'weak-collection',
+    // `has` performs `RequireInternalSlot` before it looks at the key, so it
+    // throws on anything that is not really a weak collection - including a
+    // `Proxy` around one, whose traps `.call()` bypasses. A genuine one returns
+    // an empty child list: non-enumerable by specification, for every caller,
+    // so there is legitimately nothing to read and nothing to report.
+    read: (value) => {
+      try {
+        WEAKMAP_HAS.call(value, WEAK_PROBE_KEY)
+        return []
+      } catch {
+        // Not a WeakMap; try the other one.
+      }
+      try {
+        WEAKSET_HAS.call(value, WEAK_PROBE_KEY)
+        return []
+      } catch {
+        return null
+      }
+    },
+    presentsAs: presenter(
+      [WeakMap.prototype, WeakSet.prototype],
+      ['[object WeakMap]', '[object WeakSet]']
+    ),
+    excluded: [WeakMap.prototype, WeakSet.prototype],
+  },
+  {
+    name: 'boxed-string',
+    // `new String(token)` is an object, so the caller's `typeof value ===
+    // 'string'` leaf test never fires on it and its own properties are single
+    // characters. Hand back the primitive so the leaf test does fire.
+    read: (value, path) => {
+      try {
+        return [{ value: STRING_VALUE_OF.call(value), path: `${path}.valueOf()` }]
+      } catch {
+        return null
+      }
+    },
+    presentsAs: presenter([String.prototype], ['[object String]']),
+    excluded: [String.prototype],
+  },
+  {
+    name: 'bytes',
+    // The token crosses this codebase as bytes constantly, so a `TextEncoder`
+    // round trip is the likeliest way it ends up somewhere unnoticed.
+    //
+    // Detection is by captured slot accessors, never `instanceof`: a
+    // `TextEncoder`'s output is **not** `instanceof` this file's `Uint8Array`
+    // in this environment, so a check written that way silently never fires.
+    read: (value, path) => {
+      const bytes = readBytes(value)
+      if (bytes === null) return null
+      if (bytes.byteLength > MAX_DECODED_BYTES) return []
+      const children: Child[] = []
+      for (const encoding of BYTE_DECODERS) {
+        try {
+          children.push({
+            value: new TextDecoder(encoding).decode(bytes),
+            path: `${path}.<decoded ${encoding}>`,
+          })
+        } catch {
+          // An unsupported decoder in this runtime yields nothing to search.
+        }
+      }
+      return children
+    },
+    presentsAs: presenter(BYTE_VIEW_PROTOTYPES, BYTE_TAGS),
+    excluded: BYTE_VIEW_PROTOTYPES,
+  },
+]
+
+/**
+ * The registered probe names, for the suites to enumerate.
+ *
+ * Exported so a test can assert that every probe has a Proxy-wrapping case:
+ * adding a probe without one then fails CI instead of shipping the silence that
+ * boxed `String` and byte views each shipped once.
+ */
+export const SLOT_PROBE_NAMES: readonly string[] = SLOT_PROBES.map((probe) => probe.name)
 
 /** One reachable value and the path that reached it. */
 export interface Child {
@@ -549,45 +617,17 @@ export interface Expansion {
 export function expandObject(object: object, path: string): Expansion {
   const children: Child[] = []
 
-  // A boxed String is an object, so the caller's string leaf-test never fires
-  // on it. Hand back the primitive so it does.
-  const boxed = readBoxedString(object)
-  if (boxed !== null) {
-    children.push({ value: boxed, path: `${path}.valueOf()` })
-  }
-
-  // Same idea for bytes. The token crosses this codebase as bytes constantly,
-  // so a `TextEncoder` round trip is the likeliest way it ends up somewhere
-  // unnoticed - which is why this is covered rather than documented away.
-  const bytes = readBytes(object)
-  if (bytes !== null && bytes.byteLength <= MAX_DECODED_BYTES) {
-    for (const encoding of BYTE_DECODERS) {
-      try {
-        children.push({
-          value: new TextDecoder(encoding).decode(bytes),
-          path: `${path}.<decoded ${encoding}>`,
-        })
-      } catch {
-        // An unsupported decoder in this runtime yields nothing to search.
-      }
-    }
-  }
-
   for (const [key, descriptor] of descriptorsOf(object)) {
     // The `__proto__` *accessor* (inherited from `Object.prototype`) is a
     // redundant edge, not a hiding place: `descriptorsOf` already merges the
     // whole prototype chain into this same descriptor set and reads each entry
     // with `object` as the receiver, so a token parked on a prototype is found
-    // while walking the instance. Following it only re-reaches class prototypes
-    // as objects in their own right - which is how vitest's
-    // `DefaultMap.prototype` and `process.allowedNodeEnvironmentFlags.__proto__`
-    // turned up as unreadable collections.
+    // while walking the instance.
     //
     // An **own** property named `__proto__` is a different thing entirely.
     // `Object.defineProperty(o, '__proto__', { value })` creates ordinary data
     // and never touches the real `[[Prototype]]` slot, so the redundancy
     // argument does not apply to it and skipping it hid a token in plain sight.
-    // Skip only the inherited accessor; walk an own one like any other key.
     if (key === '__proto__' && Object.getOwnPropertyDescriptor(object, '__proto__') === undefined) {
       continue
     }
@@ -600,8 +640,8 @@ export function expandObject(object: object, path: string): Expansion {
         child = descriptor.get.call(object)
       } catch {
         // Silence rests on the getter throwing: it yielded no value. A `Proxy`
-        // `get` trap could throw deliberately to hide - see the silence audit,
-        // third group; there is no unforgeable alternative to reading it.
+        // `get` trap could throw deliberately to hide - see the taxonomy,
+        // group D; there is no unforgeable alternative to reading it.
         continue
       }
     } else {
@@ -613,45 +653,39 @@ export function expandObject(object: object, path: string): Expansion {
     // re-enables descent into function objects and makes the walk fail to
     // terminate against jsdom's constructor graph - it is not shadowed
     // anywhere, so a reverter testing the documented boundary gets a true
-    // signal rather than a silent no-op. This is a *cost* boundary, documented
-    // in both suites, not a claim that functions are safe.
+    // signal rather than a silent no-op. This is a *cost* boundary, not a
+    // claim that functions are safe.
     if (typeof child === 'function') continue
 
     children.push({ value: child, path: `${path}.${String(key)}` })
   }
 
-  const mapEntries = readMapEntries(object)
-  if (mapEntries !== null) {
-    mapEntries.forEach(([entryKey, entryValue], index) => {
-      children.push({ value: entryKey, path: `${path}.<mapKey ${index}>` })
-      children.push({ value: entryValue, path: `${path}.get(${String(entryKey)})` })
-    })
+  // Internal-slot contents. Every probe pairs a slot read with a mandatory
+  // `presentsAs` fallback, so an object that claims to be one of these and
+  // cannot be read is *reported* rather than passed over - see `SlotProbe`.
+  for (const probe of SLOT_PROBES) {
+    const slotChildren = probe.read(object, path)
+    if (slotChildren === null) continue
+    children.push(...slotChildren)
     return { children, opaque: null }
   }
 
-  const setEntries = readSetEntries(object)
-  if (setEntries !== null) {
-    setEntries.forEach((entry, index) => {
-      children.push({ value: entry, path: `${path}.<setEntry ${index}>` })
-    })
-    return { children, opaque: null }
+  for (const probe of SLOT_PROBES) {
+    // Silence rests on identity: only the built-in prototypes themselves are
+    // excluded, and they hold no instance data. A subclass prototype is not
+    // identity-equal to one and is reported like anything else.
+    if (probe.excluded.includes(object)) return { children, opaque: null }
   }
 
-  if (
-    presentsAsCollection(object) &&
-    // Silence rests on identity...
-    !isBuiltinCollectionPrototype(object) &&
-    // ...and on an internal-slot probe.
-    !hasWeakCollectionSlot(object)
-  ) {
-    return { children, opaque: `${path} ${OPAQUE_NOTE}` }
-  }
-
-  // The same fallback for boxed Strings. Without it, a `Proxy` around one was
-  // complete silence - the only internal-slot check in this file that had no
-  // "presents as, cannot be read" path.
-  if (boxed === null && presentsAsBoxedString(object) && object !== String.prototype) {
-    return { children, opaque: `${path} ${OPAQUE_NOTE}` }
+  for (const probe of SLOT_PROBES) {
+    if (probe.presentsAs(object)) {
+      // It behaves like the thing to application code but has no internal slot,
+      // so its contents cannot be read - a `Proxy` around a real one is the
+      // ordinary way to land here. We cannot unwrap it, so we cannot prove it
+      // holds the token; we can decline to certify it clean, which is the
+      // honest result. Silently skipping it would turn a bypass into a tick.
+      return { children, opaque: `${path} ${OPAQUE_NOTE}` }
+    }
   }
 
   return { children, opaque: null }

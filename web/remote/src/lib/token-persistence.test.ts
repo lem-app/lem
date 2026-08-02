@@ -170,7 +170,12 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
-import { OPAQUE_NOTE, expandObject, isHarnessRootValue } from '../test/reachability'
+import {
+  OPAQUE_NOTE,
+  SLOT_PROBE_NAMES,
+  expandObject,
+  isHarnessRootValue,
+} from '../test/reachability'
 
 /** A value distinctive enough that finding it anywhere is unambiguous. */
 const NEEDLE = 'eyJhbGciOiJIUzI1NiJ9.NEEDLE-9f3c1a7e-token.sig'
@@ -515,6 +520,48 @@ describe('the reachability walk itself (positive controls)', () => {
   // that throws from it would hide its contents behind the walk's `catch` while
   // `.get()` kept working perfectly. Going through the built-in `forEach`
   // defeats that, because it reads the internal slot rather than the iterator.
+  // -- every slot probe must report a Proxy-wrapped instance ------------------
+  //
+  // Twice a probe shipped without its "presents as this, cannot be read"
+  // fallback - boxed `String`, then byte views one round later - and each time
+  // a `Proxy` around a real instance became completely silent. Remembering was
+  // demonstrably not working, so this is the mechanism instead: the table below
+  // must cover every registered probe, and each entry must be reported.
+  //
+  // Adding a probe without a case here fails the first test; adding one whose
+  // fallback does not work fails the second.
+  const PROXY_CASES: Record<string, () => object> = {
+    map: () => new Map([['session', NEEDLE]]),
+    set: () => new Set([NEEDLE]),
+    'weak-collection': () => new WeakMap<object, string>([[{ id: 1 }, NEEDLE]]),
+    'boxed-string': () => new String(NEEDLE),
+    bytes: () => new TextEncoder().encode(NEEDLE),
+  }
+
+  /** A wrapper that is genuinely usable - not a broken object nobody would write. */
+  function bindingProxy(target: object): object {
+    return new Proxy(target, {
+      get(inner, key) {
+        const value = Reflect.get(inner, key, inner) as unknown
+        if (typeof value !== 'function') return value
+        return (value as (...args: unknown[]) => unknown).bind(inner)
+      },
+    })
+  }
+
+  it('has a Proxy case for every registered slot probe', () => {
+    expect(Object.keys(PROXY_CASES).sort()).toEqual([...SLOT_PROBE_NAMES].sort())
+  })
+
+  it.each([...SLOT_PROBE_NAMES])('refuses to certify a Proxy-wrapped %s', (name) => {
+    const make = PROXY_CASES[name]
+    expect(make, `no Proxy case registered for probe "${name}"`).toBeDefined()
+
+    plantGlobal('__lemProbeWrapped', bindingProxy(make()))
+
+    expect(reachableFromGlobals(NEEDLE)).toContain(`globalThis.__lemProbeWrapped ${OPAQUE_NOTE}`)
+  })
+
   // The fourth forgeable-classification bug, and the one that needed no ill
   // intent at all: harness roots used to be excluded by *string name*, so
   // anything a developer happened to call `global` was silently skipped. They
