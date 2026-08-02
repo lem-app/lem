@@ -26,7 +26,7 @@ function newClient(onState?: (state: ConnectionState) => void, onError?: (e: Err
   return new RelayClient({
     relayUrl: 'ws://relay.test',
     sessionId: 'browser-1-device-1',
-    token: 'jwt-token',
+    getToken: () => 'jwt-token',
     onStateChange: onState,
     onError,
   })
@@ -252,7 +252,7 @@ describe('RelayClient', () => {
     const client = new RelayClient({
       relayUrl: 'ws://relay.test',
       sessionId: 's',
-      token: 't',
+      getToken: () => 't',
       onMessage: (message) => received.push(message),
     })
 

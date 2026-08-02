@@ -38,7 +38,16 @@ import { SIGNAL_CONTEXT, getDeviceIdentity } from '../api/device-key'
  */
 export interface WebRTCConfig {
   signalUrl: string
-  token: string
+  /**
+   * Supplies the signaling JWT at the moment it is sent.
+   *
+   * A callback rather than the value, so the credential lives in module scope
+   * behind a closure instead of in a field on this instance. The manager is
+   * held in a React ref, which puts it on a fiber node attached to the DOM -
+   * `this.token` would therefore be readable by a framed service walking
+   * `parent.document` (#82). A closure is not.
+   */
+  getToken: () => string
   deviceId: string
   targetDeviceId: string
   iceServers?: RTCIceServer[]
@@ -81,7 +90,7 @@ const MAX_RECONNECT_DELAY_MS = 60000
  */
 export class WebRTCConnectionManager {
   private signalUrl: string
-  private token: string
+  private getToken: () => string
   private deviceId: string
   private targetDeviceId: string
 
@@ -129,7 +138,7 @@ export class WebRTCConnectionManager {
 
   constructor(config: WebRTCConfig) {
     this.signalUrl = config.signalUrl
-    this.token = config.token
+    this.getToken = config.getToken
     this.deviceId = config.deviceId
     this.targetDeviceId = config.targetDeviceId
     this.iceServers = config.iceServers ?? DEFAULT_ICE_SERVERS
@@ -445,7 +454,7 @@ export class WebRTCConnectionManager {
         ws.send(
           JSON.stringify({
             type: 'auth',
-            token: this.token,
+            token: this.getToken(),
             device_id: this.deviceId,
           })
         )

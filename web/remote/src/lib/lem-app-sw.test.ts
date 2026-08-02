@@ -174,6 +174,108 @@ describe('buildResponseHeaders', () => {
   })
 })
 
+// -- CSP substitution (spec sections 3.8 and 8.3) ----------------------------
+//
+// Two things have to be true at once, and they pull against each other:
+//
+//   1. No upstream policy may survive, because any of them can stop the
+//      injected shim from running - and a shim that does not run means
+//      `new WebSocket(...)` in the framed app reaches the remote browser's own
+//      network instead of the tunnel. That is defect #3 of #6 returning.
+//   2. The policy the worker substitutes must not be a blank cheque. It is
+//      served on the *dashboard's* origin, so anything it permits, it permits
+//      to third-party app code sharing that origin.
+//
+// The assertions below parse the policy rather than matching substrings. A
+// substring test for "script-src" passes for `script-src-elem`, and a
+// substring test for "'self'" passes for `frame-ancestors *  'self'`.
+
+/** Parse a CSP into `directive -> values`, lower-cased as the grammar says. */
+function parsePolicy(policy: string): Map<string, string[]> {
+  const directives = new Map<string, string[]>()
+  for (const serialized of policy.split(';')) {
+    const tokens = serialized.trim().split(/\s+/).filter(Boolean)
+    if (tokens.length === 0) continue
+    const [name, ...values] = tokens
+    // First occurrence wins, per the CSP grammar.
+    if (!directives.has(name.toLowerCase())) directives.set(name.toLowerCase(), values)
+  }
+  return directives
+}
+
+describe('the substituted Content-Security-Policy', () => {
+  const context = { deviceId: 'dev', serviceId: 'svc', upstreamPath: '/' }
+
+  it('replaces every shape of upstream policy, so none can block the shim', () => {
+    const headers = buildResponseHeaders(
+      [
+        ['Content-Type', 'text/html'],
+        // The maximally hostile one: this alone stops the shim executing.
+        ['Content-Security-Policy', "default-src 'none'; script-src 'none'"],
+        // A second policy header. CSP *intersects* multiple policies, so one
+        // surviving header is enough to block the shim even if another is
+        // permissive - which is why the test sends more than one.
+        ['Content-Security-Policy', "script-src 'nonce-abc'"],
+        // Report-Only does not block, but it exfiltrates: it would post the
+        // shim's presence to a URL the app chooses.
+        ['Content-Security-Policy-Report-Only', 'default-src *; report-uri https://evil.test/r'],
+        // Header names are case-insensitive; the strip must be too.
+        ['CONTENT-SECURITY-POLICY', "script-src 'none'"],
+        ['content-security-policy-report-only', "default-src 'none'"],
+      ],
+      context
+    )
+
+    // `getAll` is not on Headers; `get` joins duplicates with ", ". Splitting
+    // it is how we prove there is exactly one policy, not a merged pair.
+    const policies = (headers.get('content-security-policy') ?? '').split(', ')
+
+    expect(policies).toEqual([SUBSTITUTED_CSP])
+    expect(headers.get('content-security-policy-report-only')).toBeNull()
+  })
+
+  it('declares no directive that could block the injected inline script', () => {
+    const directives = parsePolicy(SUBSTITUTED_CSP)
+
+    // The shim is spliced in as an inline <script> element. Under CSP an
+    // inline script element is governed by `script-src-elem`, falling back to
+    // `script-src`, falling back to `default-src`. If none of the three is
+    // declared, the script is unrestricted and runs. Asserting their absence is
+    // therefore the whole "the shim executes under the substituted CSP"
+    // criterion, decided from the policy rather than guessed at.
+    expect(directives.has('script-src-elem')).toBe(false)
+    expect(directives.has('script-src')).toBe(false)
+    expect(directives.has('default-src')).toBe(false)
+  })
+
+  it('is not so permissive that substituting it defeats the point', () => {
+    const directives = parsePolicy(SUBSTITUTED_CSP)
+
+    // `frame-ancestors 'self'`: the proxied app may be framed by the dashboard
+    // and by nothing else. Without it, any site on the internet could frame
+    // /app/<deviceId>/<serviceId>/ and drive the user's home services.
+    expect(directives.get('frame-ancestors')).toEqual(["'self'"])
+
+    // `base-uri 'self'`: a framed app that could set <base href="https://evil">
+    // would re-point every relative URL in its own document off this origin,
+    // out of the Service Worker's scope, and straight past the proxy. Pinning
+    // it to 'self' keeps relative resolution inside the scope the worker owns.
+    expect(directives.get('base-uri')).toEqual(["'self'"])
+
+    // Neither may be widened by a wildcard or a scheme source hiding beside it.
+    for (const [name, values] of directives) {
+      expect(values, `${name} must not admit a wildcard`).not.toContain('*')
+      expect(values, `${name} must not admit any host`).toEqual(["'self'"])
+    }
+  })
+
+  it('substitutes a policy even when upstream sent none', () => {
+    const headers = buildResponseHeaders([['Content-Type', 'text/html']], context)
+
+    expect(headers.get('content-security-policy')).toBe(SUBSTITUTED_CSP)
+  })
+})
+
 describe('problemResponse', () => {
   it('renders an RFC 7807 document with the taxonomy status', async () => {
     const response = problemResponse('E_DEVICE_MISMATCH', 'wrong device')

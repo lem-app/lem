@@ -20,6 +20,7 @@
 import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 import { listDevices } from '../api/auth'
+import { readToken } from '../lib/session'
 import type { Device } from '../api/types'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -29,10 +30,17 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 
 type DeviceSelectorProps = {
   onSelectDevice: (deviceId: string) => void
-  token: string
 }
 
-export function DeviceSelector({ onSelectDevice, token }: DeviceSelectorProps): ReactElement {
+/**
+ * The signaling JWT is deliberately **not** a prop here.
+ *
+ * A prop is stored on the fiber node React attaches to this component's DOM,
+ * which a framed service reaches through `parent.document` (#82). The token is
+ * read from module scope at the moment it is needed instead, so it exists only
+ * as a local inside the fetch closure.
+ */
+export function DeviceSelector({ onSelectDevice }: DeviceSelectorProps): ReactElement {
   const [devices, setDevices] = useState<Device[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -44,7 +52,7 @@ export function DeviceSelector({ onSelectDevice, token }: DeviceSelectorProps): 
       try {
         setIsLoading(true)
         setError(null)
-        const deviceList = await listDevices(token)
+        const deviceList = await listDevices(readToken() ?? '')
         // Filter out browser devices (only show local server devices)
         const serverDevices = deviceList.filter((d) => !d.id.startsWith('browser-'))
         setDevices(serverDevices)
@@ -56,7 +64,7 @@ export function DeviceSelector({ onSelectDevice, token }: DeviceSelectorProps): 
     }
 
     void fetchDevices()
-  }, [token])
+  }, [])
 
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault()

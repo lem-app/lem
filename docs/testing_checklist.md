@@ -440,9 +440,12 @@ and the suite says so in the tests that touch them:
 
 - a same-origin `window.parent` that really does expose `__lemWsBridge` (jsdom's `WindowProxy`
   does not forward properties, so the test re-points `parent`);
-- a browser honouring `Set-Cookie` on a `Response` a Service Worker synthesised. Modern Chrome,
-  Firefox and Safari do — the Fetch Standard dropped "forbidden response-header name" — but that
-  is a claim about browsers, not something this suite proves.
+- a browser **refusing** `Set-Cookie` on a `Response` a Service Worker synthesised. It is a
+  forbidden response-header name, so the `Headers` guard drops it silently and the storing
+  algorithm is never reached (§5.6.2). Node's undici does **not** enforce that guard, which is
+  exactly why a green suite once "proved" cookie isolation that no browser would ever have
+  performed ([#72](https://github.com/lem-app/lem/issues/72)). Step A below is written to observe
+  the refusal rather than assume it.
 
 Run the §4 setup first: machine A at home with Open WebUI and Ollama running and a small model
 pulled, machine B on a different network. Everything below happens on **B**.
@@ -460,13 +463,23 @@ pulled, machine B on a different network. Everything below happens on **B**.
    *does* stick, the cookie reached the jar by some route §5.6.2 says is impossible; that is worth
    investigating and reporting, not celebrating.
 3. Open DevTools → Application → Cookies → the dashboard's origin.
-   **Expected today: the cookie is absent** — dropped by the browser, not by this proxy. To see
-   that the proxy did its part, open the Network panel entry for the login response: the
-   `Set-Cookie` the worker produced is visible there even though nothing stored it.
-   **Expected once the cookie transport works:** the session cookie is listed with
-   **`Path` = `/app/<deviceId>/webui/`**
-   (the ids from the iframe's URL), and with **no `Domain`** value of its own. `HttpOnly` and
-   `SameSite` read exactly as Open WebUI set them.
+   **Expected today: the cookie is absent.** Do not expect to find it in the Network panel
+   either: the worker strips `set-cookie` when it builds the `Response`, precisely so its output
+   does not display a header no browser would ever act on. The header does still cross the tunnel
+   — the server-side relay stops stripping it, which is the prerequisite for the §5.6.2 jar — so
+   the place to confirm the far side sent one is machine A's own logs, not B's DevTools.
+   **Expected once the [#72](https://github.com/lem-app/lem/issues/72) jar is built:** still
+   nothing here — the worker's own jar never creates a browser cookie, which is the point of that
+   design. What changes is that the app stays signed in. Confirm it by re-running step 1 and
+   getting past the login form, not by looking at this panel.
+> **Steps 4–6 are BLOCKED, not merely unverified.** They all ask which requests carry a cookie,
+> and step 3 has just established that no cookie exists to carry. There is nothing to observe
+> until the [#72](https://github.com/lem-app/lem/issues/72) jar is built. Do not run them and
+> record a pass on the strength of finding no cross-service leakage — an empty jar leaks nothing,
+> and scoring that as isolation is the same error the issue was filed for. They are kept here
+> because they are the right steps *once there is a session*, and re-deriving them later would
+> lose the reasoning.
+
 4. In DevTools → Network, reload the frame and pick any request the app made.
    **Expected:** it carries the cookie. Now open a *second* service (Ollama, say) and pick one of
    its requests. **Expected:** it carries **no** Open WebUI cookie.
@@ -559,6 +572,124 @@ pulled, machine B on a different network. Everything below happens on **B**.
 **F. A large message survives fragmentation.** Send a chat message with a pasted block of at
 least 100 KB. **Expected:** Open WebUI receives it whole — the reply refers to the content, and
 A's log shows no `message exceeded MAX_WS_MESSAGE_BYTES`.
+
+### 4.2 Phase 6 — the criteria that need a real browser
+
+Phase 6's in-suite coverage is listed at the end of this section. Three of its criteria rest on
+browser behaviour that jsdom does not have, and are **not** met by any test in this repository:
+
+- **`window.isSecureContext` is `false` at `http://<lan-ip>:5173` and `true` at
+  `http://localhost:5173`.** The suite injects `secureContext` into `detectUnavailability`, so it
+  proves the branch, never the browser's verdict. That verdict is the entire criterion.
+- **The substituted CSP actually permits the injected inline `<script>` to execute.** The suite
+  asserts the policy declares no `script-src`/`script-src-elem`/`default-src` — a derivation from
+  the CSP grammar, not an observation of an engine enforcing it.
+- **An upstream CSP cannot block the shim.** Same reason: `buildResponseHeaders` is checked
+  directly, but only a browser decides what a delivered policy does.
+
+**A. Degraded state on the LAN.** On machine B, in the same LAN as B's browser:
+
+1. `cd web/remote && pnpm run dev:lan`, then open `http://<lan-ip>:5173` — the LAN address, not
+   `localhost`.
+2. In the console, evaluate `window.isSecureContext`. **Expected:** `false`. If it is `true` you
+   are on `localhost` or HTTPS and are not testing this criterion.
+3. Log in and connect to device A. **Expected:** the catalog lists services.
+4. **Expected:** every installed service's **Launch** button is disabled, and hovering it shows
+   *"Service Workers need a secure context. Serve the dashboard over HTTPS, or open it at
+   http://localhost."*
+5. **The control plane must be untouched.** Install a service you do not have; start it; stop it.
+   **Expected:** all three run to completion with job progress, exactly as on `localhost`.
+6. Open `APITester` and issue `GET /v1/services`. **Expected:** a normal JSON response.
+7. Navigate to a service's viewer anyway. **Expected:** the unavailable alert, naming the reason.
+   **Expected: NO iframe in the DOM at all** — check DevTools → Elements rather than trusting the
+   rendering. An iframe here pointed at the service's `127.0.0.1` address is defect #1 of
+   [#6](https://github.com/lem-app/lem/issues/6) returning through the fallback path.
+8. Now reopen the dashboard at `http://localhost:5173` and repeat step 4. **Expected:** Launch is
+   enabled. This is the positive control for the whole section — without it, a Launch button
+   disabled for an unrelated reason reads as a pass.
+
+**B. A hostile upstream CSP does not stop the shim.** This needs a service that sets a
+restrictive CSP. If none of your installed services does, add one for the test on machine A:
+
+```bash
+# On A, a throwaway upstream that sends the most hostile policy there is.
+python3 -c "
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'<!doctype html><html><head><title>csp</title></head><body>hi</body></html>'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Security-Policy', \"default-src 'none'; script-src 'none'\")
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+http.server.HTTPServer(('127.0.0.1', 39999), H).serve_forever()
+"
+```
+
+1. Point a service id at port 39999 on A and frame it from B.
+2. DevTools → Network → the document request → Response Headers.
+   **Expected:** `content-security-policy: frame-ancestors 'self'; base-uri 'self'` and **no**
+   `x-frame-options`. The upstream's `default-src 'none'` must not appear.
+3. DevTools → Console, iframe context. **Expected: no CSP violation reported.** A message like
+   *"Refused to execute inline script because it violates the following Content Security
+   Policy"* is a failure of this criterion.
+4. Evaluate `window.__lemWsShimInstalled` in the iframe context. **Expected:** `true`. This is
+   the criterion: the shim *ran* under the substituted policy.
+5. **Negative control, so step 3 means something.** In the iframe console run
+   `document.head.insertAdjacentHTML('afterbegin', '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">')`
+   then `document.body.append(document.createElement('script'))`. **Expected:** *now* you see a
+   violation in the console. If you cannot produce one on demand, step 3's silence proves
+   nothing about this browser's reporting.
+
+**C. The JWT is in no browser store, and a reload logs you out.**
+
+> **Scope, so this section is not over-read.** Steps 1-4 check *storage*; step 5 checks the
+> *render tree*, which is a separate exposure and was live until
+> [#82](https://github.com/lem-app/lem/issues/82). Neither makes a hostile framed service safe —
+> it is same-origin with the dashboard and per-service origins remains the boundary.
+
+1. On B at `http://localhost:5173` (a secure context, so the proxy works), log in and frame any
+   service.
+2. In DevTools → Application → Local Storage and → Session Storage for the dashboard's origin.
+   **Expected:** no JWT under any key. Search the values, not just the key names.
+3. Switch the console context to the **iframe** and evaluate
+   `Object.entries(localStorage)` and `document.cookie`. **Expected:** no token in either. This
+   is the exfiltration path §8.4 describes, executed from the realm that would use it.
+4. Press F5 on the dashboard. **Expected:** the login screen, every time. Staying signed in means
+   the token is being re-hydrated from somewhere and the criterion has failed, whatever the
+   suite says.
+5. **The exposure that remains, observed rather than assumed.** Still in the iframe's console:
+
+   ```js
+   const host = parent.document.body
+   const fiberKey = Object.keys(host).find((k) => k.startsWith('__reactFiber$'))
+   fiberKey ? 'fiber reachable: ' + fiberKey : 'no fiber found'
+   ```
+
+   **Expected:** a fiber key is found on some element under `#root` — React always attaches
+   these, and their presence is not the defect. Now walk `.return` upwards from it and inspect
+   `memoizedProps` and `memoizedState` at each step. **Expected: no token anywhere along the
+   chain**, because components receive `isAuthenticated` and callbacks rather than the value.
+   Finding one means [#82](https://github.com/lem-app/lem/issues/82) has regressed. The automated
+   form of this check, including a positive control that reproduces the pre-fix arrangement, is
+   `web/remote/src/lib/fiber-reachability.test.tsx`.
+
+**In-suite for Phase 6, and therefore not repeated above:** the degradation reason table and its
+precedence (`sw-bridge.test.ts`), the degraded UI and the absence of an iframe fallback
+(`ClientViewer.test.tsx`), Launch disabled while install/start/stop stay live
+(`ServiceCard.test.tsx`), CSP stripping and substitution including report-only and duplicate
+headers (`lem-app-sw.test.ts`), the shim landing first under a hostile upstream policy
+(`sw-shim.test.ts`), and the token-reachability walk with a positive control per case — including
+the `Reflect.set(window, …)` mutation that defeated the earlier surface-enumeration version — plus
+the instrumented out-of-band stores and the forced re-authentication on reload
+(`token-persistence.test.ts`).
+
+Step C below is worth running even though the walk is in-suite: the walk is bounded (it does not
+follow closures or function-object properties, and it stops at depth 8), so a real browser with
+real DevTools remains the broader check.
 
 ---
 

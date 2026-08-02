@@ -24,11 +24,20 @@ import { HTTPProxy, WebRTCTransport, RelayTransport } from '../lib/proxy-fetch'
 import { WSProxyManager } from '../lib/ws-proxy'
 import { installWsBridge } from '../lib/ws-bridge'
 import { TunnelSession } from '../lib/tunnel-session'
+import { readToken } from '../lib/session'
 import type { ConnectionState, DataChannelState } from '../api/types'
 
 interface UseWebRTCOptions {
   signalUrl: string
-  token: string
+  /**
+   * Whether a session exists - a boolean, never the token.
+   *
+   * The token itself is read from module scope via `readToken()` at the moment
+   * a socket needs it. Passing it in as an option would put the credential in
+   * this hook's props and therefore on a fiber node attached to the DOM, where
+   * a framed service reads it through `parent.document` (#82).
+   */
+  authenticated: boolean
   deviceId: string
   targetDeviceId: string
   autoConnect?: boolean
@@ -122,13 +131,13 @@ export function useWebRTC(options: UseWebRTCOptions) {
 
   // Initialize WebRTC manager
   useEffect(() => {
-    if (!options.token || !options.deviceId || !options.targetDeviceId) {
+    if (!options.authenticated || !options.deviceId || !options.targetDeviceId) {
       return
     }
 
     const manager = new WebRTCConnectionManager({
       signalUrl: options.signalUrl,
-      token: options.token,
+      getToken: () => readToken() ?? '',
       deviceId: options.deviceId,
       targetDeviceId: options.targetDeviceId,
       iceServers: options.iceServers,
@@ -239,7 +248,7 @@ export function useWebRTC(options: UseWebRTCOptions) {
         const relayClient = new RelayClient({
           relayUrl: options.relayUrl,
           sessionId,
-          token: options.token,
+          getToken: () => readToken() ?? '',
           onStateChange: setConnectionState,
           onMessage: routeBinaryFrame,
           onError: setError,
@@ -283,7 +292,7 @@ export function useWebRTC(options: UseWebRTCOptions) {
     }
   }, [
     options.signalUrl,
-    options.token,
+    options.authenticated,
     options.deviceId,
     options.targetDeviceId,
     options.relayUrl,

@@ -16,9 +16,31 @@
 /**
  * Authentication hook for managing login state.
  *
- * Token persistence, expiry checking and the 401 interceptor all live in
- * `lib/session.ts` - see the comment there for why the token is in
- * `localStorage` and what that does and does not buy us.
+ * Token custody, expiry checking and the 401 interceptor all live in
+ * `lib/session.ts`. The token is held in a module-scoped variable and is **not
+ * persisted anywhere**, because the framed app at `/app/<deviceId>/<serviceId>/`
+ * shares this origin and can read any store the dashboard writes (tunnel proxy
+ * spec §8.4). The consequence is visible right here: `initialState()` finds no
+ * token after a reload, so a reload is a logout.
+ *
+ * ## This hook deliberately does not return the token
+ *
+ * It returns `isAuthenticated`, a boolean, and nothing that a component could
+ * put in props or state. That is not tidiness - it is the second half of the
+ * §8.4 requirement, and it was missing until
+ * [#82](https://github.com/lem-app/lem/issues/82).
+ *
+ * React stores hook state and props on fiber nodes, and attaches those fibers
+ * to DOM elements as `__reactFiber$…` expandos. A token returned from here
+ * therefore ends up in the DOM subtree that hosts the framed service's iframe,
+ * where same-origin code reads it through `parent.document`. Taking it out of
+ * `localStorage` and putting it in the render tree would have moved the
+ * exposure, not removed it.
+ *
+ * Code that genuinely needs the value calls `readToken()` at the point of use,
+ * so it lives on the stack for the duration of a call and in module scope the
+ * rest of the time - neither of which a fiber walk can reach.
+ * `lib/fiber-reachability.test.tsx` asserts this.
  */
 
 import { useState, useCallback, useEffect } from 'react'
@@ -27,19 +49,17 @@ import { clearToken, onSessionExpired, readToken, storeToken } from '../lib/sess
 import type { UserLogin, UserRegister, Token } from '../api/types'
 
 interface AuthState {
-  token: string | null
   isAuthenticated: boolean
   isLoading: boolean
   error: string | null
 }
 
 function initialState(): AuthState {
-  // readToken() drops the token if its `exp` claim has passed, so a stale
-  // session no longer renders a signed-in dashboard whose every call 401s.
-  const token = readToken()
+  // Always false on a fresh realm - see the module comment. readToken() also
+  // drops a token whose `exp` claim has passed, so a stale session never
+  // renders a signed-in dashboard whose every call 401s.
   return {
-    token,
-    isAuthenticated: token !== null,
+    isAuthenticated: readToken() !== null,
     isLoading: false,
     error: null,
   }
@@ -51,7 +71,6 @@ export function useAuth() {
   const logout = useCallback(() => {
     clearToken()
     setState({
-      token: null,
       isAuthenticated: false,
       isLoading: false,
       error: null,
@@ -63,7 +82,6 @@ export function useAuth() {
     () =>
       onSessionExpired(() => {
         setState({
-          token: null,
           isAuthenticated: false,
           isLoading: false,
           error: 'Your session has expired. Please sign in again.',
@@ -72,8 +90,11 @@ export function useAuth() {
     []
   )
 
+  // Returns void, not the `Token`: handing the credential back to a component
+  // is how it gets into props and state, which is the exposure this hook exists
+  // to avoid. Callers that need the value call `readToken()`.
   const authenticate = useCallback(
-    async (run: () => Promise<Token>, fallbackError: string): Promise<Token> => {
+    async (run: () => Promise<Token>, fallbackError: string): Promise<void> => {
       setState((prev) => ({ ...prev, isLoading: true, error: null }))
 
       try {
@@ -81,13 +102,10 @@ export function useAuth() {
         storeToken(response.access_token)
 
         setState({
-          token: response.access_token,
           isAuthenticated: true,
           isLoading: false,
           error: null,
         })
-
-        return response
       } catch (error) {
         const message = error instanceof Error ? error.message : fallbackError
         setState((prev) => ({

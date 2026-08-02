@@ -1,6 +1,10 @@
 # Tunnel Proxy Spec: Same-Origin Service Worker + Tunnel Protocol v3
 
-**Status**: Approved design, not yet implemented
+**Status**: **Implemented through Phase 6** (§9). This document was written as a design and is
+still largely phrased that way — **much of it describes the pre-implementation codebase in the
+present tense, and many `file:line` citations have drifted**. §9's phase list and §8.4 are kept
+current; treat the rest as design rationale, not as a description of the code. The full inventory
+of stale passages is [#83](https://github.com/lem-app/lem/issues/83).
 **Tracks**: [#6](https://github.com/lem-app/lem/issues/6) (remote app viewing is broken), [#3](https://github.com/lem-app/lem/issues/3) (protocol v3)
 **Composes with**: PR [#24](https://github.com/lem-app/lem/pull/24) (`fix/green-baseline`), PR [#25](https://github.com/lem-app/lem/pull/25) (`fix/local-api-security`)
 **Audience**: the engineer implementing it. Every decision below is settled; build from it, do not re-derive it.
@@ -8,6 +12,13 @@
 ---
 
 ## 1. Why this document exists
+
+> **All three defects below are fixed.** This section is the original problem statement, kept for
+> the reasoning; every "today" in it means *before Phase 4*. Defect 1 was fixed by Phase 4
+> (`ClientViewer` frames the same-origin `/app/<deviceId>/<serviceId>/` path), defects 2 and 3 by
+> Phase 5 (`WS_CONNECT_ACK` on both sides; `websocket-intercept.ts` deleted in favour of the
+> SW-spliced shim), and the untrue UI strings by Phase 6. The `file:line` citations here point at
+> the pre-Phase-4 tree and no longer resolve — see the status note at the top.
 
 Lem's headline promise is "access your home AI setup from work or travel". Today the remote
 dashboard can call JSON APIs on your machine and nothing else. Opening a service shows you
@@ -1703,18 +1714,39 @@ browser — a denial of service against Lem itself.
 
 ### 8.4 The `sandbox` attribute is not a boundary here — say so
 
-`ClientViewer.tsx:285` sets `sandbox="allow-scripts allow-same-origin allow-forms allow-popups"`.
-`allow-scripts` together with `allow-same-origin` is the documented escape hatch: the framed
+`ClientViewer` sets `sandbox="allow-scripts allow-same-origin allow-forms"` — `allow-popups`
+was dropped in Phase 6, and `allow=""` additionally denies every powerful feature. `allow-scripts`
+together with `allow-same-origin` is nevertheless the documented escape hatch: the framed
 document is same-origin with its parent and can therefore reach `parent.document` and remove
 the `sandbox` attribute from its own `<iframe>` element, then trigger a reload. The attribute
-provides **no** protection against hostile frame content.
+provides **no** protection against hostile frame content, and the code carries a comment saying
+so rather than leaving the reader to infer it.
 
 The same-origin SW design makes this worse in one specific way and better in another:
 
 - **Worse**: the framed app now genuinely shares an origin with the dashboard. It can read
-  `localStorage`, where the dashboard currently keeps the signaling JWT
-  (`web/remote/src/hooks/useAuth.ts:33`, `:44`, `:70`, `:92`). A hostile or compromised local
-  service could exfiltrate the token that authorises tunnelling to the user's machine.
+  `localStorage`, where the dashboard used to keep the signaling JWT. A hostile or compromised
+  local service could exfiltrate the token that authorises tunnelling to the user's machine.
+  **Closed in Phase 6, in two halves.** *Storage*: the token is held in a module-scoped variable
+  in `web/remote/src/lib/session.ts`, written to no browser store, with a legacy persisted token
+  purged on load; `lib/token-persistence.test.ts` asserts it is unreachable from any global root.
+  *Render tree*: `useAuth()` returns `isAuthenticated` and never the token, and no component takes
+  it as a prop — React keeps props and hook state on fiber nodes attached to the DOM, so a token
+  in a component would have been readable by a framed service through `parent.document`.
+  `lib/fiber-reachability.test.tsx` asserts that, with the pre-fix arrangement as a positive
+  control ([#82](https://github.com/lem-app/lem/issues/82)).
+
+  > **The first half alone would have relocated the exposure, not removed it** — and the storage
+  > sweep stayed green the whole time the render tree was leaking, which is why the two need
+  > separate assertions. Verified by reverting: putting the token back into `useAuth`'s state
+  > leaves `token-persistence.test.ts` fully green and fails three assertions in
+  > `fiber-reachability.test.tsx`. Note the reason the storage sweep misses it is **setup, not
+  > capability** — that walk *can* reach fiber data through `document`; none of its cases render
+  > a component holding a token. The test files carry the full explanation. *(The line citations that
+  stood here — `hooks/useAuth.ts:33`, `:44`, `:70`, `:92` — were already stale when Phase 6
+  began: [#68](https://github.com/lem-app/lem/pull/68) and #70 had moved custody into
+  `lib/session.ts`. Recorded because a `file:line` that has drifted is the failure mode this
+  document keeps filing issues about.)*
 - **Better**: dropping `allow-same-origin` is not an option, because a document with an opaque
   origin is not controlled by a Service Worker at all — the proxy would simply not work. So the
   choice is explicit rather than accidental.
@@ -1744,11 +1776,42 @@ hostile or compromised service framed on this origin is contained by none of it.
 origins (requirement 4 below) is the actual boundary**, and that remains true whichever cookie
 design lands.
 
-**Normative requirements that ship with Phase 6:**
+**Normative requirements that ship with Phase 6 — all four addressed; 1–3 landed, 4 deferred by
+design:**
 
-1. The remote dashboard MUST NOT persist the signaling JWT (or any bearer credential) in
-   `localStorage`, `sessionStorage`, or IndexedDB once the SW proxy is enabled. It MUST hold it
+1. **Landed.** The remote dashboard MUST NOT persist the signaling JWT (or any bearer credential)
+   in `localStorage`, `sessionStorage`, or IndexedDB once the SW proxy is enabled. It MUST hold it
    in a module-scoped variable.
+
+   > Phase 6 read this requirement wider than its letter, deliberately, and then had to widen it
+   > again. A rule naming three stores is satisfied by a cookie, a Cache entry or a URL fragment
+   > — but a list of *those* is satisfied by an arbitrary global property, which is how the first
+   > attempt failed review. What ships asserts the positive property instead: **after
+   > `storeToken()`, the token must not be reachable from a global root**, verified by walking the
+   > object graph. The ESLint rule bans the storage globals rather than the key name `'token'`
+   > (which a rename defeats) and is explicitly a tripwire, not the criterion.
+   >
+   > The walk's boundaries are stated in the test rather than left to be discovered: values held
+   > in **closures** are invisible to any property walk — which is exactly the mechanism that
+   > makes `session.ts` correct — and properties on **function objects** are excluded on cost
+   > (removing that guard makes the walk fail to terminate against jsdom's constructor graph;
+   > the test says which line to delete to see it). Out-of-band stores that are not object
+   > properties are instrumented separately. An honest boundary beats a sweep that reads as
+   > exhaustive and is not.
+   >
+   > The walk never classifies an object by anything the object controls: **deciding to stay
+   > quiet requires an unforgeable fact** (object identity against a reference captured at module
+   > load, or an internal-slot probe that throws unless the slot is real), while deciding to
+   > *surface* something may use a heuristic, because a forged answer there costs a missed report
+   > rather than a false all-clear.
+   >
+   > **That rule, the review history that produced it, and the complete list of what the sweep
+   > can and cannot see live in one place: `web/remote/src/test/reachability.ts`.** Deliberately
+   > not restated here — this narrative previously existed in three copies and had already
+   > drifted between them, which is the same failure that two copies of the traversal code
+   > caused. Note for §3.1's sake only: dropping the type test also fixed a live bug rather than
+   > merely an attack, because **a `Map` from another realm** is not `instanceof Map` and this
+   > dashboard frames services by construction, so cross-realm objects are routine.
 
    **The `HttpOnly` refresh cookie is a prerequisite, not part of this phase — and it does not
    exist.** An `HttpOnly` cookie can only be set by a server response header, so the signaling
@@ -1775,13 +1838,18 @@ design lands.
    Phase 6's acceptance criterion is written accordingly (§9): a lint rule proving the token is
    not persisted is necessary but not sufficient, so the criterion also asserts the reload
    behaviour explicitly rather than letting "no `setItem`" stand in for a working design.
-2. `ClientViewer` keeps `sandbox="allow-scripts allow-same-origin allow-forms"` — dropping
-   `allow-popups`, which the apps we target do not need — and the code carries a comment stating
-   plainly that this restrains well-behaved apps only.
-3. The known limitation is documented for users: **the services you launch remotely run with
-   the dashboard's origin privileges. Only launch services you trust.** This belongs in the
-   README's security section, not buried here.
-4. Phase 7 (post-v0.1, tracked separately): give each service its own origin
+2. **Landed.** `ClientViewer` keeps `sandbox="allow-scripts allow-same-origin allow-forms"` —
+   dropping `allow-popups`, which the apps we target do not need — and the code carries a comment
+   stating plainly that this restrains well-behaved apps only. It also sets `allow=""`, denying
+   camera, microphone and every other powerful feature, which this requirement did not ask for.
+3. **Landed.** The known limitation is documented for users: **the services you launch remotely
+   run with the dashboard's origin privileges. Only launch services you trust.** This belongs in
+   the README's security section, not buried here. Phase 6 added the
+   [#72](https://github.com/lem-app/lem/issues/72) cookie caveat beside it: no cookie reaches the
+   browser at all, so a framed app cannot hold a session — a **functional** limitation that must
+   not be presented as isolation, since an empty jar leaks nothing and proves nothing.
+4. **Deferred by design.** Phase 7 (post-v0.1, tracked separately): give each service its own
+   origin
    (`<serviceId>.apps.<dashboard-domain>`) with its own SW registration. That is the only design
    that yields a real boundary, and it costs wildcard DNS and a wildcard certificate.
 
@@ -1971,23 +2039,56 @@ through the secure WebRTC tunnel" claims where they are not yet true.
 
 **Acceptance criteria**
 
-- [ ] Dashboard served at `http://<lan-ip>:5173` shows the degraded state with reason
-      `insecure-context`; catalog, install/start/stop, and `APITester` still work.
-- [ ] No `localStorage.setItem('token', …)` remains in `web/remote/src` (today: `useAuth.ts:44`,
-      `:70`, plus reads at `:33`, `:34` and the remove at `:92`); a lint rule enforces it.
-- [ ] The token lives only in a module-scoped variable, asserted by a test that reloads the page
+- [x] Dashboard served at `http://<lan-ip>:5173` shows the degraded state with reason
+      `insecure-context`; catalog, install/start/stop, and `APITester` still work. *Detection,
+      precedence and the degraded UI are in-suite (`sw-bridge.test.ts`, `ClientViewer.test.tsx`,
+      `ServiceCard.test.tsx`); that a browser reports `isSecureContext === false` for a LAN
+      address is a fact about browsers, settled by `testing_checklist.md` §4.2 A.*
+- [x] No `localStorage.setItem('token', …)` remains in `web/remote/src`; a lint rule enforces it.
+      *The token had already moved out of `useAuth.ts` into `lib/session.ts` — the cited line
+      numbers were stale. The rule bans the `localStorage`/`sessionStorage` **globals** rather
+      than the string `'token'`, because a key rename satisfies the narrower rule.*
+- [x] The token lives only in a module-scoped variable, asserted by a test that reloads the page
       and observes a forced re-authentication — the accepted interim cost of §8.4 requirement 1.
       A green lint rule with the token silently re-persisted elsewhere must fail this criterion.
-- [ ] Upstream `Content-Security-Policy` is stripped; the injected shim executes under the
-      substituted CSP.
-- [ ] The strings at `ClientViewer.tsx:290-293` ("All HTTP requests and WebSocket connections
-      are automatically routed through the secure WebRTC tunnel to your local device") and
-      `ClientSelector.tsx:197-198` ("All connections are routed through the secure WebRTC
-      tunnel. HTTP requests and WebSocket connections are automatically proxied to your local
-      device") describe what the build actually does. The two are near-duplicates making the
-      same untrue claim, but they are **not** verbatim identical — fix both, do not
-      search-and-replace one string.
-- [ ] README's security section carries the §8.4 warning.
+      *`lib/token-persistence.test.ts` asserts the **positive** property — after `storeToken()`,
+      the token must not be reachable from `globalThis` — by walking the object graph, rather than
+      enumerating storage APIs. Out-of-band stores that are not object properties (IndexedDB, the
+      Cache API, `document.cookie`) are instrumented separately. Every detector has a positive
+      control. Demonstrated against four re-persistence mutations —
+      `Reflect.set(window, '__lemDebugCache', token)`, `history.pushState`, a DOM `dataset`
+      property and `window.name` — each of which leaves the lint rule **green** and fails the
+      walk.*
+
+      > **The first implementation of this criterion enumerated surfaces, and lost.** A reviewer
+      > defeated it with one line, `Reflect.set(window, '__lemDebugCache', token)`: it names no
+      > banned identifier, so the lint rule passed, and a global property was not one of the eight
+      > surfaces scanned, so the sweep passed. It is also *worse* than `localStorage` — a framed
+      > iframe reads it as `window.parent.__lemDebugCache` with no API call to intercept and no
+      > storage event. The surface set is open-ended, so enumeration always loses; asserting
+      > unreachability tests the property we actually want. Recorded because "add the missing
+      > surface to the list" was the wrong fix and would have failed again.
+- [x] Upstream `Content-Security-Policy` is stripped; the injected shim executes under the
+      substituted CSP. *Stripping and substitution are in-suite, including report-only, duplicate
+      and mixed-case headers, plus assertions that the substituted policy declares no directive
+      governing inline script and is not widened past `'self'`. That a browser then executes the
+      shim is `testing_checklist.md` §4.2 B, which carries its own negative control.*
+- [x] The strings in `ClientViewer.tsx` and `ClientSelector.tsx` describe what the build actually
+      does. The two are near-duplicates making the same untrue claim, but they are **not**
+      verbatim identical — fix both, do not search-and-replace one string.
+
+      > **The claim had already moved when Phase 6 arrived.**
+      > PR [#65](https://github.com/lem-app/lem/pull/65) removed "secure WebRTC tunnel" and added
+      > the relay caveat, so the quoted strings no longer existed. What remained untrue is
+      > narrower and easy to miss: **"All HTTP requests … are automatically routed"**. The
+      > Service Worker deliberately does *not* intercept cross-origin URLs (§3.8), so a CDN
+      > script or font the framed app loads is fetched by the remote browser directly and never
+      > touches the user's device. "All" is a security claim, and it was false. Both notes now
+      > scope it, and both carry the cookie limitation.
+- [x] README's security section carries the §8.4 warning, and the
+      [#72](https://github.com/lem-app/lem/issues/72) cookie caveat alongside it — no cookie
+      reaches the browser at all, which is a functional limitation and explicitly *not* a
+      security boundary; per-service origins (Phase 7) remains the boundary.
 
 ### Phase 7 — Per-service origins (post-v0.1, tracked separately)
 

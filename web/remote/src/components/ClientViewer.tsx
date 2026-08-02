@@ -393,12 +393,39 @@ export function ClientViewer({
                 />
               </div>
 
-              <div className="mt-4 rounded-lg bg-muted p-3">
+              {/*
+                Scoped deliberately. "All HTTP requests are routed through the
+                tunnel" was untrue when this component framed the service's own
+                127.0.0.1 address, and it is still untrue now: the Service
+                Worker does not intercept cross-origin URLs (spec 3.8), so a
+                font or script the app pulls from a CDN is fetched by *this*
+                browser, directly. Saying "all" would tell a user their traffic
+                is hidden behind the tunnel when some of it is not.
+              */}
+              <div className="mt-4 space-y-2 rounded-lg bg-muted p-3">
                 <p className="text-xs text-muted-foreground">
-                  <strong>Note:</strong> All HTTP requests and WebSocket connections are
-                  automatically routed to your local device over the tunnel. A direct WebRTC
-                  connection is encrypted between the two peers; if it falls back to the relay, the
-                  relay terminates encryption and can see this traffic.
+                  <strong>What goes over the tunnel:</strong> this app's own requests and the
+                  WebSockets it opens are proxied to your local device. Anything it loads from
+                  another site — a CDN script or font, say — is fetched directly by this browser and
+                  does not touch your device.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  <strong>Encryption:</strong> a direct WebRTC connection is encrypted between the
+                  two peers. If it falls back to the relay, the relay terminates encryption and can
+                  see this traffic.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  <strong>Signing in does not work yet:</strong> cookies are not delivered to framed
+                  apps (
+                  <a
+                    className="underline"
+                    href="https://github.com/lem-app/lem/issues/72"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    #72
+                  </a>
+                  ), so an app that needs a login cannot hold a session here.
                 </p>
               </div>
             </CardContent>

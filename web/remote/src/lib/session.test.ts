@@ -14,7 +14,11 @@
 // Public License for more details.
 
 /**
- * Tests for token persistence and expiry (F-SEC-1).
+ * Tests for token custody and expiry (F-SEC-1, and spec section 8.4 req 1).
+ *
+ * The "is it persisted anywhere" question is deliberately *not* asked here -
+ * this file can only see the surfaces it thinks to look at. It is asked
+ * behaviourally, with positive controls, in `token-persistence.test.ts`.
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest'
@@ -23,6 +27,7 @@ import {
   expireSession,
   isTokenExpired,
   onSessionExpired,
+  purgeLegacyPersistedToken,
   readToken,
   readTokenExpiry,
   storeToken,
@@ -40,6 +45,7 @@ function jwtWithExp(expSeconds: number): string {
 
 describe('session token storage', () => {
   afterEach(() => {
+    clearToken()
     localStorage.clear()
     vi.useRealTimers()
   })
@@ -84,7 +90,8 @@ describe('session token storage', () => {
     storeToken(jwtWithExp(Math.floor(Date.now() / 1000) - 60))
 
     expect(readToken()).toBeNull()
-    expect(localStorage.getItem('token')).toBeNull()
+    // and it is dropped, not merely hidden: a second read agrees.
+    expect(readToken()).toBeNull()
   })
 
   it('notifies subscribers when the session expires', () => {
@@ -103,9 +110,29 @@ describe('session token storage', () => {
     expect(listener).toHaveBeenCalledTimes(1)
   })
 
-  it('clearToken removes the stored value', () => {
+  it('clearToken drops the held value', () => {
     storeToken('abc')
+    expect(readToken()).toBe('abc')
     clearToken()
+    expect(readToken()).toBeNull()
+  })
+
+  // Spec section 8.4 requirement 1. Shipping the in-memory switch without this
+  // would leave every upgrading installation exactly as exposed as before: the
+  // framed app reads `localStorage`, not the dashboard's variables.
+  it('purges a token left behind by the persisting build', () => {
+    localStorage.setItem('token', jwtWithExp(Math.floor(Date.now() / 1000) + 3600))
+
+    purgeLegacyPersistedToken()
+
     expect(localStorage.getItem('token')).toBeNull()
+  })
+
+  it('does not adopt a persisted token as the live session', () => {
+    localStorage.setItem('token', jwtWithExp(Math.floor(Date.now() / 1000) + 3600))
+
+    // Reading must not resurrect it: a value an attacker can *write* to
+    // localStorage must never become this session's bearer credential.
+    expect(readToken()).toBeNull()
   })
 })

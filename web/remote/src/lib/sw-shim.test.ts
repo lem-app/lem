@@ -33,9 +33,12 @@ import { describe, it, expect, afterEach } from 'vitest'
 import {
   HTML_SNIFF_BYTES,
   SHIM_MARKER_ATTRIBUTE,
+  SUBSTITUTED_CSP,
   WS_SHIM_SOURCE,
+  buildResponseHeaders,
   createShimInjector,
   findShimInsertionPoint,
+  shouldInjectShim,
 } from '../../public/lem-app-sw.js'
 import { WSProxyManager } from './ws-proxy'
 import { installWsBridge } from './ws-bridge'
@@ -106,6 +109,50 @@ function scriptsOf(html: string): HTMLScriptElement[] {
   const parsed = new DOMParser().parseFromString(html, 'text/html')
   return [...parsed.querySelectorAll('script')]
 }
+
+// -- a hostile upstream, headers and body together ---------------------------
+
+describe('a response from an upstream that is actively trying to stop the shim', () => {
+  // The two halves of "the shim executes" are tested apart elsewhere: that the
+  // policy is stripped and substituted (`lem-app-sw.test.ts`) and that the
+  // element lands first in the document (below). Neither on its own says the
+  // *same response* carries both. This does, for one response the worker would
+  // actually build.
+  it('still delivers the shim first, under a policy that permits it', async () => {
+    const upstream: [string, string][] = [
+      ['Content-Type', 'text/html; charset=utf-8'],
+      ['Content-Security-Policy', "default-src 'none'; script-src 'none'"],
+      ['Content-Security-Policy-Report-Only', "script-src 'none'"],
+      ['X-Frame-Options', 'DENY'],
+      ['Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload'],
+    ]
+
+    const headers = buildResponseHeaders(upstream, {
+      deviceId: 'dev-7f3a',
+      serviceId: 'webui',
+      upstreamPath: '/',
+    })
+
+    // The upstream declared HTML, so the worker splices - the hostile policy
+    // does not change that decision.
+    expect(shouldInjectShim(true, headers)).toBe(true)
+
+    const delivered = await inject(
+      '<!doctype html><html><head><title>app</title></head><body>hi</body></html>'
+    )
+
+    // The element is there and it is first.
+    expect(scriptsOf(delivered)[0].getAttribute(SHIM_MARKER_ATTRIBUTE)).toBe('1')
+
+    // And nothing in the delivered headers can stop it running: the upstream
+    // policies are gone, and the substituted one declares no script directive.
+    expect(headers.get('content-security-policy')).toBe(SUBSTITUTED_CSP)
+    expect(headers.get('content-security-policy-report-only')).toBeNull()
+    expect(headers.get('x-frame-options')).toBeNull()
+    expect(headers.get('strict-transport-security')).toBeNull()
+    expect(SUBSTITUTED_CSP).not.toMatch(/(^|;)\s*(default-src|script-src|script-src-elem)\s/)
+  })
+})
 
 // -- where the shim is spliced ----------------------------------------------
 

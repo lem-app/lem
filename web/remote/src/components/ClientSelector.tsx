@@ -203,12 +203,32 @@ export function ClientSelector({ proxyFetch, onSelectClient }: ClientSelectorPro
           )}
 
           {/* Info Box */}
-          <div className="rounded-lg border bg-muted/50 p-4">
+          {/*
+            Kept shorter than the equivalent note in ClientViewer, and worded
+            for this screen: nothing is framed yet here, so this describes what
+            opening a client will do rather than what a live frame is doing.
+            Both were near-duplicates of one claim that was untrue; they are
+            deliberately no longer duplicates of each other.
+          */}
+          <div className="space-y-2 rounded-lg border bg-muted/50 p-4">
             <p className="text-xs text-muted-foreground">
-              <strong>Note:</strong> HTTP requests and WebSocket connections are automatically
-              proxied to your local device over the tunnel. A direct WebRTC connection is encrypted
-              between the two peers; if it falls back to the relay, the relay terminates encryption
-              and can see this traffic.
+              <strong>Note:</strong> when you open a client, its own requests and WebSockets are
+              proxied to your local device over the tunnel. Resources it pulls from third-party
+              sites are loaded directly by this browser instead. On a direct WebRTC connection the
+              traffic is encrypted between the two peers; on the relay fallback the relay terminates
+              encryption and can see it.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Cookies are not delivered to framed apps (
+              <a
+                className="underline"
+                href="https://github.com/lem-app/lem/issues/72"
+                target="_blank"
+                rel="noreferrer"
+              >
+                #72
+              </a>
+              ), so a client that asks you to sign in will not be able to keep you signed in.
             </p>
           </div>
         </CardContent>
