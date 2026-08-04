@@ -28,6 +28,7 @@
  */
 
 import { LOCAL_API_BASE_URL } from './env'
+import { rawResponseHeaders } from './proxy-fetch'
 import { LemProxyError } from './tunnel-errors'
 
 /** Where the worker script is served. Origin root, so it can claim `/app/`. */
@@ -436,11 +437,17 @@ export class ServiceWorkerBridge {
       return
     }
 
+    // The frame's pairs, not `response.headers`. A `Response`'s headers carry
+    // the "response" guard, which drops `Set-Cookie` silently, so reading them
+    // here would hand the worker's cookie jar a response with the one header it
+    // exists to read already removed - in a browser only, since undici does not
+    // enforce the guard. `rawResponseHeaders` is the side-channel that keeps
+    // the upstream's own pairs intact all the way to the worker.
     port.postMessage({
       type: 'LEM_RESPONSE_HEAD',
       reqId,
       status: response.status,
-      headers: [...response.headers.entries()],
+      headers: rawResponseHeaders(response) ?? [...response.headers.entries()],
     })
 
     const body = response.body

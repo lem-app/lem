@@ -39,6 +39,48 @@ import {
 } from './http-frame'
 import { LemProxyError, TunnelErrorCode, errorNameForCode } from './tunnel-errors'
 
+/**
+ * The response's header pairs exactly as the frame carried them.
+ *
+ * **`Response`'s `Headers` has the "response" guard, and that guard silently
+ * drops `Set-Cookie`.** So the `Response` this class returns cannot be used to
+ * find out what the upstream actually sent - it has already lost precisely the
+ * header the Service Worker's cookie jar exists to read (spec section 5.6.2).
+ * Node's undici does not enforce the guard, so a test reading
+ * `response.headers` agrees with the code and every browser disagrees; that
+ * exact divergence has cost this area one full implementation already.
+ *
+ * The pairs therefore travel beside the `Response` rather than inside it. A
+ * symbol, not a field: `Response` is a platform object and this is a private
+ * side-channel between `HTTPProxy` and `sw-bridge`, not part of its shape.
+ */
+const RAW_HEADER_PAIRS = Symbol('lem.rawResponseHeaders')
+
+/**
+ * Read the unguarded header pairs `HTTPProxy` attached to a response.
+ *
+ * Returns null for any response this class did not produce, so a caller can
+ * fall back to `response.headers` for those.
+ */
+export function rawResponseHeaders(response: Response): HeaderList | null {
+  const carrier = response as Response & { [RAW_HEADER_PAIRS]?: HeaderList }
+  return carrier[RAW_HEADER_PAIRS] ?? null
+}
+
+/**
+ * Attach the frame's pairs to the `Response` built from it.
+ *
+ * Exported only so a test can build the `Response` a *browser* would have
+ * produced - one whose `headers` have already lost `Set-Cookie` to the guard.
+ * Node cannot produce that response on its own, so a test that needs one has to
+ * construct it, and a test that cannot construct it can only ever assert
+ * undici's behaviour instead of the platform's.
+ */
+export function attachRawHeaders(response: Response, headers: HeaderList): Response {
+  Object.defineProperty(response, RAW_HEADER_PAIRS, { value: headers, enumerable: false })
+  return response
+}
+
 /** No RESPONSE_HEAD within this window fails the fetch. */
 export const HEAD_TIMEOUT_MS = 30_000
 
@@ -322,7 +364,9 @@ export class HTTPProxy {
     if (!frame.bodyFollows) {
       this.clearTimer(exchange)
       this.pending.delete(frame.requestId)
-      exchange.resolveResponse(new Response(null, { status: frame.statusCode, headers }))
+      exchange.resolveResponse(
+        attachRawHeaders(new Response(null, { status: frame.statusCode, headers }), frame.headers)
+      )
       return
     }
 
@@ -345,7 +389,9 @@ export class HTTPProxy {
     // The clock now measures inter-chunk silence, not total duration.
     this.armTimer(frame.requestId, exchange, CHUNK_IDLE_TIMEOUT_MS, 'E_TIMEOUT_STREAM')
 
-    exchange.resolveResponse(new Response(stream, { status: frame.statusCode, headers }))
+    exchange.resolveResponse(
+      attachRawHeaders(new Response(stream, { status: frame.statusCode, headers }), frame.headers)
+    )
   }
 
   /**

@@ -838,24 +838,518 @@ export function shouldInjectShim(isNavigation, headers) {
 
 // -- cookies -----------------------------------------------------------------
 //
-// There is deliberately no cookie handling here.
+// The worker keeps its **own** cookie jar (spec section 5.6.2). The browser's
+// cookie store is never involved, in either direction, and cannot be:
 //
-// #72 decided that the Service Worker would re-scope each upstream `Set-Cookie`
-// to `/app/<deviceId>/<serviceId>/` on the way out. That was implemented, and
-// then found not to work: `Set-Cookie` is a *forbidden response-header name*,
-// so the `Response` this worker synthesises cannot carry it, and the algorithm
-// that would parse it is never reached by a worker-supplied response. The
-// request direction is blocked symmetrically - `Cookie` is appended after the
-// worker has already run. Spec section 5.6.2 has the mechanisms and the
-// citations.
+// - `Set-Cookie` is a *forbidden response-header name*, so the `Response` this
+//   worker synthesises cannot carry one - the `Headers` "response" guard drops
+//   it silently - and *parse and store response `Set-Cookie` headers* is only
+//   reached from *HTTP-network-or-cache fetch*, which a worker-supplied
+//   response never enters.
+// - Symmetrically, `Cookie` is appended to a request *after* *handle fetch*, so
+//   `event.request.headers` never contains one. The jar has to supply it.
 //
-// The rewrite was deleted rather than left in place and annotated. Code that
-// looks like working cookie handling, with green tests behind it, is worse than
-// no code at all: the tests passed only because Node's undici does not enforce
-// the response guard a browser does.
+// So the jar reads `Set-Cookie` off the tunnel response frame, stores it under
+// `(deviceId, serviceId)`, and writes `Cookie` into the header pairs handed to
+// the tunnel. Nothing here ever touches `document.cookie` or a `Headers` object
+// that would guard these names.
 //
-// The design that does work - the worker keeping its own jar, keyed by
-// (deviceId, serviceId) - is recorded in section 5.6.2 and belongs to #72.
+// The partition *is* the key. That is what makes this stronger than the
+// `Path`-rewrite it replaces: `HttpOnly` is real because the frame's JS has no
+// access to the jar at all, one service cannot read another's cookies by
+// walking a path, and no `Path` is ever rewritten - so the `__Host-` rule that
+// pins `Path=/` is satisfied rather than fought.
+
+/** Cookies kept per `(deviceId, serviceId)` partition before the oldest go. */
+export const MAX_COOKIES_PER_PARTITION = 50
+
+/** Bound on the drop log. Diagnosis needs the recent ones, not all of them. */
+export const MAX_COOKIE_DROPS = 32
+
+/** Hosts a `Secure` cookie may be accepted on without HTTPS. */
+const TRUSTWORTHY_LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+/**
+ * @typedef {object} StoredCookie
+ * @property {string} name
+ * @property {string} value
+ * @property {string} path Upstream path scope; never rewritten.
+ * @property {number | null} expiresAt Epoch ms, or null for a session cookie.
+ * @property {boolean} secure
+ * @property {boolean} httpOnly
+ * @property {'strict' | 'lax' | 'none' | null} sameSite
+ * @property {number} createdAt Tie-breaker for the `Cookie` header's order.
+ */
+
+/**
+ * @typedef {object} CookieStore
+ * @property {(key: string) => Promise<StoredCookie[] | null>} get
+ * @property {(key: string, cookies: StoredCookie[]) => Promise<void>} put
+ */
+
+/** @typedef {{ name: string, reason: string, raw: string }} CookieDrop */
+
+/**
+ * @typedef {object} CookieReport
+ * @property {string[]} stored Names accepted into the jar.
+ * @property {string[]} removed Names deleted by an expiry or `Max-Age=0`.
+ * @property {CookieDrop[]} dropped Refusals, with the reason for each.
+ */
+
+/**
+ * Is this origin one a `Secure` cookie may be accepted on?
+ *
+ * The platform's own "potentially trustworthy origin" rule, not a Lem-specific
+ * dev switch: HTTPS anywhere, or a loopback host. Production serves the
+ * dashboard over HTTPS and is therefore unaffected by the loopback clause -
+ * which is the point. A build flag or an env var here would be a dev
+ * convenience that silently weakened production; keying off the actual origin
+ * cannot be, because the origin *is* what the rule is about.
+ *
+ * A plain-HTTP dashboard on a LAN address is neither, so it refuses `Secure`
+ * cookies and says so. That is the same answer a browser gives.
+ *
+ * @param {string} origin
+ * @returns {boolean}
+ */
+export function isTrustworthyOrigin(origin) {
+  let url
+  try {
+    url = new URL(origin)
+  } catch {
+    return false
+  }
+  if (url.protocol === 'https:' || url.protocol === 'wss:') return true
+  return TRUSTWORTHY_LOOPBACK.has(url.hostname)
+}
+
+/**
+ * The prefix a cookie name carries, matched **case-insensitively**.
+ *
+ * RFC 6265bis section 4.1.3 describes the prefixes from the *server's* point of
+ * view and says the match is case-sensitive. The requirement that binds an
+ * implementation is in section 5.4 and the storage model of section 5.7, and
+ * there it is case-insensitive (`MUST`) - deliberately, so a case-insensitive
+ * server cannot be tricked into accepting `__SECURE-` as an unprefixed name.
+ *
+ * **tough-cookie matches case-sensitively**, and via jsdom it is this
+ * repository's only cookie oracle, so a `__HOST-`-cased cookie would pass a
+ * suite written against it and fail in a real browser. This matches the way a
+ * user agent must, not the way the oracle does.
+ *
+ * @param {string} name
+ * @returns {'__host-' | '__secure-' | null}
+ */
+export function cookiePrefixOf(name) {
+  const lower = name.toLowerCase()
+  if (lower.startsWith('__host-')) return '__host-'
+  if (lower.startsWith('__secure-')) return '__secure-'
+  return null
+}
+
+/**
+ * RFC 6265 section 5.1.4 default-path: the request path's directory.
+ *
+ * @param {string} requestPath Path only, no query
+ * @returns {string}
+ */
+export function defaultCookiePath(requestPath) {
+  if (!requestPath.startsWith('/')) return '/'
+  const lastSlash = requestPath.lastIndexOf('/')
+  if (lastSlash === 0) return '/'
+  return requestPath.slice(0, lastSlash)
+}
+
+/**
+ * RFC 6265 section 5.1.4 path-match.
+ *
+ * @param {string} requestPath
+ * @param {string} cookiePath
+ * @returns {boolean}
+ */
+export function cookiePathMatches(requestPath, cookiePath) {
+  if (requestPath === cookiePath) return true
+  if (!requestPath.startsWith(cookiePath)) return false
+  if (cookiePath.endsWith('/')) return true
+  return requestPath.charAt(cookiePath.length) === '/'
+}
+
+/**
+ * Reject anything that could break out of the header it will be written into.
+ *
+ * The jar's output is concatenated into a `Cookie` header and serialised into a
+ * tunnel frame by hand. A CR, LF or NUL smuggled through an upstream
+ * `Set-Cookie` would be header injection on the far side, so it is refused at
+ * the point of parsing rather than escaped later.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function hasControlCharacters(text) {
+  return /[\u0000-\u001f\u007f]/.test(text)
+}
+
+/**
+ * Parse one `Set-Cookie` value (RFC 6265 section 5.2).
+ *
+ * Returns the cookie, or the reason it is unusable. Never throws and never
+ * returns silently: a refused cookie that says nothing is the failure mode
+ * section 5.6.2 note 3 records, and it has cost this area two review rounds.
+ *
+ * @param {string} raw
+ * @param {object} context
+ * @param {string} context.requestPath Path the request was made to, no query
+ * @param {number} context.now
+ * @param {boolean} context.secureOrigin
+ * @returns {{ cookie: StoredCookie } | { reason: string, name: string }}
+ */
+export function parseSetCookie(raw, context) {
+  const [pair, ...attributeParts] = raw.split(';')
+  const equals = pair.indexOf('=')
+  if (equals < 0) return { reason: 'no-name-value-pair', name: '' }
+
+  const name = pair.slice(0, equals).trim()
+  const value = pair.slice(equals + 1).trim()
+  if (name === '') return { reason: 'empty-name', name: '' }
+  if (hasControlCharacters(name) || hasControlCharacters(value)) {
+    return { reason: 'control-character', name }
+  }
+
+  /** @type {string | null} */
+  let domain = null
+  /** @type {string | null} */
+  let path = null
+  /** @type {number | null} */
+  let expires = null
+  /** @type {number | null} */
+  let maxAge = null
+  let secure = false
+  let httpOnly = false
+  /** @type {'strict' | 'lax' | 'none' | null} */
+  let sameSite = null
+
+  for (const part of attributeParts) {
+    const split = part.indexOf('=')
+    const attribute = (split < 0 ? part : part.slice(0, split)).trim().toLowerCase()
+    const attributeValue = split < 0 ? '' : part.slice(split + 1).trim()
+    switch (attribute) {
+      case 'domain':
+        // Recorded for the `__Host-` rule below and for the drop report. It has
+        // no scoping effect: see the jar's note on Domain.
+        domain = attributeValue.replace(/^\./, '')
+        break
+      case 'path':
+        // A Path that is not absolute is ignored, and the default-path applies.
+        if (attributeValue.startsWith('/')) path = attributeValue
+        break
+      case 'expires': {
+        const parsed = Date.parse(attributeValue)
+        if (!Number.isNaN(parsed)) expires = parsed
+        break
+      }
+      case 'max-age': {
+        // Max-Age wins over Expires (RFC 6265 section 5.3 step 3).
+        if (/^-?\d+$/.test(attributeValue)) maxAge = Number(attributeValue)
+        break
+      }
+      case 'secure':
+        secure = true
+        break
+      case 'httponly':
+        httpOnly = true
+        break
+      case 'samesite': {
+        const lower = attributeValue.toLowerCase()
+        if (lower === 'strict' || lower === 'lax' || lower === 'none') sameSite = lower
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  const prefix = cookiePrefixOf(name)
+  if (prefix !== null && !secure) return { reason: `${prefix}needs-secure`, name }
+  if (prefix === '__host-') {
+    if (domain !== null) return { reason: '__host-forbids-domain', name }
+    if (path !== null && path !== '/') return { reason: '__host-needs-root-path', name }
+  }
+
+  // A `Secure` cookie is refused on an origin that is not potentially
+  // trustworthy - the same answer a browser gives, and the reason the loopback
+  // clause above is the platform's rule rather than a Lem dev switch.
+  if (secure && !context.secureOrigin) return { reason: 'insecure-origin', name }
+
+  /** @type {number | null} */
+  let expiresAt = null
+  if (maxAge !== null) {
+    expiresAt = maxAge <= 0 ? 0 : context.now + maxAge * 1000
+  } else if (expires !== null) {
+    expiresAt = expires
+  }
+
+  return {
+    cookie: {
+      name,
+      value,
+      // `__host-` forces `/`; everything else keeps what upstream said, or the
+      // request's default-path. No path is ever *rewritten* - the partition is
+      // the key, so there is nothing for a rewrite to buy.
+      path: prefix === '__host-' ? '/' : (path ?? defaultCookiePath(context.requestPath)),
+      expiresAt,
+      secure,
+      httpOnly,
+      sameSite,
+      createdAt: context.now,
+    },
+  }
+}
+
+/**
+ * The worker's cookie jar, partitioned by `(deviceId, serviceId)`.
+ *
+ * **Domain is parsed and then ignored for scoping, deliberately.** The
+ * partition key is the device and the service, not a host. Every request the
+ * jar answers is a request the worker is making to *one* upstream on behalf of
+ * *one* framed service, so a `Domain` attribute could only ever widen a cookie
+ * to hosts this jar has no way to address - honouring it would have no
+ * observable effect, and not honouring it cannot leak, because the key is not
+ * the domain. It is still parsed, because `__Host-` is defined by its absence.
+ *
+ * **SameSite is parsed and recorded, and has no operative effect.** No
+ * cross-site request can arise inside a per-service partition. The
+ * `SameSite=None`-requires-`Secure` pairing is therefore *not* enforced: it
+ * would protect nothing here, while refusing those cookies would break logins
+ * for apps that set them over plain HTTP upstream.
+ *
+ * **HttpOnly is recorded and is universally true in effect.** The jar is not
+ * reachable from the framed realm at all, so every cookie in it is hidden from
+ * the app's own JavaScript whether or not the flag was set. That is the cost
+ * recorded in section 5.6.2: an app whose *client-side* script reads its own
+ * cookie by name will not find it.
+ */
+export class CookieJar {
+  /**
+   * @param {object} options
+   * @param {CookieStore} options.store Persistence, mirroring `BindingStore`
+   * @param {boolean} options.secureOrigin Whether `Secure` may be accepted
+   * @param {() => number} [options.now]
+   */
+  constructor({ store, secureOrigin, now = Date.now }) {
+    this.store = store
+    this.secureOrigin = secureOrigin
+    this.now = now
+
+    /**
+     * Partition key -> the cookies in it, as a promise that resolves once.
+     *
+     * The array is mutated **in place** so that everything already holding it
+     * sees a write, and the promise is cached so two concurrent operations on
+     * one partition serialise behind the same load instead of racing to
+     * overwrite each other with a stale copy.
+     *
+     * @type {Map<string, Promise<StoredCookie[]>>}
+     */
+    this.partitions = new Map()
+
+    /**
+     * Why the jar refused something, most recent last (section 5.6.2 note 3).
+     *
+     * Nothing in the platform reports a refused cookie - no exception, no
+     * console entry - so a jar that cannot say what it dropped is a jar that
+     * believes it succeeded. Both bugs in this area were exactly that.
+     *
+     * @type {CookieDrop[]}
+     */
+    this.drops = []
+
+    this.stats = { stored: 0, removed: 0, dropped: 0, expired: 0, headersSent: 0 }
+  }
+
+  /**
+   * @param {string} key
+   * @returns {Promise<StoredCookie[]>}
+   */
+  partition(key) {
+    const cached = this.partitions.get(key)
+    if (cached !== undefined) return cached
+    const loading = this.store
+      .get(key)
+      .then((rows) => (Array.isArray(rows) ? rows : []))
+      .catch(() => [])
+    this.partitions.set(key, loading)
+    return loading
+  }
+
+  /**
+   * @param {string} name
+   * @param {string} reason
+   * @param {string} raw
+   * @returns {CookieDrop}
+   */
+  recordDrop(name, reason, raw) {
+    const drop = { name, reason, raw }
+    this.drops.push(drop)
+    if (this.drops.length > MAX_COOKIE_DROPS) this.drops.shift()
+    this.stats.dropped += 1
+    console.warn(`[lem-sw] Refused cookie ${name || '(unnamed)'}: ${reason}`)
+    return drop
+  }
+
+  /**
+   * Read the live cookies of a partition, dropping any that have expired.
+   *
+   * Expiry is enforced **here**, on read, not only when a cookie is written: a
+   * jar that only checks at write time keeps sending a cookie the upstream has
+   * already invalidated, for as long as nothing overwrites it.
+   *
+   * @param {string} deviceId
+   * @param {string} serviceId
+   * @returns {Promise<StoredCookie[]>}
+   */
+  async read(deviceId, serviceId) {
+    const key = sessionKey(deviceId, serviceId)
+    if (key === null) return []
+    const cookies = await this.partition(key)
+    const now = this.now()
+    let expired = 0
+    for (let index = cookies.length - 1; index >= 0; index -= 1) {
+      const cookie = cookies[index]
+      if (cookie.expiresAt !== null && cookie.expiresAt <= now) {
+        cookies.splice(index, 1)
+        expired += 1
+      }
+    }
+    if (expired > 0) {
+      this.stats.expired += expired
+      void this.persist(key, cookies)
+    }
+    return cookies
+  }
+
+  /**
+   * Build the `Cookie` header for one request, or null when there is nothing.
+   *
+   * @param {string} deviceId
+   * @param {string} serviceId
+   * @param {string} upstreamPath Path, possibly with a query string
+   * @returns {Promise<string | null>}
+   */
+  async headerFor(deviceId, serviceId, upstreamPath) {
+    const cookies = await this.read(deviceId, serviceId)
+    if (cookies.length === 0) return null
+    const requestPath = pathWithoutQuery(upstreamPath)
+    const matched = cookies.filter((cookie) => cookiePathMatches(requestPath, cookie.path))
+    if (matched.length === 0) return null
+    // RFC 6265 section 5.4: longer paths first, then oldest first.
+    matched.sort((left, right) =>
+      right.path.length !== left.path.length
+        ? right.path.length - left.path.length
+        : left.createdAt - right.createdAt
+    )
+    this.stats.headersSent += 1
+    return matched.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ')
+  }
+
+  /**
+   * Take every `Set-Cookie` off one response's header pairs.
+   *
+   * Each header is its own cookie: they are **not** foldable into one
+   * comma-joined value, which is the section 5.6 correction already recorded
+   * and the reason the wire carries pairs rather than a map.
+   *
+   * @param {string} deviceId
+   * @param {string} serviceId
+   * @param {[string, string][]} pairs Response header pairs from the frame
+   * @param {string} upstreamPath Path the request was made to
+   * @returns {Promise<CookieReport>}
+   */
+  async ingest(deviceId, serviceId, pairs, upstreamPath) {
+    /** @type {CookieReport} */
+    const report = { stored: [], removed: [], dropped: [] }
+    const raws = pairs
+      .filter(([name]) => name.toLowerCase() === 'set-cookie')
+      .map(([, value]) => value)
+    if (raws.length === 0) return report
+
+    const key = sessionKey(deviceId, serviceId)
+    if (key === null) {
+      for (const raw of raws) report.dropped.push(this.recordDrop('', 'no-partition', raw))
+      return report
+    }
+
+    const cookies = await this.partition(key)
+    const requestPath = pathWithoutQuery(upstreamPath)
+
+    for (const raw of raws) {
+      const parsed = parseSetCookie(raw, {
+        requestPath,
+        now: this.now(),
+        secureOrigin: this.secureOrigin,
+      })
+      if ('reason' in parsed) {
+        report.dropped.push(this.recordDrop(parsed.name, parsed.reason, raw))
+        continue
+      }
+      const cookie = parsed.cookie
+      // Identity is (name, path) inside the partition. Domain is not part of
+      // it: see the class note - it has no scoping effect here, so including it
+      // could only split one logical cookie into two.
+      const existing = cookies.findIndex(
+        (candidate) => candidate.name === cookie.name && candidate.path === cookie.path
+      )
+      if (cookie.expiresAt !== null && cookie.expiresAt <= this.now()) {
+        if (existing >= 0) cookies.splice(existing, 1)
+        report.removed.push(cookie.name)
+        this.stats.removed += 1
+        continue
+      }
+      if (existing >= 0) {
+        // RFC 6265 section 5.3 step 11: an overwrite keeps the creation time,
+        // so a refreshed session cookie does not jump the `Cookie` ordering.
+        cookie.createdAt = cookies[existing].createdAt
+        cookies[existing] = cookie
+      } else {
+        cookies.push(cookie)
+      }
+      report.stored.push(cookie.name)
+      this.stats.stored += 1
+    }
+
+    while (cookies.length > MAX_COOKIES_PER_PARTITION) {
+      const evicted = cookies.shift()
+      if (evicted) report.dropped.push(this.recordDrop(evicted.name, 'partition-full', ''))
+    }
+
+    void this.persist(key, cookies)
+    return report
+  }
+
+  /**
+   * @param {string} key
+   * @param {StoredCookie[]} cookies
+   * @returns {Promise<void>}
+   */
+  async persist(key, cookies) {
+    try {
+      await this.store.put(key, [...cookies])
+    } catch {
+      // A jar that cannot persist still works for the life of this worker.
+    }
+  }
+}
+
+/**
+ * Strip the query off a path the jar is asked about.
+ *
+ * @param {string} upstreamPath
+ * @returns {string}
+ */
+function pathWithoutQuery(upstreamPath) {
+  const query = upstreamPath.indexOf('?')
+  const path = query < 0 ? upstreamPath : upstreamPath.slice(0, query)
+  return path === '' ? '/' : path
+}
 
 /**
  * Build the `Headers` for a proxied response.
@@ -881,6 +1375,114 @@ export function buildResponseHeaders(pairs, context) {
   }
   headers.set('Content-Security-Policy', SUBSTITUTED_CSP)
   return headers
+}
+
+/** The worker's database, and the stores in it. */
+const DB_NAME = 'lem-sw'
+const BINDING_OBJECT_STORE = 'clientBindings'
+const COOKIE_OBJECT_STORE = 'cookies'
+
+/**
+ * Version 2 added the cookie jar's store alongside the bindings (section
+ * 5.6.2). Both stores are created on demand rather than only at their
+ * introducing version, so a browser upgrading from 1 and a browser arriving
+ * fresh at 2 end up with the same database.
+ */
+const DB_VERSION = 2
+
+/**
+ * A memoised opener for the worker's database.
+ *
+ * One per store object, which is fine and deliberate: IndexedDB allows several
+ * connections at one version, and the alternative - a module-level singleton -
+ * would keep a handle alive across the fake scopes the tests build.
+ *
+ * @param {IDBFactory} idb
+ * @returns {() => Promise<IDBDatabase>}
+ */
+function createDbOpener(idb) {
+  /** @type {Promise<IDBDatabase> | null} */
+  let opening = null
+  return function open() {
+    if (opening !== null) return opening
+    opening = new Promise((resolve, reject) => {
+      const request = idb.open(DB_NAME, DB_VERSION)
+      request.onupgradeneeded = () => {
+        const db = request.result
+        if (!db.objectStoreNames.contains(BINDING_OBJECT_STORE)) {
+          db.createObjectStore(BINDING_OBJECT_STORE, { keyPath: 'clientId' })
+        }
+        if (!db.objectStoreNames.contains(COOKIE_OBJECT_STORE)) {
+          db.createObjectStore(COOKIE_OBJECT_STORE, { keyPath: 'key' })
+        }
+      }
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'))
+    })
+    return opening
+  }
+}
+
+/**
+ * An in-memory cookie store, used when IndexedDB is unavailable.
+ *
+ * The jar still works for the life of the worker; a restart loses the login.
+ *
+ * @returns {CookieStore}
+ */
+export function createMemoryCookieStore() {
+  /** @type {Map<string, StoredCookie[]>} */
+  const records = new Map()
+  return {
+    get: (key) => Promise.resolve(records.get(key) ?? null),
+    put: (key, cookies) => {
+      records.set(key, cookies)
+      return Promise.resolve()
+    },
+  }
+}
+
+/**
+ * An IndexedDB-backed cookie store.
+ *
+ * A session cookie has to survive the browser killing an idle worker, or a
+ * framed app is logged out every time the user looks away - which is the same
+ * failure this feature exists to fix, arriving a minute late.
+ *
+ * @param {IDBFactory | undefined} factory
+ * @returns {CookieStore}
+ */
+export function createIndexedDbCookieStore(factory) {
+  if (!factory) return createMemoryCookieStore()
+  const open = createDbOpener(factory)
+
+  return {
+    async get(key) {
+      const db = await open()
+      return await new Promise((resolve) => {
+        const request = db
+          .transaction(COOKIE_OBJECT_STORE, 'readonly')
+          .objectStore(COOKIE_OBJECT_STORE)
+          .get(key)
+        request.onsuccess = () => {
+          const record = /** @type {{ cookies: StoredCookie[] } | undefined} */ (request.result)
+          resolve(record?.cookies ?? null)
+        }
+        request.onerror = () => resolve(null)
+      })
+    },
+    async put(key, cookies) {
+      const db = await open()
+      await new Promise((resolve) => {
+        const request = db
+          .transaction(COOKIE_OBJECT_STORE, 'readwrite')
+          .objectStore(COOKIE_OBJECT_STORE)
+          .put({ key, cookies })
+        request.onsuccess = () => resolve(undefined)
+        request.onerror = () => resolve(undefined)
+      })
+    },
+  }
 }
 
 /**
@@ -917,31 +1519,15 @@ export function createMemoryBindingStore() {
  */
 export function createIndexedDbBindingStore(factory) {
   if (!factory) return createMemoryBindingStore()
-  const idb = factory
-
-  /** @type {Promise<IDBDatabase> | null} */
-  let opening = null
-
-  function open() {
-    if (opening !== null) return opening
-    opening = new Promise((resolve, reject) => {
-      const request = idb.open('lem-sw', 1)
-      request.onupgradeneeded = () => {
-        request.result.createObjectStore('clientBindings', { keyPath: 'clientId' })
-      }
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'))
-    })
-    return opening
-  }
+  const open = createDbOpener(factory)
 
   return {
     async get(clientId) {
       const db = await open()
       return await new Promise((resolve) => {
         const request = db
-          .transaction('clientBindings', 'readonly')
-          .objectStore('clientBindings')
+          .transaction(BINDING_OBJECT_STORE, 'readonly')
+          .objectStore(BINDING_OBJECT_STORE)
           .get(clientId)
         request.onsuccess = () => {
           const record = /** @type {StoredBinding | undefined} */ (request.result)
@@ -954,8 +1540,8 @@ export function createIndexedDbBindingStore(factory) {
       const db = await open()
       await new Promise((resolve) => {
         const request = db
-          .transaction('clientBindings', 'readwrite')
-          .objectStore('clientBindings')
+          .transaction(BINDING_OBJECT_STORE, 'readwrite')
+          .objectStore(BINDING_OBJECT_STORE)
           .put({ clientId, ...binding })
         request.onsuccess = () => resolve(undefined)
         request.onerror = () => resolve(undefined)
@@ -977,12 +1563,14 @@ export class LemAppServiceWorker {
    * @param {string} options.origin This worker's origin
    * @param {SwClients} options.clients The `clients` API
    * @param {BindingStore} options.bindingStore Persistent client bindings
+   * @param {CookieJar} options.cookies The per-service cookie jar (section 5.6.2)
    * @param {() => number} [options.now] Clock, for TTL expiry
    */
-  constructor({ origin, clients, bindingStore, now = Date.now }) {
+  constructor({ origin, clients, bindingStore, cookies, now = Date.now }) {
     this.origin = origin
     this.clients = clients
     this.bindingStore = bindingStore
+    this.cookies = cookies
     this.now = now
 
     /** Bindings for live clients. Lost on every worker restart, by design. */
@@ -1369,10 +1957,19 @@ export class LemAppServiceWorker {
       body = await request.arrayBuffer()
     }
 
-    // Note for whoever builds the cookie jar of section 5.6.2: there is no
-    // `Cookie` header in here to forward. The browser appends it *after* this
-    // worker has run, so the jar has to supply one itself at this point.
-    const headers = /** @type {[string, string][]} */ ([...request.headers.entries()])
+    // There is no `Cookie` header in `request.headers` to forward: the browser
+    // appends it *after* this worker has run, so the jar supplies it here. Any
+    // `cookie` that somehow is in there is dropped rather than added to, so a
+    // request can never carry two of them.
+    //
+    // This is a plain array, never a `Headers`. A `Headers` with the "request"
+    // guard drops `Cookie` silently - the mirror of the rule that makes the jar
+    // necessary in the first place - and undici would not have told us.
+    const headers = /** @type {[string, string][]} */ (
+      [...request.headers.entries()].filter(([name]) => name.toLowerCase() !== 'cookie')
+    )
+    const cookieHeader = await this.cookies.headerFor(deviceId, serviceId, upstreamPath)
+    if (cookieHeader !== null) headers.push(['Cookie', cookieHeader])
     const reqId = this.nextRequestId
     this.nextRequestId = this.nextRequestId >= 0xffffffff ? 1 : this.nextRequestId + 1
 
@@ -1459,10 +2056,21 @@ export class LemAppServiceWorker {
             headSettled = true
             const status = typeof message.status === 'number' ? message.status : 502
             const pairs = /** @type {[string, string][]} */ (message.headers ?? [])
-            // `pairs` still carries every upstream `Set-Cookie`, because the
-            // server relays them (#72). This is where the jar of section 5.6.2
-            // would read them; `buildResponseHeaders` drops them, since a
-            // browser would not deliver them to the frame regardless.
+            // `pairs` carries every upstream `Set-Cookie`, because the server
+            // relays them (#72) and the page reads them off the frame rather
+            // than off a guarded `Response`. The jar takes them here;
+            // `buildResponseHeaders` then drops them, because a browser would
+            // not deliver them to the frame regardless.
+            //
+            // Fire-and-forget: the head must resolve now, and the jar's write
+            // lands in an earlier microtask than any request the frame makes in
+            // reaction to this response.
+            void this.cookies.ingest(
+              exchange.deviceId,
+              exchange.serviceId,
+              pairs,
+              exchange.upstreamPath
+            )
             const responseHeaders = buildResponseHeaders(pairs, {
               deviceId: exchange.deviceId,
               serviceId: exchange.serviceId,
@@ -1594,14 +2202,21 @@ function parseSessionKey(key) {
  * is not something a fake scope can supply.
  *
  * @param {LemSwScope} scope
- * @param {{ bindingStore?: BindingStore }} [overrides]
+ * @param {{ bindingStore?: BindingStore, cookieStore?: CookieStore }} [overrides]
  * @returns {LemAppServiceWorker}
  */
 export function installServiceWorker(scope, overrides = {}) {
+  const origin = scope.location.origin
   const worker = new LemAppServiceWorker({
-    origin: scope.location.origin,
+    origin,
     clients: scope.clients,
     bindingStore: overrides.bindingStore ?? createIndexedDbBindingStore(scope.indexedDB),
+    cookies: new CookieJar({
+      store: overrides.cookieStore ?? createIndexedDbCookieStore(scope.indexedDB),
+      // The dashboard's origin decides whether `Secure` is acceptable, because
+      // that is the origin this jar belongs to.
+      secureOrigin: isTrustworthyOrigin(origin),
+    }),
   })
 
   // No skipWaiting()/clients.claim(): a newly deployed worker takes over on the

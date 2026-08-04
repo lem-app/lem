@@ -190,22 +190,31 @@ DOM and its storage. What we do about it:
 wildcard certificate. It is planned, not shipped. Until then, trust in a
 service you launch remotely is the security control.
 
-### Cookies are not delivered to remotely-viewed services
-
-**A framed app cannot sign you in.** This is a functional limitation, not a
-security boundary, and it should not be mistaken for one.
+### Cookies for remotely-viewed services are held by Lem, not by your browser
 
 `Set-Cookie` is a forbidden response-header name: a Service Worker cannot
 attach a cookie to a response it synthesises, and the browser never runs the
 step that would store one. So **no cookie from a service you view remotely ever
-reaches your browser** — anything needing a login session will not hold it.
-Tracked in [#72](https://github.com/lem-app/lem/issues/72), whose fix is for the
-worker to keep its own per-service jar. Read-only and anonymous apps are
-unaffected.
+reaches your browser's cookie store.**
 
-Because no cookie exists, there is nothing partitioned and nothing isolated
-here — do not read this as "cookies are isolated per service". Per-service
-origins remain the actual boundary, as above.
+Instead the Service Worker keeps **its own cookie jar**, one per service, and
+attaches the right cookies to that service's requests itself
+([#72](https://github.com/lem-app/lem/issues/72)). Signing in to a remotely
+viewed app therefore has a working code path — though **it has not yet been
+confirmed against a real app end to end**
+([#6](https://github.com/lem-app/lem/issues/6)).
+
+Two consequences worth knowing:
+
+- **An app whose own JavaScript reads a cookie by name will not find it.**
+  `document.cookie` in the frame sees nothing. Session cookies marked
+  `HttpOnly` — the overwhelming majority, and the ones logins rely on — are
+  unaffected.
+- **This is a functional partition, not a security boundary.** One service's
+  cookies are genuinely unreachable from another service's frame, which is
+  stronger than it was; but a hostile framed app still shares the dashboard's
+  origin and is not contained by it. Per-service origins remain the actual
+  boundary, as above.
 
 ## 📖 Documentation
 

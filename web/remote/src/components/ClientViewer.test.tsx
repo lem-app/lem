@@ -141,12 +141,17 @@ describe('what ClientViewer tells the user about the tunnel', () => {
 
   // Presence-plus-scope tied to an issue number, so that closing #72 makes this
   // stale rather than leaving a claim that is simply false.
-  it('says cookies are not delivered to framed apps, and cites #72', async () => {
+  it('says cookies are held per service rather than by the browser, and cites #72', async () => {
     renderViewer('http://localhost:3000/', fakeBridge())
 
     const text = await noteText()
 
-    expect(text).toMatch(/cookies are not delivered to framed apps/i)
+    expect(text).toMatch(/kept per service/i)
+    // The cost has to travel with the capability, or the note overclaims: the
+    // app's own JavaScript still cannot read these cookies, and no real sign-in
+    // has been confirmed end to end.
+    expect(text).toMatch(/will not find it/i)
+    expect(text).toMatch(/not yet been confirmed/i)
     expect(text).toContain('#72')
   })
 
