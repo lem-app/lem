@@ -403,6 +403,15 @@ export interface Harness {
   network: FakeNetwork
   bindingStore: BindingStore
   cookieStore: CookieStore
+  /**
+   * Post to the worker as an arbitrary client, the way a framed app can.
+   *
+   * A framed service is a controlled client, so it can reach the worker with
+   * `navigator.serviceWorker.controller.postMessage`. This is how a test plays
+   * the attacker rather than a stand-in for one: `clientUrl` becomes
+   * `event.source.url`.
+   */
+  postAsClient: (clientUrl: string | null, message: unknown, transfer?: Transferable[]) => void
   /** Replace the worker with a fresh one over the same store, as a restart does. */
   restartWorker: () => Promise<LemAppServiceWorker>
   dispatch: (url: string, options?: DispatchOptions) => Promise<DispatchResult>
@@ -467,7 +476,14 @@ export async function createHarness(
   const listeners = new Map<string, Set<EventListener>>()
   const controller: FakeWorkerHandle = {
     postMessage: (message, transfer) => {
-      emit('message', { data: message, ports: (transfer ?? []) as MessagePort[] })
+      // `source` is the dashboard's own client. A real `ExtendableMessageEvent`
+      // always carries one, and the worker now refuses messages without it, so
+      // a fake that omitted it would be testing a shape no browser produces.
+      emit('message', {
+        data: message,
+        ports: (transfer ?? []) as MessagePort[],
+        source: { id: 'dashboard', url: `${ORIGIN}/` },
+      })
     },
   }
 
@@ -512,6 +528,14 @@ export async function createHarness(
     network,
     bindingStore,
     cookieStore,
+    postAsClient: (clientUrl, message, transfer) => {
+      emit('message', {
+        data: message,
+        ports: (transfer ?? []) as MessagePort[],
+        // null models a sender the worker cannot establish at all.
+        source: clientUrl === null ? null : { id: 'hostile', url: clientUrl },
+      })
+    },
     restartWorker: async () => {
       // A restarted worker keeps nothing but what it persisted, which is the
       // whole point of resolution step 4.

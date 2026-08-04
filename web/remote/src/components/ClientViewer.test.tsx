@@ -155,6 +155,20 @@ describe('what ClientViewer tells the user about the tunnel', () => {
     expect(text).toContain('#72')
   })
 
+  // The separation is functional, not a boundary: the jar is plaintext in
+  // origin-scoped IndexedDB and every framed service shares that origin. A user
+  // deciding whether to sign in needs that at the moment of deciding, so it is
+  // asserted here and not only in the README.
+  it('warns that any framed service can read every other service’s cookies', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    expect(text).toMatch(/read every other service/i)
+    expect(text).toMatch(/not a security boundary/i)
+    expect(text).toMatch(/only launch services you trust/i)
+  })
+
   // Cross-origin URLs are deliberately not intercepted (spec 3.8), so a user
   // must not be told their third-party traffic goes via their device.
   it('says third-party resources are fetched by this browser directly', async () => {

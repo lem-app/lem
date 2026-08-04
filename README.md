@@ -204,17 +204,33 @@ viewed app therefore has a working code path — though **it has not yet been
 confirmed against a real app end to end**
 ([#6](https://github.com/lem-app/lem/issues/6)).
 
-Two consequences worth knowing:
+> [!WARNING]
+> **A service you view remotely can read the login cookies of every other
+> service you view remotely.** The jar is stored unencrypted in your browser's
+> IndexedDB, which is shared by everything on the dashboard's origin — and a
+> framed service runs on that origin. So a malicious or compromised service can
+> read the whole jar, including other services' session cookies and those for
+> other devices. `HttpOnly` does **not** protect against this: the flag is
+> recorded, but the cookie is not in the browser's cookie store where the flag
+> would mean anything.
+>
+> This cannot be fixed while every service shares one origin. Per-service
+> origins is the fix, and it is not shipped.
+> **Only launch services you trust — and prefer not to sign in to a service you
+> would not trust with your other services' sessions.**
+
+Two more consequences worth knowing:
 
 - **An app whose own JavaScript reads a cookie by name will not find it.**
-  `document.cookie` in the frame sees nothing. Session cookies marked
-  `HttpOnly` — the overwhelming majority, and the ones logins rely on — are
-  unaffected.
-- **This is a functional partition, not a security boundary.** One service's
-  cookies are genuinely unreachable from another service's frame, which is
-  stronger than it was; but a hostile framed app still shares the dashboard's
-  origin and is not contained by it. Per-service origins remain the actual
-  boundary, as above.
+  `document.cookie` in the frame sees nothing.
+- **The per-service split is functional, not a security boundary.** It decides
+  which cookies Lem attaches to which request. It does not keep one service's
+  cookies away from another service's code — see the warning above.
+
+Why ship it anyway: without the jar, remotely viewed apps **cannot log in at
+all**. And the alternative it replaces — one shared browser cookie jar for the
+whole origin — is worse, because your browser would automatically *send* every
+service's cookies to every other service without anything having to attack it.
 
 ## 📖 Documentation
 

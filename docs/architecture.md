@@ -352,11 +352,17 @@ later requests without the browser's cookie store ever being involved
 ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2,
 [#72](https://github.com/lem-app/lem/issues/72)).
 
-Two consequences worth stating plainly. `HttpOnly` becomes real rather than emulated and the
-per-service partition is genuine, because the frame's JavaScript cannot reach the jar at all.
-The cost is the mirror image: `document.cookie` inside the frame sees none of it, so an app
-whose *client-side* script reads its own cookie by name will not find it. **Nothing here has
-been confirmed against a real app** — socket.io and the full sign-in flow remain unverified.
+**This is a functional partition, not a security boundary.** The jar is plaintext in IndexedDB,
+which is scoped per origin rather than per realm, and a framed service is same-origin with the
+dashboard by construction — so it can read every service's cookies out of `lem-sw` if it wants
+to. `HttpOnly` is *not* preserved by this design, and an earlier draft of this paragraph wrongly
+said it was. Per-service origins remains the actual boundary
+([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §8.4).
+
+What it buys is that login works at all, and that the `__Host-`/`Path` conflict disappears. The
+cost is the mirror image: `document.cookie` inside the frame sees none of it, so an app whose
+*client-side* script reads its own cookie by name will not find it. **Nothing here has been
+confirmed against a real app** — socket.io and the full sign-in flow remain unverified.
 
 Beyond that, no run against a real Open WebUI from a second machine has happened; the procedure
 that settles it is [`testing_checklist.md`](./testing_checklist.md) §4.1. Full design:

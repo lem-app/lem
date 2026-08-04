@@ -429,6 +429,14 @@ export function ClientViewer({
                   ). An app whose own JavaScript reads a cookie by name will not find it, and
                   sign-in has not yet been confirmed against a real app end to end.
                 </p>
+                <p className="text-xs text-muted-foreground">
+                  <strong>
+                    Any service you view can read every other service's login cookies.
+                  </strong>{' '}
+                  They are stored unencrypted on this dashboard's origin, which every framed service
+                  shares, so this separation is a convenience and not a security boundary. Only
+                  launch services you trust.
+                </p>
               </div>
             </CardContent>
           </Card>

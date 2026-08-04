@@ -442,6 +442,44 @@ export function bindingFromUrl(raw, origin) {
 }
 
 /**
+ * Is this client the dashboard itself, rather than a framed service?
+ *
+ * Used to decide who may send the worker a control message. Three rules, and
+ * the third is the one that matters:
+ *
+ * 1. It must parse, and be on this origin.
+ * 2. It must **not** be under `/app/` - that is a framed service.
+ * 3. It must be an `http:`/`https:` document. A `blob:` URL reports
+ *    `origin === this origin` and a `pathname` of
+ *    `https://host/<uuid>`, which is not under `/app/` and would therefore pass
+ *    rules 1 and 2 while being exactly the thing being kept out: a Worker a
+ *    framed app minted with `URL.createObjectURL`. `data:` is refused for the
+ *    same reason.
+ *
+ * **This is not a security boundary and must not be described as one.** The
+ * framed service is same-origin with the dashboard, so a determined one can
+ * reach `window.parent` and act *as* the dashboard, and no check on the sender
+ * can see the difference. What this closes is the unprivileged path - a frame
+ * that simply posts a message - which was reachable with no such effort.
+ *
+ * @param {string | null | undefined} raw Client URL
+ * @param {string} origin
+ * @returns {boolean}
+ */
+export function isDashboardClientUrl(raw, origin) {
+  if (!raw) return false
+  let url
+  try {
+    url = new URL(raw, origin)
+  } catch {
+    return false
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false
+  if (url.origin !== origin) return false
+  return parseAppPath(url.pathname) === null
+}
+
+/**
  * Build an RFC 7807 problem detail response, the same shape the local server
  * already uses for its own errors.
  *
@@ -854,17 +892,53 @@ export function shouldInjectShim(isNavigation, headers) {
 // the tunnel. Nothing here ever touches `document.cookie` or a `Headers` object
 // that would guard these names.
 //
-// The partition *is* the key. That is what makes this stronger than the
-// `Path`-rewrite it replaces: `HttpOnly` is real because the frame's JS has no
-// access to the jar at all, one service cannot read another's cookies by
-// walking a path, and no `Path` is ever rewritten - so the `__Host-` rule that
-// pins `Path=/` is satisfied rather than fought.
+// The partition *is* the key, so no `Path` is ever rewritten - the `__Host-`
+// rule that pins `Path=/` is satisfied rather than fought.
+//
+// **This partition is functional, not a security boundary. Do not describe it
+// as one.** The store below is plaintext in IndexedDB, and IndexedDB is scoped
+// per *origin*, not per realm. A framed service is same-origin with the
+// dashboard by construction - that is the premise the whole proxy rests on - so
+// it can open `lem-sw` and read every service's cookies on every device.
+// `HttpOnly` is **not** preserved here: the flag is recorded, but the value is
+// simply somewhere `document.cookie` does not look. An earlier revision of this
+// comment claimed otherwise and was wrong.
+//
+// It is not fixable within one origin: any key this worker can retrieve,
+// same-origin JS can retrieve too, and a key held only in memory dies on the
+// restart the persistence exists for. Per-service origins is the boundary. What
+// the jar buys is that login works at all - and it still beats the unavailable
+// alternative, a shared browser jar that would *send* each service's cookies to
+// every other service on this origin without being attacked.
 
 /** Cookies kept per `(deviceId, serviceId)` partition before the oldest go. */
 export const MAX_COOKIES_PER_PARTITION = 50
 
 /** Bound on the drop log. Diagnosis needs the recent ones, not all of them. */
 export const MAX_COOKIE_DROPS = 32
+
+/** Bound on the refused-control log, for the same reason. */
+export const MAX_REFUSED_CONTROL = 32
+
+/**
+ * Control messages that may only arrive over the bridge port.
+ *
+ * Every one of them changes what the worker will route, or where. A framed
+ * service that could send them could open a session for a service it does not
+ * own and then steer an unattributable request onto it - which is how a forged
+ * `LEM_SESSION_OPEN` plus a `blob:` Worker turns into another service's session
+ * cookie on the wire.
+ *
+ * `LEM_BRIDGE_INIT` is deliberately absent: it is the message that delivers the
+ * port, so it cannot require the port. It is gated by the sender check instead.
+ */
+const BRIDGE_PORT_ONLY_MESSAGES = new Set([
+  'LEM_ACTIVE_DEVICE',
+  'LEM_SESSION_OPEN',
+  'LEM_SESSION_CLOSE',
+  'LEM_TUNNEL_UP',
+  'LEM_TUNNEL_DOWN',
+])
 
 /** Hosts a `Secure` cookie may be accepted on without HTTPS. */
 const TRUSTWORTHY_LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -1122,11 +1196,14 @@ export function parseSetCookie(raw, context) {
  * would protect nothing here, while refusing those cookies would break logins
  * for apps that set them over plain HTTP upstream.
  *
- * **HttpOnly is recorded and is universally true in effect.** The jar is not
- * reachable from the framed realm at all, so every cookie in it is hidden from
- * the app's own JavaScript whether or not the flag was set. That is the cost
- * recorded in section 5.6.2: an app whose *client-side* script reads its own
- * cookie by name will not find it.
+ * **HttpOnly is recorded and enforces nothing.** It is kept so the jar can
+ * report what upstream sent, and because a future per-service-origin design
+ * will need it. It is *not* honoured as a protection: the jar's contents are
+ * readable by any same-origin script (see the section note above), so a cookie
+ * in here is hidden from `document.cookie` and from nothing else.
+ *
+ * The functional cost recorded in section 5.6.2 still applies: an app whose
+ * *client-side* script reads its own cookie by name will not find it.
  */
 export class CookieJar {
   /**
@@ -1615,28 +1692,79 @@ export class LemAppServiceWorker {
       forbidden: 0,
       bridgeTimeouts: 0,
       passedThrough: 0,
+      refusedControlMessages: 0,
+      unattributableClients: 0,
     }
+
+    /**
+     * Control messages the worker refused, most recent last.
+     *
+     * @type {{ type: string, reason: string }[]}
+     */
+    this.refusedControl = []
   }
 
   // -- page messages ---------------------------------------------------------
 
   /**
+   * Refuse a control message, loudly.
+   *
+   * Visible for the same reason a refused cookie is (section 5.6.2 note 3): a
+   * silently ignored forgery is as hard to diagnose as a silently dropped one,
+   * and this path is the one an attack would exercise.
+   *
+   * @param {string} type
+   * @param {string} reason
+   * @returns {void}
+   */
+  refuseControlMessage(type, reason) {
+    this.stats.refusedControlMessages += 1
+    this.refusedControl.push({ type, reason })
+    if (this.refusedControl.length > MAX_REFUSED_CONTROL) this.refusedControl.shift()
+    console.warn(`[lem-sw] Refused control message ${type}: ${reason}`)
+  }
+
+  /**
    * Handle one message from the dashboard page.
+   *
+   * `trusted` means the message arrived over the **bridge port**, which is a
+   * capability rather than an identity: the port is created by the dashboard
+   * and handed over in `LEM_BRIDGE_INIT`, so holding it is the proof. Every
+   * message that changes session or device state requires it, and in production
+   * the dashboard already sends all of them that way (`sw-bridge.ts` `post()`)
+   * - so this gate costs nothing and closes the forgery path.
    *
    * @param {unknown} data
    * @param {readonly MessagePort[]} ports
+   * @param {boolean} [trusted] Arrived over the authenticated bridge port
    * @returns {void}
    */
-  handleMessage(data, ports = []) {
+  handleMessage(data, ports = [], trusted = false) {
     if (typeof data !== 'object' || data === null) return
     const message = /** @type {Record<string, unknown>} */ (data)
+
+    // The second of two independent gates. The first is the sender check in
+    // `installServiceWorker`, which keeps framed clients out entirely; this one
+    // means that even a sender that passed it cannot change session state
+    // without the port. `LEM_BRIDGE_INIT` is necessarily exempt - it is the
+    // message that *delivers* the port - so it rests on the sender check alone.
+    if (
+      !trusted &&
+      typeof message.type === 'string' &&
+      BRIDGE_PORT_ONLY_MESSAGES.has(message.type)
+    ) {
+      this.refuseControlMessage(message.type, 'not-over-bridge-port')
+      return
+    }
 
     switch (message.type) {
       case 'LEM_BRIDGE_INIT': {
         const port = ports[0]
         if (!port) return
         this.bridgePort = port
-        port.onmessage = (event) => this.handleMessage(event.data)
+        // Anything arriving on this port is trusted: only the holder of the
+        // other end can post to it, and the dashboard minted the channel.
+        port.onmessage = (event) => this.handleMessage(event.data, [], true)
         port.start?.()
         this.notifyBridgeWaiters()
         return
@@ -1838,6 +1966,7 @@ export class LemAppServiceWorker {
     // 3. The client's own URL. Survives `Referrer-Policy: no-referrer`, and
     //    works for window, worker and sharedworker clients alike - a worker the
     //    app spawned was itself loaded from inside the prefix.
+    let sawUnattributableClient = false
     if (clientId) {
       const client = await this.clients.get(clientId)
       const fromClient = client ? bindingFromUrl(client.url, this.origin) : null
@@ -1845,6 +1974,17 @@ export class LemAppServiceWorker {
         this.stats.resolvedByClientUrl += 1
         this.bindClient(clientId, fromClient)
         return fromClient
+      }
+      // We could read this client's URL and it does not live in any service.
+      // A `blob:` or `data:` Worker is the case that matters: a framed app can
+      // mint one with `URL.createObjectURL`, and its requests carry no prefix,
+      // no referrer and a URL no step above can attribute. Such a client must
+      // never reach the fallback below - "the only session open" would hand it
+      // another service's session, and the jar would then attach that service's
+      // cookie. That is the theft this rule exists to stop, and it needs no
+      // forged message to set up.
+      if (client && typeof client.url === 'string' && client.url !== '') {
+        sawUnattributableClient = true
       }
     }
 
@@ -1857,6 +1997,23 @@ export class LemAppServiceWorker {
         this.clientBindings.set(clientId, binding)
         return binding
       }
+    }
+
+    // 4b. A client we could see, that belongs to no service, never reaches the
+    //     fallback. The fallback exists for a request whose owner we could not
+    //     look up at all; it is not a licence to give a `blob:` Worker whatever
+    //     session happens to be open. Failing closed here costs such a Worker
+    //     the requests that used to succeed **by luck** - only ever when
+    //     exactly one service was open - and that luck was indistinguishable
+    //     from the attack. A 421 says so; a stolen cookie says nothing.
+    if (sawUnattributableClient) {
+      this.stats.unattributableClients += 1
+      console.warn(
+        `[lem-sw] Refusing to guess a session for ${event.request.url}: the client that made ` +
+          'it belongs to no service. A Worker created from a blob: or data: URL cannot be ' +
+          'attributed, so it is not served rather than being given the only open session.'
+      )
+      return null
     }
 
     // 5. Single open session on the active device. Sessions for any other
@@ -2239,9 +2396,31 @@ export function installServiceWorker(scope, overrides = {}) {
 
   scope.addEventListener(
     'message',
-    /** @param {{ data: unknown, ports: readonly MessagePort[] }} event */
+    /**
+     * The first of two gates: who is allowed to speak to the worker at all.
+     *
+     * `event.source` is the `Client` that posted. A framed service is a
+     * controlled client too, so without this check any framed app could send
+     * `LEM_SESSION_OPEN` for a service it does not own - and then steer an
+     * unattributable request onto that session and have the jar attach the
+     * victim's cookie. Reading `event.source` is the whole difference.
+     *
+     * @param {{ data: unknown, ports: readonly MessagePort[], source?: { url?: unknown } | null }} event
+     */
     (event) => {
-      worker.handleMessage(event.data, event.ports)
+      const source = event.source
+      const url = source && typeof source.url === 'string' ? source.url : null
+      if (!isDashboardClientUrl(url, origin)) {
+        const type =
+          typeof event.data === 'object' && event.data !== null
+            ? String(/** @type {Record<string, unknown>} */ (event.data).type)
+            : 'unknown'
+        // Fail closed on a missing source too: a message whose sender cannot be
+        // established is not one to act on.
+        worker.refuseControlMessage(type, url === null ? 'unknown-sender' : `framed-sender ${url}`)
+        return
+      }
+      worker.handleMessage(event.data, event.ports, false)
     }
   )
 
