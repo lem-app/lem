@@ -63,6 +63,6 @@ dev = [
     "pytest-cov>=5.0.0",
     "httpx>=0.27.0",
     "mypy>=2.3.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
     "types-python-jose>=3.5.0.20260408",
 ]
