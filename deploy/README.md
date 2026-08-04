@@ -180,8 +180,8 @@ Plus optional:
 
 ### Support
 
-- GitHub Issues: https://github.com/lem/lem/issues
-- Discord: [Join our community]
+- GitHub Issues: https://github.com/lem-app/lem/issues
+- Discord: [Join our community](https://discord.gg/xY4XXKJDZZ)
 
 ---
 
