@@ -762,8 +762,11 @@ describe('the same-origin Service Worker proxy', () => {
     it('are taken by the jar rather than handed to the frame', async () => {
       // The worker mirrors the browser instead of diverging from it: an upstream
       // cookie reaches the worker (the server relays it, which the jar needs),
-      // is stored in the jar, and goes no further. The frame sees nothing, which
-      // is what makes `HttpOnly` real here rather than emulated.
+      // is stored in the jar, and goes no further. What this pins is that the
+      // cookie is not handed to the frame *as a response header* — nothing more.
+      // It is emphatically NOT evidence that `HttpOnly` is real: the jar sits in
+      // same-origin IndexedDB, which the framed realm can open and read itself.
+      // See spec section 5.6.2 and #94.
       harness.tunnel.serve(() => ({
         status: 200,
         headers: [
