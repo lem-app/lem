@@ -49,8 +49,10 @@ import { ServiceWorkerBridge, SW_SCOPE } from '../lib/sw-bridge'
 import {
   LemAppServiceWorker,
   createMemoryBindingStore,
+  createMemoryCookieStore,
   installServiceWorker,
   type BindingStore,
+  type CookieStore,
 } from '../../public/lem-app-sw.js'
 
 /** Origin the dashboard and the framed apps share; matches `vitest.config.ts`. */
@@ -267,6 +269,11 @@ export function persistentBindingStore(): BindingStore {
   return createMemoryBindingStore()
 }
 
+/** A cookie store that outlives a worker, exactly as IndexedDB does. */
+export function persistentCookieStore(): CookieStore {
+  return createMemoryCookieStore()
+}
+
 /** Everything the browser would have fetched itself. */
 export class FakeNetwork {
   readonly requests: string[] = []
@@ -288,6 +295,9 @@ export class FakeNetwork {
     })
   }
 }
+
+/** The shape `ServiceWorkerBridge` wants for its tunnel fetch. */
+export type ProxyFetchLike = (url: string, init?: RequestInit) => Promise<Response>
 
 export interface DispatchOptions {
   clientId?: string
@@ -392,6 +402,16 @@ export interface Harness {
   clients: FakeClients
   network: FakeNetwork
   bindingStore: BindingStore
+  cookieStore: CookieStore
+  /**
+   * Post to the worker as an arbitrary client, the way a framed app can.
+   *
+   * A framed service is a controlled client, so it can reach the worker with
+   * `navigator.serviceWorker.controller.postMessage`. This is how a test plays
+   * the attacker rather than a stand-in for one: `clientUrl` becomes
+   * `event.source.url`.
+   */
+  postAsClient: (clientUrl: string | null, message: unknown, transfer?: Transferable[]) => void
   /** Replace the worker with a fresh one over the same store, as a restart does. */
   restartWorker: () => Promise<LemAppServiceWorker>
   dispatch: (url: string, options?: DispatchOptions) => Promise<DispatchResult>
@@ -405,10 +425,24 @@ interface FakeWorkerHandle {
  * Build the whole proxy: worker, bridge, tunnel and fakes, already connected.
  */
 export async function createHarness(
-  options: { deviceId?: string; bindingStore?: BindingStore } = {}
+  options: {
+    deviceId?: string
+    bindingStore?: BindingStore
+    cookieStore?: CookieStore
+    /**
+     * Wrap the page's tunnel fetch.
+     *
+     * The seam exists for one thing Node cannot do by itself: hand the bridge
+     * the `Response` a *browser* would have built, with `Set-Cookie` already
+     * removed by the "response" header guard. undici does not enforce that
+     * guard, so a test that needs the browser's response has to construct it.
+     */
+    proxyFetch?: (inner: (url: string, init?: RequestInit) => Promise<Response>) => ProxyFetchLike
+  } = {}
 ): Promise<Harness> {
   const deviceId = options.deviceId ?? 'dev-7f3a'
   const bindingStore = options.bindingStore ?? persistentBindingStore()
+  const cookieStore = options.cookieStore ?? persistentCookieStore()
   const clients = new FakeClients()
   const network = new FakeNetwork()
   const tunnel = new FakeTunnel()
@@ -428,7 +462,7 @@ export async function createHarness(
 
   const buildWorker = (): LemAppServiceWorker => {
     swListeners.clear()
-    return installServiceWorker(scope, { bindingStore })
+    return installServiceWorker(scope, { bindingStore, cookieStore })
   }
 
   const emit = (type: string, event: unknown): void => {
@@ -442,7 +476,14 @@ export async function createHarness(
   const listeners = new Map<string, Set<EventListener>>()
   const controller: FakeWorkerHandle = {
     postMessage: (message, transfer) => {
-      emit('message', { data: message, ports: (transfer ?? []) as MessagePort[] })
+      // `source` is the dashboard's own client. A real `ExtendableMessageEvent`
+      // always carries one, and the worker now refuses messages without it, so
+      // a fake that omitted it would be testing a shape no browser produces.
+      emit('message', {
+        data: message,
+        ports: (transfer ?? []) as MessagePort[],
+        source: { id: 'dashboard', url: `${ORIGIN}/` },
+      })
     },
   }
 
@@ -460,8 +501,9 @@ export async function createHarness(
     },
   } as unknown as ServiceWorkerContainer
 
+  const innerFetch = (url: string, init?: RequestInit): Promise<Response> => proxy.fetch(url, init)
   const bridge = new ServiceWorkerBridge({
-    proxyFetch: (url, init) => proxy.fetch(url, init),
+    proxyFetch: options.proxyFetch ? options.proxyFetch(innerFetch) : innerFetch,
     container,
     secureContext: true,
   })
@@ -485,6 +527,15 @@ export async function createHarness(
     clients,
     network,
     bindingStore,
+    cookieStore,
+    postAsClient: (clientUrl, message, transfer) => {
+      emit('message', {
+        data: message,
+        ports: (transfer ?? []) as MessagePort[],
+        // null models a sender the worker cannot establish at all.
+        source: clientUrl === null ? null : { id: 'hostile', url: clientUrl },
+      })
+    },
     restartWorker: async () => {
       // A restarted worker keeps nothing but what it persisted, which is the
       // whole point of resolution step 4.

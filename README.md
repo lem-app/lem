@@ -190,22 +190,47 @@ DOM and its storage. What we do about it:
 wildcard certificate. It is planned, not shipped. Until then, trust in a
 service you launch remotely is the security control.
 
-### Cookies are not delivered to remotely-viewed services
-
-**A framed app cannot sign you in.** This is a functional limitation, not a
-security boundary, and it should not be mistaken for one.
+### Cookies for remotely-viewed services are held by Lem, not by your browser
 
 `Set-Cookie` is a forbidden response-header name: a Service Worker cannot
 attach a cookie to a response it synthesises, and the browser never runs the
 step that would store one. So **no cookie from a service you view remotely ever
-reaches your browser** — anything needing a login session will not hold it.
-Tracked in [#72](https://github.com/lem-app/lem/issues/72), whose fix is for the
-worker to keep its own per-service jar. Read-only and anonymous apps are
-unaffected.
+reaches your browser's cookie store.**
 
-Because no cookie exists, there is nothing partitioned and nothing isolated
-here — do not read this as "cookies are isolated per service". Per-service
-origins remain the actual boundary, as above.
+Instead the Service Worker keeps **its own cookie jar**, one per service, and
+attaches the right cookies to that service's requests itself
+([#72](https://github.com/lem-app/lem/issues/72)). Signing in to a remotely
+viewed app therefore has a working code path — though **it has not yet been
+confirmed against a real app end to end**
+([#6](https://github.com/lem-app/lem/issues/6)).
+
+> [!WARNING]
+> **A service you view remotely can read the login cookies of every other
+> service you view remotely.** The jar is stored unencrypted in your browser's
+> IndexedDB, which is shared by everything on the dashboard's origin — and a
+> framed service runs on that origin. So a malicious or compromised service can
+> read the whole jar, including other services' session cookies and those for
+> other devices. `HttpOnly` does **not** protect against this: the flag is
+> recorded, but the cookie is not in the browser's cookie store where the flag
+> would mean anything.
+>
+> This cannot be fixed while every service shares one origin. Per-service
+> origins is the fix, and it is not shipped.
+> **Only launch services you trust — and prefer not to sign in to a service you
+> would not trust with your other services' sessions.**
+
+Two more consequences worth knowing:
+
+- **An app whose own JavaScript reads a cookie by name will not find it.**
+  `document.cookie` in the frame sees nothing.
+- **The per-service split is functional, not a security boundary.** It decides
+  which cookies Lem attaches to which request. It does not keep one service's
+  cookies away from another service's code — see the warning above.
+
+Why ship it anyway: without the jar, remotely viewed apps **cannot log in at
+all**. And the alternative it replaces — one shared browser cookie jar for the
+whole origin — is worse, because your browser would automatically *send* every
+service's cookies to every other service without anything having to attack it.
 
 ## 📖 Documentation
 

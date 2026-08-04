@@ -322,7 +322,8 @@ binding, so a stale binding is *detectable* rather than invisible:
 | 2 | `event.request.referrer` | For a subresource fetched by the iframe document this is the iframe's own URL, e.g. `https://remote.lem.gg/app/dev-7f3a/openwebui/`. Same-origin, so the default `strict-origin-when-cross-origin` policy sends the full path. Parse `/app/<deviceId>/<serviceId>/` out of it and, if `event.clientId` is non-empty, cache the binding. |
 | 3 | `await clients.get(event.clientId)` → `client.url` | Survives an empty referrer (`Referrer-Policy: no-referrer` set by the app, `<meta name=referrer>`, `fetch(..., {referrerPolicy:'no-referrer'})`) because it does not depend on the referrer at all. Works for `window`, `worker`, and `sharedworker` clients — a worker the app spawned was itself loaded from `/app/<deviceId>/<serviceId>/…`, so its `client.url` carries the full prefix. |
 | 4 | IndexedDB store `lem-sw/clientBindings` | The in-memory map is lost every time the browser kills an idle SW. Every binding written in steps B/2/3 is mirrored here with a 24 h TTL, and this step reads it back. Records are `{clientId, deviceId, serviceId, expiresAt}` — **keyed by `clientId`, storing `deviceId`**, which is what lets the caller reject a binding written for a device the dashboard has since left. |
-| 5 | Single-session fallback | If exactly one service session is open **on the active device**, use it. Log a warning with the request URL — hitting this step routinely means steps 1–4 have a bug. Sessions for any other device are not candidates. |
+| 4b | **Unattributable client → stop** | If step 3 *found* a client and its URL belongs to no service, fail closed here rather than continuing. A Worker created from a `blob:` or `data:` URL is the case that matters: a framed app can mint one, and its requests carry no prefix, no referrer and a URL no step above can attribute. Letting it reach step 5 handed it whatever session was open — and the cookie jar then attached that service's cookie to a real tunnel request. **That needed no forged message; it was reachable by any framed service.** Added in [#93](https://github.com/lem-app/lem/pull/93) after adversarial review. |
+| 5 | Single-session fallback | If exactly one service session is open **on the active device**, use it. Log a warning with the request URL — hitting this step routinely means steps 1–4 have a bug. Sessions for any other device are not candidates. Reachable only for a client the worker could *not* look up at all, per 4b. |
 | 6 | **Fail closed** | Return a synthetic `421 Misdirected Request` (§7.1) whose body names the unresolvable URL. Never guess between two sessions. |
 
 Why the referrer is step 2 and not step 1: it is the cheapest signal, but it is also the one an
@@ -1287,20 +1288,20 @@ token stream is forwarded token-group by token-group. That is G4. Note `iter_chu
 >   encoding is for. It does *not* rewrite: the rewrite needs the device segment, and the far
 >   side is the device, so that id is never on the wire for it to use.
 > - ~~The **Service Worker re-scopes each cookie** as it builds the `Response`: `Path` replaced
->   with `/app/<deviceId>/<serviceId>/`, `Domain` dropped.~~ **Not implemented — see §5.6.2.**
+>   with `/app/<deviceId>/<serviceId>/`, `Domain` dropped.~~ **Superseded — see §5.6.2.**
 >   This was built and then deleted: a browser discards `Set-Cookie` on a response a worker
->   synthesises, so the rewrite could never take effect. The worker does no cookie handling at
->   all today.
+>   synthesises, so the rewrite could never take effect. What ships instead is the worker's own
+>   cookie jar, which never creates a browser cookie at all.
 > - `set-cookie2` stays blocked. RFC 6265 obsoleted RFC 2965, its attribute grammar is a
 >   different quoted one, and no upstream this proxy fronts emits it.
 
-> ### ⚠️ §5.6.2 supersedes the browser half of this: the browser never sees these cookies
+> ### ⚠️ §5.6.2 supersedes the browser half of this: the browser's cookie store is never used
 >
 > The **server** relay above is real and shipped. The Service Worker rewrite this block
-> originally described is **not implemented** — it was built, found undeliverable, and deleted.
-> Read §5.6.2 before building on any of it.
+> originally described is **not** what shipped — it was built, found undeliverable, and replaced
+> by the worker's own jar. Read §5.6.2 before building on any of it.
 
-#### 5.6.2 The `Set-Cookie` design of #72 does not work in a browser
+#### 5.6.2 The `Set-Cookie` design of #72 does not work in a browser — the worker keeps its own jar
 
 **Found while responding to the review of PR #78, verified against the Fetch Standard.** The
 mechanism §5.6 and #72 describe — the Service Worker puts `Set-Cookie` on the `Response` it
@@ -1329,29 +1330,97 @@ loses it in every browser. The cookie tests were checking the proxy's output aga
 store the browser would never have been handed. `sw-proxy.test.ts` now asserts that divergence
 explicitly so it is recorded rather than re-derived.
 
-**The design that does work, for whoever picks this up: the worker keeps its own jar.** The
-browser's cookie store is not actually needed — nothing except the upstream server ever has to
-read these cookies.
+**The design that works, and what shipped: the worker keeps its own jar.** The browser's cookie
+store is not actually needed — nothing except the upstream server ever has to read these cookies.
 
 - On `LEM_RESPONSE_HEAD`, the worker parses `Set-Cookie` and stores it itself, in the IndexedDB it
   already uses for client bindings, keyed by `(deviceId, serviceId)`.
 - On every request, the worker builds the `Cookie` header from that store and puts it in the pairs
   it hands the page.
 
-That is **stronger** than what §5.6 aimed at, on three counts: `HttpOnly` becomes real rather than
-emulated (the value never enters the browser at all), isolation becomes a genuine per-service
-partition rather than path-scoping the frame's own JavaScript could walk around, and the `__Host-`
-`__Host-` conflict disappears entirely (see the implementation notes below).
+##### What the jar wins, and what it emphatically does not
 
-The cost is the mirror image: `document.cookie` in the frame sees none of it, so an app whose
-*client-side* JavaScript reads a cookie by name breaks. That is a real trade and it belongs to
-whoever owns #72, not to a review round — which is why PR #78 reports this rather than
-implementing it.
+> **Corrected after adversarial review of [#93](https://github.com/lem-app/lem/pull/93).** This
+> section previously claimed the jar was "stronger on three counts", including that "`HttpOnly`
+> becomes real rather than emulated" and that "isolation becomes a genuine per-service partition".
+> **Both of those are false**, and the withdrawn design's own text had it right before this
+> section replaced it. They are corrected here rather than quietly deleted, because the false
+> version was cited into the PR, the README and `architecture.md`.
+
+It wins two things, and both are real:
+
+- **Login works at all**, where before it could not. That is the entire point, and it is worth
+  the trade below.
+- **The `__Host-`/`Path` conflict disappears**, because the partition is the key rather than the
+  path, so no `Path` is ever rewritten (see implementation note 2).
+
+It does **not** win either of these, and must never be described as though it does:
+
+- **`HttpOnly` is not real.** The jar is plaintext in IndexedDB, under `lem-sw` → `cookies`.
+  IndexedDB is scoped **per origin, not per realm**, and the framed service is same-origin with
+  the dashboard *by construction* — that is the premise the whole Service Worker proxy rests on.
+  So the frame's own JavaScript can call `indexedDB.open('lem-sw')` and read every cookie for
+  every service and every device. `document.cookie` not showing them is an inconvenience to an
+  attacker, not a control.
+- **The partition is not a security boundary.** It is a *functional* partition: it decides what
+  the worker attaches to which request. It does not keep one service's cookies away from another
+  service's code.
+
+**This is not fixable within a single origin, and should not be attempted.** Every mitigation
+dies on the same premise: any key the worker can retrieve, same-origin JavaScript can also
+retrieve, and a key held only in worker memory does not survive the restart the persistence
+exists for. **Per-service origins (§8.4 requirement 4) is the actual boundary**, and always was.
+
+**Why it still ships.** The alternative is not a safer jar — it is **no login at all**. And the
+mechanism it replaces, a shared browser cookie jar on one origin, would have been *worse*: the
+browser would have automatically **sent** each service's cookies to every other service on that
+origin, without any code being written to do it. The jar is a functional improvement with a
+stated limitation, not a security control.
+
+The functional cost is the mirror image of the win: `document.cookie` in the frame sees none of
+it, so an app whose *client-side* JavaScript reads a cookie by name breaks.
+
+##### What shipped (`web/remote/public/lem-app-sw.js`, `sw-cookies.test.ts`)
+
+`CookieJar` holds the partitions; `createIndexedDbCookieStore` persists them in the `cookies`
+object store of the same `lem-sw` database as the bindings, bumped to version 2. Both stores are
+created on demand rather than only at their introducing version, so a browser upgrading from 1
+and a browser arriving fresh at 2 converge on the same schema. `installServiceWorker` takes a
+`cookieStore` override for the same reason it takes `bindingStore`: a test has to be able to
+survive a worker restart over one store.
+
+Scope, decided deliberately and no wider:
+
+| Attribute | What the jar does |
+| --- | --- |
+| name/value | Parsed per RFC 6265 §5.2. Control characters (`CR`, `LF`, `NUL`) are **refused** — the value is concatenated into a `Cookie` header and hand-serialised into a frame, so this is header injection on the far side, not a formatting nicety. |
+| `Path` | Honoured, including default-path (§5.1.4) and path-match. **Never rewritten** — the partition is the key, so a rewrite buys nothing, and `__Host-`'s `Path=/` requirement is satisfied rather than fought. Identity inside a partition is `(name, path)`. |
+| `Domain` | Parsed, then **ignored for scoping.** The partition key is a device and a service, not a host, and every request the jar answers goes to one upstream on behalf of one service. `Domain` could only widen a cookie to hosts the jar cannot address, so honouring it has no observable effect — and ignoring it cannot leak, because the key is not the domain. It is still parsed, because `__Host-` is defined by its absence. |
+| `Expires` / `Max-Age` | `Max-Age` wins (§5.3). **Expiry is enforced on read, not only on write**, so a cookie the upstream has invalidated stops being sent even if nothing overwrites it. A past expiry at write time is a deletion. |
+| `Secure` | Accepted only on a **potentially trustworthy origin** — HTTPS anywhere, or a loopback host. This is the platform's own rule, keyed off the dashboard's actual origin, *not* a build flag or env var: production is HTTPS and is therefore unaffected by the loopback clause, which is the point. A plain-HTTP LAN dashboard refuses `Secure` cookies and reports it, exactly as a browser would. |
+| `HttpOnly` | Recorded, and **not enforced by anything** — the flag has no operative effect here in either direction. The jar is out of reach of `document.cookie`, but it is *not* out of reach of the framed realm: IndexedDB is scoped per origin, and the frame is same-origin with the dashboard by construction, so its own script can read the whole jar. See the correction above and #94. |
+| `SameSite` | Parsed and recorded; **no operative effect**, since no cross-site request can arise inside a per-service partition. The `SameSite=None`-requires-`Secure` pairing is deliberately **not** enforced: it would protect nothing here, while refusing those cookies would break logins for apps that set them over plain HTTP upstream. |
+
+**A third guarded-header trap, found while implementing this and worth more than the rest.** The
+mechanism above requires the worker to *see* `Set-Cookie`. It nearly could not. The page builds a
+`Response` from the frame in `proxy-fetch.ts` and `sw-bridge.ts` read `response.headers` off it —
+but `new Response(body, { headers })` gives its `Headers` the **"response" guard**, the same rule
+that defeated the original design, so in a browser that `Response` has *already lost*
+`Set-Cookie` before the worker is reached. The server relays the header correctly, the jar is
+correct, and the feature would still have been dead in every browser while green in Node, because
+undici does not enforce the guard. The frame's raw header pairs now travel beside the `Response`
+(`rawResponseHeaders`) instead of being read out of it. **This is the same class of error twice
+in one feature: a premise about the platform that the runtime cannot falsify.**
+
+Nothing in the implementation puts `Set-Cookie` on a `Response` or reads `Cookie` off a
+`Request`; the request pairs are a plain array, never a `Headers`, because the "request" guard
+drops `Cookie` just as silently.
 
 ##### Implementation notes for the jar, paid for once already
 
-These were learned while building the rewrite that was then deleted. They apply unchanged to a
-jar, which must also parse `Set-Cookie` and must also decide what a cookie name means.
+These were learned while building the rewrite that was then deleted. They applied unchanged to the
+jar, which also parses `Set-Cookie` and also decides what a cookie name means. All three are
+honoured by what shipped; each has a test that fails when it is reverted.
 
 **1. Cookie name prefixes, and the trap in how they are specified.** RFC 6265bis §4.1.3 describes
 the `__Secure-`/`__Host-` prefixes from the *server's* point of view and says the match is
@@ -1366,6 +1435,10 @@ a real browser. Any test written against that jar inherits the gap; match case-i
 the implementation regardless of what the oracle accepts, and do not treat a green suite here as
 evidence about prefixes.
 
+`cookiePrefixOf` folds case before matching, and the tests assert the RFC requirement directly
+rather than asking the oracle — `__Host-`, `__host-`, `__HOST-` and `__HoSt-` are each required to
+behave identically. Making the match case-sensitive again fails five of them.
+
 **2. `__Host-` constrains `Path`; `__Secure-` does not.** `__Host-` requires `Secure`, no
 `Domain`, and `Path=/` *exactly*. `__Secure-` requires only `Secure` and says nothing about
 `Path`. A jar keyed by `(deviceId, serviceId)` sidesteps both — it never has to alter a `Path`,
@@ -1377,6 +1450,13 @@ refused, the same cookie with `Path=/` stores and reads back.
 exception, not a console entry. Whatever the jar does, it should be able to say what it stored and
 why it dropped anything — the two bugs in this area both cost a review round precisely because the
 code believed it had succeeded.
+
+`CookieJar.ingest` returns a `{stored, removed, dropped}` report and also records every refusal on
+`jar.drops` (bounded) and `jar.stats`, with a `console.warn` per drop. The report distinguishes a
+*removal* (an expiry or `Max-Age=0`, which is the upstream doing its job) from a *refusal* (a
+cookie the jar would not accept, with the reason: `__host-forbids-domain`, `insecure-origin`,
+`control-character`, and so on). The worker calls `ingest` fire-and-forget, which is why the
+refusals have to live on the jar and not only in the return value.
 
 **Backpressure.** Before each chunk, if the transport's buffered amount exceeds
 `SEND_HIGH_WATER = 1 MiB`, await the low-water signal:
@@ -1754,27 +1834,44 @@ The same-origin SW design makes this worse in one specific way and better in ano
 **Cookies on the shared origin (Phase 5, [#72](https://github.com/lem-app/lem/issues/72)).**
 Because every framed service shares the dashboard's origin, it would also share its cookie jar.
 
-**Today there is nothing to partition: no cookie reaches the browser at all.** The plan was for
-the Service Worker to re-scope each upstream `Set-Cookie` to `Path=/app/<deviceId>/<serviceId>/`
-and strip `Domain`. That is undeliverable — a browser discards `Set-Cookie` on a
-worker-synthesised response (§5.6.2) — so it was built, found not to work, and deleted. **A framed
-app cannot hold a session over the tunnel**, which is a functional limitation rather than a
-security one, and it is the honest state of Phase 5.
+**No cookie reaches the browser's cookie store at all — the worker holds them instead.** The
+original plan was for the Service Worker to re-scope each upstream `Set-Cookie` to
+`Path=/app/<deviceId>/<serviceId>/` and strip `Domain`. That is undeliverable — a browser discards
+`Set-Cookie` on a worker-synthesised response (§5.6.2) — so it was built, found not to work, and
+deleted. What shipped is the §5.6.2 jar: keyed by `(deviceId, serviceId)`, in IndexedDB, written
+only by the worker — but, crucially, **readable by anything on this origin.**
 
-When the §5.6.2 jar is built, note what changes about *this* section: a jar keyed by
-`(deviceId, serviceId)` and read only by the worker is a **stronger** position than the
-path-scoping described above, not a weaker one. `HttpOnly` becomes real rather than emulated,
-because the value never enters the browser; and one service's cookies become genuinely
-unreachable from another's frame, rather than merely un-sent-by-default.
+**This is a functional partition, not a security boundary, and it must never be described as one.**
+An earlier revision of this section claimed the jar made `HttpOnly` "real" and the partition
+"genuine". Adversarial review of [#93](https://github.com/lem-app/lem/pull/93) disproved both,
+and the correction belongs here as much as in §5.6.2:
 
-**Path-scoping, had it worked, would have been functional isolation and not a security boundary —
-and it must never be described as "cookies are isolated per service".** It governs what the
-browser sends on its own initiative and nothing else: same-origin JavaScript in one framed app can
-still `fetch('/app/<other>/…')` deliberately and have that request carry the other service's
-cookies, and can still read anything not marked `HttpOnly` through a request it makes itself. A
-hostile or compromised service framed on this origin is contained by none of it. **Per-service
-origins (requirement 4 below) is the actual boundary**, and that remains true whichever cookie
-design lands.
+- The jar is **plaintext in IndexedDB**, and IndexedDB is scoped **per origin, not per realm**.
+  The framed service is same-origin with the dashboard by construction, so it can open `lem-sw`
+  and read every service's cookies on every device. `HttpOnly` is *not* preserved by this design;
+  the cookie is merely somewhere `document.cookie` does not look.
+- A hostile or compromised service framed on this origin is contained by none of it, exactly as
+  before. **Per-service origins (requirement 4 below) is the actual boundary**, and this design
+  does not substitute for it.
+
+What the jar does buy is that **login works at all**, and that the `__Host-`/`Path` conflict
+disappears. It is not fixable within one origin — any key the worker can reach, same-origin code
+can reach — and it still beats the unavailable alternative, since a shared browser cookie jar
+would have *automatically sent* each service's cookies to every other service on this origin.
+
+**The functional cost, stated plainly:** `document.cookie` in a framed app sees nothing, so an app
+whose *client-side* script reads its own cookie by name will not find it.
+
+**A related hole, found in the same review and fixed in #93.** The worker's `message` listener
+never read `event.source`, so any controlled client — including a framed service — could send
+`LEM_SESSION_OPEN`, `LEM_SESSION_CLOSE`, `LEM_ACTIVE_DEVICE` or `LEM_BRIDGE_INIT`. Chained with a
+`blob:` Worker, whose client URL no resolution step can attribute, that steered the
+single-open-session fallback onto a victim service and made the jar attach its cookie to a real
+tunnel request. Two gates now close it — the sender must be a non-`/app/`, `http(s):` client, and
+every state-changing message must arrive over the bridge port — **and the fallback itself was the
+larger half of the bug: it served an unattributable client whatever session happened to be open,
+which needed no forged message at all.** An unattributable client is now refused rather than
+guessed for. None of this contains a same-origin attacker either; it closes the unprivileged path.
 
 **Normative requirements that ship with Phase 6 — all four addressed; 1–3 landed, 4 deferred by
 design:**
@@ -1845,9 +1942,11 @@ design:**
 3. **Landed.** The known limitation is documented for users: **the services you launch remotely
    run with the dashboard's origin privileges. Only launch services you trust.** This belongs in
    the README's security section, not buried here. Phase 6 added the
-   [#72](https://github.com/lem-app/lem/issues/72) cookie caveat beside it: no cookie reaches the
-   browser at all, so a framed app cannot hold a session — a **functional** limitation that must
-   not be presented as isolation, since an empty jar leaks nothing and proves nothing.
+   [#72](https://github.com/lem-app/lem/issues/72) cookie caveat beside it. That caveat now
+   changes shape rather than disappearing: cookies are held in the worker's own per-service jar
+   and never reach the browser's cookie store, so a framed app *can* hold a session but its own
+   JavaScript cannot read the cookie. A **functional** difference that must not be presented as
+   isolation — per-service origins remains the boundary.
 4. **Deferred by design.** Phase 7 (post-v0.1, tracked separately): give each service its own
    origin
    (`<serviceId>.apps.<dashboard-domain>`) with its own SW registration. That is the only design
@@ -1917,7 +2016,8 @@ return value), `message_dispatcher.py` (new types).
 - [ ] A stub upstream that emits one line per 100 ms for 5 s produces the first
       `HTTP_RESPONSE_CHUNK` in < 300 ms — proving no full buffering.
 - [ ] No single frame exceeds `MAX_CHUNK_BYTES`.
-- [ ] A response with two `Set-Cookie` headers arrives with both.
+- [x] A response with two `Set-Cookie` headers arrives with both, and both are stored
+      separately in the worker's jar — they are not foldable into one header.
 - [ ] `Content-Encoding` and `Content-Length` are absent from forwarded headers; a gzip-encoded
       upstream response decodes correctly in the browser.
 - [ ] `HTTP_CANCEL` mid-stream closes the upstream connection (asserted via the stub's
@@ -2015,9 +2115,15 @@ resumed over a WebSocket.
       `Set-Cookie` on a worker-synthesised `Response`, so this criterion cannot be met by any
       implementation of the §5.6 design. The Service Worker rewrite was built, found
       undeliverable, and **deleted** rather than kept and annotated — code that looks like working
-      cookie handling, with a green suite behind it, is worse than none. What remains is the
-      server-side relay, which is the prerequisite for the §5.6.2 jar. **Login over the tunnel
-      still does not work**, which is also what blocks the socket.io criterion above.
+      cookie handling, with a green suite behind it, is worse than none.
+- [x] **Replacing it:** an upstream `Set-Cookie` is parsed off the tunnel frame into the worker's
+      own jar under the requesting `(deviceId, serviceId)`, and a later request to that service
+      carries a `Cookie` header built from it — asserted on the header pairs handed to the
+      transport, never on a browser cookie store (§5.6.2, `sw-cookies.test.ts`). A cookie stored
+      for one service is not sent to another, nor on the dashboard's own API calls. **This is the
+      code path for login; it is not a confirmation that any real app logs in.** The socket.io
+      criterion above and §4.1 of the testing checklist remain the things that settle that, and
+      neither has been run.
 
 > **Which of these a test can settle, and which a human has to.** Two criteria above name a
 > product, a browser and a model: "Open WebUI's socket.io session establishes and a chat message
@@ -2028,8 +2134,9 @@ resumed over a WebSocket.
 > settles them. Everything else in the list is verified in-suite: the ack state machine, buffering
 > before the ack (including the synchronous case), sub-second `WS_CONNECT_ERROR`, fragmentation
 > at and around the chunk boundary with a reassembly round trip, the splice asserted by parsing
-> the delivered document, and the cookie rewrite with its cross-service check made through the
-> same cookie implementation jsdom drives `document.cookie` with.
+> the delivered document, and the cookie jar with its cross-service check — the last of these
+> asserted on the jar and on the header pairs that reached the transport, deliberately **not**
+> through the jsdom/tough-cookie store that made the previous cookie suite meaningless.
 
 ### Phase 6 — Degradation, security hardening, and truthful UI
 
@@ -2086,9 +2193,10 @@ through the secure WebRTC tunnel" claims where they are not yet true.
       > touches the user's device. "All" is a security claim, and it was false. Both notes now
       > scope it, and both carry the cookie limitation.
 - [x] README's security section carries the §8.4 warning, and the
-      [#72](https://github.com/lem-app/lem/issues/72) cookie caveat alongside it — no cookie
-      reaches the browser at all, which is a functional limitation and explicitly *not* a
-      security boundary; per-service origins (Phase 7) remains the boundary.
+      [#72](https://github.com/lem-app/lem/issues/72) cookie caveat alongside it — cookies live
+      in the worker's own per-service jar and never reach the browser's cookie store, which is a
+      functional difference and explicitly *not* a security boundary; per-service origins
+      (Phase 7) remains the boundary.
 
 ### Phase 7 — Per-service origins (post-v0.1, tracked separately)
 

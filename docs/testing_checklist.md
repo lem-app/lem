@@ -444,42 +444,34 @@ and the suite says so in the tests that touch them:
   forbidden response-header name, so the `Headers` guard drops it silently and the storing
   algorithm is never reached (§5.6.2). Node's undici does **not** enforce that guard, which is
   exactly why a green suite once "proved" cookie isolation that no browser would ever have
-  performed ([#72](https://github.com/lem-app/lem/issues/72)). Step A below is written to observe
-  the refusal rather than assume it.
+  performed ([#72](https://github.com/lem-app/lem/issues/72)). The worker no longer relies on
+  that delivery — it keeps its own jar — but the guard is still the reason the design looks the
+  way it does, and **only a real browser can confirm the jar is reading a header the guard has
+  not already eaten.** That is what step A settles.
 
 Run the §4 setup first: machine A at home with Open WebUI and Ollama running and a small model
 pulled, machine B on a different network. Everything below happens on **B**.
 
-**A. Login — expected to FAIL, and this step is how you confirm why.**
+**A. Login — the code path exists; this is the run that decides whether it works.**
 
-> **Do not run this step expecting a pass.** A Service Worker cannot deliver `Set-Cookie` to the
-> browser: it is a forbidden response-header name, and a worker-synthesised `Response` never
-> reaches the algorithm that would parse it. See `tunnel-proxy-spec.md` §5.6.2. The steps below
-> are written to *localise* the failure, so that when the cookie transport is redesigned there is
-> a procedure that already distinguishes "the rewrite is wrong" from "the browser dropped it".
+> **Nothing below has been confirmed against a real app.** The worker's cookie jar
+> ([#72](https://github.com/lem-app/lem/issues/72), spec §5.6.2) is implemented and covered by
+> `sw-cookies.test.ts`, but that suite runs on undici, which cannot reproduce either header guard
+> this design is built around. A pass here is the first real evidence; a failure localises where.
+> Record what you see rather than what this document predicts.
 
 1. Launch Open WebUI from the remote dashboard and sign in with your Open WebUI account.
-2. **Expected today:** the sign-in does **not** stick — the app returns to the login form. If it
-   *does* stick, the cookie reached the jar by some route §5.6.2 says is impossible; that is worth
-   investigating and reporting, not celebrating.
+2. **Expected:** the sign-in sticks and the app loads past the login form. If it does not, go
+   straight to step 3 — the question is whether the jar ever received the cookie.
 3. Open DevTools → Application → Cookies → the dashboard's origin.
-   **Expected today: the cookie is absent.** Do not expect to find it in the Network panel
-   either: the worker strips `set-cookie` when it builds the `Response`, precisely so its output
-   does not display a header no browser would ever act on. The header does still cross the tunnel
-   — the server-side relay stops stripping it, which is the prerequisite for the §5.6.2 jar — so
-   the place to confirm the far side sent one is machine A's own logs, not B's DevTools.
-   **Expected once the [#72](https://github.com/lem-app/lem/issues/72) jar is built:** still
-   nothing here — the worker's own jar never creates a browser cookie, which is the point of that
-   design. What changes is that the app stays signed in. Confirm it by re-running step 1 and
-   getting past the login form, not by looking at this panel.
-> **Steps 4–6 are BLOCKED, not merely unverified.** They all ask which requests carry a cookie,
-> and step 3 has just established that no cookie exists to carry. There is nothing to observe
-> until the [#72](https://github.com/lem-app/lem/issues/72) jar is built. Do not run them and
-> record a pass on the strength of finding no cross-service leakage — an empty jar leaks nothing,
-> and scoring that as isolation is the same error the issue was filed for. They are kept here
-> because they are the right steps *once there is a session*, and re-deriving them later would
-> lose the reasoning.
-
+   **Expected: the cookie is absent, and that is correct.** The worker's jar never creates a
+   browser cookie; that is the whole design. This panel can therefore neither confirm nor deny a
+   working login, and an absent cookie here is not a failure.
+   To see what the jar actually holds, use DevTools → Application → IndexedDB → `lem-sw` →
+   `cookies`. Records are keyed `<deviceId>\0<serviceId>`.
+   **Expected:** a record for the Open WebUI service containing its session cookie.
+   If that record is missing, the cookie never reached the jar — check machine A's own logs to
+   confirm the upstream sent one at all, since the server-side relay is the prerequisite.
 4. In DevTools → Network, reload the frame and pick any request the app made.
    **Expected:** it carries the cookie. Now open a *second* service (Ollama, say) and pick one of
    its requests. **Expected:** it carries **no** Open WebUI cookie.
@@ -490,19 +482,21 @@ pulled, machine B on a different network. Everything below happens on **B**.
    container) while doing something authenticated on **B**.
    **Expected:** the request arrives carrying `Cookie: <the app's session cookie>`.
 
-   This step exists because the browser attaches `Cookie` *after* the Service Worker sees the
-   request, so what the worker forwards is whatever `event.request.headers` happens to contain.
-   Whether that includes `Cookie` is a browser behaviour this repository cannot observe — jsdom
-   has no cookie jar wired to `Request` — and the suite therefore *supplies* the header rather
-   than proving the browser did. If this step fails while step 3 shows the cookie correctly
-   stored, the defect is on the request path, not in the `Set-Cookie` rewrite, and the fix
-   belongs with whatever mechanism the worker uses to read cookies.
-7. **When the §5.6.2 jar lands, re-run steps 3–6 and add:** a `__Host-`-prefixed cookie (Open
-   WebUI does not set one; many hardened apps do) must reach the upstream under its **original**
-   name, and must not appear in DevTools → Application → Cookies at all — under a jar the browser
-   never stores these, which is the point. Note that a `__HOST-`-cased name has to work too: user
-   agents match the prefix case-insensitively, and this repository's only cookie-store oracle
-   (tough-cookie) does not, so that case can only be checked here. See spec §5.6.2.
+   This step used to depend on a browser behaviour the repository could not observe — the browser
+   appends `Cookie` *after* the worker runs, so the worker could only forward whatever
+   `event.request.headers` happened to hold, which is never a cookie. Under the jar the worker
+   **supplies** the header itself, so the request path no longer depends on the browser at all.
+   What this step now checks is that the pairs the worker built survived the page, the tunnel and
+   the local proxy intact.
+7. **A `__Host-`-prefixed cookie** (Open WebUI does not set one; many hardened apps do) must reach
+   the upstream under its **original** name, and must not appear in DevTools → Application →
+   Cookies at all — under a jar the browser never stores these, which is the point. A
+   `__HOST-`-cased name has to work identically: user agents match the prefix case-insensitively
+   and this repository's only cookie-store oracle (tough-cookie) does not, so **that case can only
+   be checked here.** See spec §5.6.2.
+8. **If login works but something in the app still misbehaves**, check whether the app's own
+   JavaScript reads a cookie by name. `document.cookie` inside the frame sees nothing under this
+   design, and that is the stated cost, not a bug to be patched around.
 
 **B. The shim is in the document, and it is first.**
 

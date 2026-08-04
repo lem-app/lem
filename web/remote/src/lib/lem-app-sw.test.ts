@@ -21,12 +21,14 @@ import { describe, it, expect, vi } from 'vitest'
 import {
   APP_PATH_RE,
   BRIDGE_WAIT_MS,
+  CookieJar,
   ERROR_STATUS,
   LemAppServiceWorker,
   SUBSTITUTED_CSP,
   bindingFromUrl,
   buildResponseHeaders,
   createMemoryBindingStore,
+  createMemoryCookieStore,
   installServiceWorker,
   parseAppPath,
   problemResponse,
@@ -300,6 +302,7 @@ describe('a cold-started worker', () => {
         origin: ORIGIN,
         clients: { get: () => Promise.resolve(undefined), matchAll: () => Promise.resolve([]) },
         bindingStore: createMemoryBindingStore(),
+        cookies: new CookieJar({ store: createMemoryCookieStore(), secureOrigin: true }),
       })
 
       const pending = worker.proxy('dev-7f3a', 'webui', '/', new Request(`${ORIGIN}/x`))
@@ -325,6 +328,7 @@ describe('a cold-started worker', () => {
         origin: ORIGIN,
         clients: { get: () => Promise.resolve(undefined), matchAll: () => Promise.resolve([]) },
         bindingStore: createMemoryBindingStore(),
+        cookies: new CookieJar({ store: createMemoryCookieStore(), secureOrigin: true }),
       })
 
       const pending = worker.proxy('dev-7f3a', 'webui', '/', new Request(`${ORIGIN}/x`))

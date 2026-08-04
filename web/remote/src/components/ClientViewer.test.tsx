@@ -141,13 +141,32 @@ describe('what ClientViewer tells the user about the tunnel', () => {
 
   // Presence-plus-scope tied to an issue number, so that closing #72 makes this
   // stale rather than leaving a claim that is simply false.
-  it('says cookies are not delivered to framed apps, and cites #72', async () => {
+  it('says cookies are held per service rather than by the browser, and cites #72', async () => {
     renderViewer('http://localhost:3000/', fakeBridge())
 
     const text = await noteText()
 
-    expect(text).toMatch(/cookies are not delivered to framed apps/i)
+    expect(text).toMatch(/kept per service/i)
+    // The cost has to travel with the capability, or the note overclaims: the
+    // app's own JavaScript still cannot read these cookies, and no real sign-in
+    // has been confirmed end to end.
+    expect(text).toMatch(/will not find it/i)
+    expect(text).toMatch(/not yet been confirmed/i)
     expect(text).toContain('#72')
+  })
+
+  // The separation is functional, not a boundary: the jar is plaintext in
+  // origin-scoped IndexedDB and every framed service shares that origin. A user
+  // deciding whether to sign in needs that at the moment of deciding, so it is
+  // asserted here and not only in the README.
+  it('warns that any framed service can read every other service’s cookies', async () => {
+    renderViewer('http://localhost:3000/', fakeBridge())
+
+    const text = await noteText()
+
+    expect(text).toMatch(/read every other service/i)
+    expect(text).toMatch(/not a security boundary/i)
+    expect(text).toMatch(/only launch services you trust/i)
   })
 
   // Cross-origin URLs are deliberately not intercepted (spec 3.8), so a user

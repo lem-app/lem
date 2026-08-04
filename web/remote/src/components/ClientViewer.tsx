@@ -415,8 +415,9 @@ export function ClientViewer({
                   see this traffic.
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  <strong>Signing in does not work yet:</strong> cookies are not delivered to framed
-                  apps (
+                  <strong>Cookies are held for you, not by your browser:</strong> this app's session
+                  cookies are kept per service by Lem and sent on its requests, so signing in can
+                  work (
                   <a
                     className="underline"
                     href="https://github.com/lem-app/lem/issues/72"
@@ -425,7 +426,16 @@ export function ClientViewer({
                   >
                     #72
                   </a>
-                  ), so an app that needs a login cannot hold a session here.
+                  ). An app whose own JavaScript reads a cookie by name will not find it, and
+                  sign-in has not yet been confirmed against a real app end to end.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  <strong>
+                    Any service you view can read every other service's login cookies.
+                  </strong>{' '}
+                  They are stored unencrypted on this dashboard's origin, which every framed service
+                  shares, so this separation is a convenience and not a security boundary. Only
+                  launch services you trust.
                 </p>
               </div>
             </CardContent>

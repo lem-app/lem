@@ -735,13 +735,13 @@ describe('the same-origin Service Worker proxy', () => {
     })
   })
 
-  // There is no cookie handling in the Service Worker to test, and that is the
-  // point of the single test below. #72 specified a `Set-Cookie` rewrite; it was
-  // built, and then found to be undeliverable. The rewrite is deleted rather
-  // than kept and annotated, so nothing here can be mistaken for working cookie
-  // support - but the *reason* is worth an assertion, because the suite would
-  // otherwise happily agree with a reimplementation of the same mistake.
-  describe('cookies, and why the worker does not handle them', () => {
+  // The worker now keeps its own cookie jar (section 5.6.2), and `sw-cookies.
+  // test.ts` covers it. What stays here is the *reason* the jar exists: the
+  // browser rule that made #72's original `Set-Cookie` rewrite undeliverable,
+  // and which this suite does not enforce. Without these two assertions a
+  // future rewrite could be "proved" correct by a runtime more permissive than
+  // the platform - which is exactly how the deleted implementation passed.
+  describe('cookies, and why the browser never sees them', () => {
     it('cannot be delivered on a worker-synthesised Response - the rule undici does not enforce', () => {
       // `Set-Cookie` and `Set-Cookie2` are *forbidden response-header names* in
       // the Fetch Standard - a concept that is current, not removed. A browser's
@@ -759,10 +759,14 @@ describe('the same-origin Service Worker proxy', () => {
       // ^ In every browser this is `[]`. See docs/tunnel-proxy-spec.md 5.6.2.
     })
 
-    it('are dropped by the worker rather than handed to the frame', async () => {
+    it('are taken by the jar rather than handed to the frame', async () => {
       // The worker mirrors the browser instead of diverging from it: an upstream
-      // cookie reaches the worker (the server relays it, which the jar design
-      // needs) and goes no further.
+      // cookie reaches the worker (the server relays it, which the jar needs),
+      // is stored in the jar, and goes no further. What this pins is that the
+      // cookie is not handed to the frame *as a response header* — nothing more.
+      // It is emphatically NOT evidence that `HttpOnly` is real: the jar sits in
+      // same-origin IndexedDB, which the framed realm can open and read itself.
+      // See spec section 5.6.2 and #94.
       harness.tunnel.serve(() => ({
         status: 200,
         headers: [
@@ -774,8 +778,12 @@ describe('the same-origin Service Worker proxy', () => {
       harness.clients.add('frame-1', appUrl(DEVICE_A, 'webui'))
 
       const result = await harness.dispatch(`${ORIGIN}/login`, { clientId: 'frame-1' })
+      await settle()
 
       expect(result.response?.headers.getSetCookie()).toEqual([])
+      // ...and the jar did get it, so this is "consumed", not "lost".
+      const stored = await harness.worker.cookies.read(DEVICE_A, 'webui')
+      expect(stored.map((cookie: { name: string }) => cookie.name)).toEqual(['session'])
     })
   })
 })

@@ -25,7 +25,7 @@ reconciled with reality).
 |---|---|---|---|---|---|
 | 1 | Local server | `server/` | 5142 | Python 3.11+, FastAPI | **Implemented** |
 | 2 | Local dashboard | `web/local/` | 5174 | React 19 + Vite | **Implemented** |
-| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane works; app viewing goes through the Service Worker proxy, but an app that needs a login cannot hold a session ([#72](https://github.com/lem-app/lem/issues/72)), and none of it is verified end to end ([#6](https://github.com/lem-app/lem/issues/6)) |
+| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane works; app viewing goes through the Service Worker proxy, which now holds session cookies in its own per-service jar ([#72](https://github.com/lem-app/lem/issues/72)), but none of it is verified end to end ([#6](https://github.com/lem-app/lem/issues/6)) |
 | 4 | Cloud signaling | `cloud/signaling/` | 8000 | Python, FastAPI | **Implemented** |
 | 5 | Cloud relay | `cloud/relay/` | 8001 | Python, FastAPI | **Partial** — reachable, but auto-fallback cannot trigger ([#12](https://github.com/lem-app/lem/issues/12)) |
 
@@ -342,15 +342,27 @@ path behind a Service Worker (Phase 4) instead of the local machine's `127.0.0.1
 now that `WS_CONNECT_ACK` exists on both sides and a shim is injected into the framed document
 (Phase 5).
 
-**What still does not work is login**, and that is a known code-level gap rather than an
-unrun test. `Set-Cookie` does now cross the tunnel — it is no longer stripped
-(`server/app/tunnel/http_proxy.py:131-145`) and every copy is relayed rather than folded into
-one (`http_proxy.py:228-252`) — but nothing on the browser side consumes it, and the mechanism
-originally designed to do so cannot work in a browser at all
+**Login now has a working code path, and it is still unverified end to end.** `Set-Cookie`
+crosses the tunnel — it is not stripped (`server/app/tunnel/http_proxy.py:131-145`) and every
+copy is relayed rather than folded into one (`http_proxy.py:228-252`) — and the Service Worker
+now consumes it. The mechanism originally designed for the browser side could not work at all;
+what replaced it is the worker keeping **its own cookie jar**, keyed by `(deviceId, serviceId)`
+in IndexedDB, which parses `Set-Cookie` off the tunnel frame and builds the `Cookie` header for
+later requests without the browser's cookie store ever being involved
 ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2,
-[#72](https://github.com/lem-app/lem/issues/72)). So an anonymous app renders; anything with a
-sign-in cannot hold a session. The dashboard says so inside the frame itself
-(`ClientViewer.tsx:417-429`).
+[#72](https://github.com/lem-app/lem/issues/72)).
+
+**This is a functional partition, not a security boundary.** The jar is plaintext in IndexedDB,
+which is scoped per origin rather than per realm, and a framed service is same-origin with the
+dashboard by construction — so it can read every service's cookies out of `lem-sw` if it wants
+to. `HttpOnly` is *not* preserved by this design, and an earlier draft of this paragraph wrongly
+said it was. Per-service origins remains the actual boundary
+([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §8.4).
+
+What it buys is that login works at all, and that the `__Host-`/`Path` conflict disappears. The
+cost is the mirror image: `document.cookie` inside the frame sees none of it, so an app whose
+*client-side* script reads its own cookie by name will not find it. **Nothing here has been
+confirmed against a real app** — socket.io and the full sign-in flow remain unverified.
 
 Beyond that, no run against a real Open WebUI from a second machine has happened; the procedure
 that settles it is [`testing_checklist.md`](./testing_checklist.md) §4.1. Full design:
@@ -583,7 +595,7 @@ it is a non-extractable `CryptoKey`, so framed code can neither read it nor copy
 | Local dashboard | **Implemented** | `web/local/` |
 | WebRTC signaling + DataChannel | **Implemented** | `webrtc_client.py`, `cloud/signaling/` |
 | Remote JSON API access | **Implemented** | `proxy-fetch.ts`, `http_proxy.py` |
-| Remote **app viewing** | **Partial** — anonymous apps load; anything needing a login does not | `lem-app-sw.js`, `sw-bridge.ts`, `ClientViewer.tsx`; cookie transport is blocked ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2, [#72](https://github.com/lem-app/lem/issues/72)) |
+| Remote **app viewing** | **Partial** — apps load and the cookie path is implemented; no login confirmed end to end | `lem-app-sw.js`, `sw-bridge.ts`, `ClientViewer.tsx`; cookies are held in the worker's own jar ([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2, [#72](https://github.com/lem-app/lem/issues/72)) |
 | Proxied WebSockets | **Implemented, unverified end to end** | `ws-proxy.ts`, `ws-bridge.ts`, `ws_proxy.py`; ack + shim covered in-suite, socket.io needs a browser ([#6](https://github.com/lem-app/lem/issues/6)) |
 | Relay transport | **Implemented** | `relay_client.py`, `cloud/relay/` |
 | Relay **auto-fallback** | **Not working** | `webrtc_client.py:704-743`, `:69` ([#12](https://github.com/lem-app/lem/issues/12)) |
