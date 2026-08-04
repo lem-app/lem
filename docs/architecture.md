@@ -25,7 +25,7 @@ reconciled with reality).
 |---|---|---|---|---|---|
 | 1 | Local server | `server/` | 5142 | Python 3.11+, FastAPI | **Implemented** |
 | 2 | Local dashboard | `web/local/` | 5174 | React 19 + Vite | **Implemented** |
-| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane works; app viewing is implemented but unverified end to end ([#6](https://github.com/lem-app/lem/issues/6)) |
+| 3 | Remote dashboard | `web/remote/` | 5173 | React 19 + Vite | **Partial** — control plane works; app viewing goes through the Service Worker proxy, but an app that needs a login cannot hold a session ([#72](https://github.com/lem-app/lem/issues/72)), and none of it is verified end to end ([#6](https://github.com/lem-app/lem/issues/6)) |
 | 4 | Cloud signaling | `cloud/signaling/` | 8000 | Python, FastAPI | **Implemented** |
 | 5 | Cloud relay | `cloud/relay/` | 8001 | Python, FastAPI | **Partial** — reachable, but auto-fallback cannot trigger ([#12](https://github.com/lem-app/lem/issues/12)) |
 
@@ -337,11 +337,23 @@ the socket as usable before `connected` arrives.
 
 **What is not yet confirmed**: viewing a service end to end. The two defects that made it
 impossible are fixed — `ClientViewer` frames the same-origin `/app/<deviceId>/<serviceId>/`
-path behind a Service Worker (Phase 4) instead of the local machine's `127.0.0.1:PORT`, and
-proxied WebSockets reach `OPEN` now that `WS_CONNECT_ACK` exists on both sides and a shim is
-injected into the framed document (Phase 5). What has *not* happened is a run against a real
-Open WebUI from a second machine; the procedure that settles it is
-[`testing_checklist.md`](./testing_checklist.md) §4.1. Full design:
+path behind a Service Worker (Phase 4) instead of the local machine's `127.0.0.1:PORT`
+(`web/remote/src/components/ClientViewer.tsx:386-393`), and proxied WebSockets reach `OPEN`
+now that `WS_CONNECT_ACK` exists on both sides and a shim is injected into the framed document
+(Phase 5).
+
+**What still does not work is login**, and that is a known code-level gap rather than an
+unrun test. `Set-Cookie` does now cross the tunnel — it is no longer stripped
+(`server/app/tunnel/http_proxy.py:131-145`) and every copy is relayed rather than folded into
+one (`http_proxy.py:228-252`) — but nothing on the browser side consumes it, and the mechanism
+originally designed to do so cannot work in a browser at all
+([`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md) §5.6.2,
+[#72](https://github.com/lem-app/lem/issues/72)). So an anonymous app renders; anything with a
+sign-in cannot hold a session. The dashboard says so inside the frame itself
+(`ClientViewer.tsx:417-429`).
+
+Beyond that, no run against a real Open WebUI from a second machine has happened; the procedure
+that settles it is [`testing_checklist.md`](./testing_checklist.md) §4.1. Full design:
 [`tunnel-proxy-spec.md`](./tunnel-proxy-spec.md).
 
 ### 3.3 Remote mode, relay fallback — **Partial**

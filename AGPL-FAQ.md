@@ -191,7 +191,7 @@ But you **must** still provide the source code to your customers.
 
 ### Can my business use Lem?
 
-**Yes!** See [Can I use Lem at my company?](#can-i-use-lem-at-my-companystartu p) above.
+**Yes!** See [Can I use Lem at my company?](#can-i-use-lem-at-my-companystartup) above.
 
 ### Can I offer Lem as a hosted service (SaaS)?
 
@@ -370,4 +370,4 @@ For official licensing inquiries, contact: blake@lem.gg
 
 ---
 
-**Still have questions?** Open a [GitHub Discussion](https://github.com/lem-gg/lem/discussions) or email blake@lem.gg
+**Still have questions?** Open a [GitHub issue](https://github.com/lem-app/lem/issues) or email blake@lem.gg

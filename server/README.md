@@ -211,5 +211,4 @@ server/
 
 - [Implementation Plan](../docs/implementation_plan.md)
 - [API Specification](../docs/api.md)
-- [Harbor Integration Guide](../docs/harbor_integration.md)
 - [Coding Standards](../CLAUDE.md)
