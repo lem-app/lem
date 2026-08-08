@@ -1,4 +1,4 @@
-# Lem
+# Lem - {PIVOT ENGAGED}
 
 **Your local AI infrastructure, securely accessible from anywhere.**
 
