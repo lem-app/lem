@@ -35,10 +35,18 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.config import platform as platform_config
+
 logger = logging.getLogger(__name__)
 
-# Database path: ~/.lem/lem.db
-LEM_HOME = Path.home() / ".lem"
+# app.config.platform is the single place the install prefix is resolved. A
+# second Path.home() / ".lem" here is how a relocated install ended up putting
+# its database and API token back in the default directory, out of reach of the
+# uninstaller. Re-exported (rather than imported by users of this module from
+# platform) because app.security and the tests already patch app.db.LEM_HOME.
+LEM_HOME: Path = platform_config.LEM_HOME
+
+# Database path: $LEM_HOME/lem.db, ~/.lem/lem.db unless the install moved.
 DB_PATH = LEM_HOME / "lem.db"
 
 # The database holds secrets at rest (Ed25519 private key, signaling JWT), so the

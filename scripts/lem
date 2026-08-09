@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2025 Lem
+#
+# This file is part of Lem.
+#
+# Lem is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Lem is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General
+# Public License for more details.
+#
+# ---------------------------------------------------------------------------
+# The lem CLI: start / stop / status / logs for the local server.
+#
+# This script holds NO platform detection and NO server command line. Both are
+# decided once by scripts/install.sh and recorded in ~/.lem/config/install.env,
+# which is read below. That is the whole point: the old CLI carried a second,
+# WSL-blind copy of platform detection, and a second `uvicorn --host 0.0.0.0`
+# invocation that could drift from the installer's.
+#
+# The server itself is always ~/.lem/bin/lem-server, generated at install time.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+LEM_HOME_OVERRIDE="${LEM_HOME:-}"
+LEM_PORT_OVERRIDE="${LEM_PORT:-}"
+
+LEM_HOME="${LEM_HOME:-$HOME/.lem}"
+INSTALL_ENV="$LEM_HOME/config/install.env"
+
+if [ ! -f "$INSTALL_ENV" ]; then
+  printf 'lem: no installation found at %s\n' "$LEM_HOME" >&2
+  printf 'lem: install it with\n' >&2
+  printf '  curl -fsSL https://raw.githubusercontent.com/lem-app/lem/main/scripts/install.sh | bash\n' >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090  # generated at install time
+. "$INSTALL_ENV"
+
+# The environment wins over the recorded values, which are only defaults.
+[ -z "$LEM_HOME_OVERRIDE" ] || LEM_HOME="$LEM_HOME_OVERRIDE"
+[ -z "$LEM_PORT_OVERRIDE" ] || LEM_PORT="$LEM_PORT_OVERRIDE"
+
+LEM_PORT="${LEM_PORT:-5142}"
+LEM_SERVICE="${LEM_SERVICE:-none}"
+LEM_SERVICE_NAME="${LEM_SERVICE_NAME:-}"
+LEM_LAUNCHER="${LEM_LAUNCHER:-$LEM_HOME/bin/lem-server}"
+LEM_LOG_FILE="${LEM_LOG_FILE:-$LEM_HOME/logs/lem.log}"
+LEM_PID_FILE="${LEM_PID_FILE:-$LEM_HOME/run/lem.pid}"
+LEM_LOCK_DIR="${LEM_LOCK_DIR:-$LEM_HOME/run/lock}"
+
+HEALTH_URL="http://127.0.0.1:$LEM_PORT/v1/health"
+START_TIMEOUT=60
+LOCK_TIMEOUT=180
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Lock
+# ---------------------------------------------------------------------------
+#
+# Start and stop are serialised per install. mkdir is the portable atomic
+# test-and-set -- flock(1) is util-linux and absent on macOS. The holder's pid
+# goes inside so a lock left by a killed process is reclaimed rather than
+# wedging every later run.
+#
+# Without it, two `lem start` runs (or a `lem start` racing the installer, which
+# delegates here) each saw "not healthy yet", each launched a server, and this
+# PID file kept only the last writer. The other server then survived both
+# `lem stop` and `install.sh --uninstall`, holding the port with its source tree
+# deleted underneath it.
+
+LOCK_HELD=""
+
+# >>> lock-reclaim: keep this block byte-identical in scripts/install.sh and scripts/lem >>>
+# Take the lock directory $1 away from the gone holder $2 ("" when it left no
+# readable pid). Returns 0 only if it removed the directory.
+#
+# NOT "re-read the pid, then rm -rf": those are two operations, and in the gap
+# another reclaimer can delete the directory and recreate it with its own live
+# pid -- which the rm -rf would then destroy, leaving two runs both believing
+# they hold the lock. mkdir of the claim marker is the atomic test-and-set, and
+# the marker lives *inside* the lock directory, so it disappears with it:
+# whoever wins the claim is provably looking at the same directory instance it
+# read, and a pid that still matches proves nothing was swapped underneath.
+#
+# Losing the claim, or finding a different pid, means someone else is dealing
+# with it. Either way this never assumes it holds the lock afterwards -- only a
+# later mkdir of the lock directory itself decides that.
+lock_reclaim() {
+  local dir="$1" holder="$2"
+
+  mkdir "$dir/claim" 2>/dev/null || return 1
+
+  if [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$holder" ]; then
+    rm -rf "$dir"
+    return 0
+  fi
+
+  rmdir "$dir/claim" 2>/dev/null || true
+  return 1
+}
+# <<< lock-reclaim <<<
+
+lock_acquire() {
+  local dir="$LEM_LOCK_DIR" waited=0 holder announced=0 blank=0
+
+  mkdir -p "${dir%/*}" 2>/dev/null || true
+
+  while [ "$waited" -lt "$LOCK_TIMEOUT" ]; do
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid"
+      LOCK_HELD="$dir"
+      return 0
+    fi
+
+    holder="$(cat "$dir/pid" 2>/dev/null || true)"
+    case "$holder" in
+      ''|*[!0-9]*) holder="" ;;
+    esac
+    sleep 1
+    waited=$((waited + 1))
+
+    if [ -z "$holder" ]; then
+      # No readable pid: a leftover from a crash, or a winner that has not
+      # written its pid yet. Act only on the second sighting, so the second
+      # case resolves itself rather than being reclaimed out from under a run
+      # that is about to hold the lock.
+      blank=$((blank + 1))
+      if [ "$blank" -ge 2 ]; then
+        lock_reclaim "$dir" "" || true
+        blank=0
+      fi
+      continue
+    fi
+    blank=0
+
+    if ! kill -0 "$holder" 2>/dev/null; then
+      lock_reclaim "$dir" "$holder" || true
+      continue
+    fi
+
+    if [ "$announced" -eq 0 ]; then
+      printf 'Waiting for another lem run (pid %s) to finish\n' "$holder" >&2
+      announced=1
+    fi
+  done
+
+  printf 'lem: timed out after %ss waiting for %s\n' "$LOCK_TIMEOUT" "$LEM_LOCK_DIR" >&2
+  printf 'lem: if nothing else is running, remove that directory.\n' >&2
+  return 1
+}
+
+lock_release() {
+  [ -n "$LOCK_HELD" ] || return 0
+  rm -rf "$LOCK_HELD" 2>/dev/null || true
+  LOCK_HELD=""
+}
+
+trap lock_release EXIT
+
+is_healthy() {
+  curl -fsS -m 2 "$HEALTH_URL" >/dev/null 2>&1
+}
+
+# PID of the server we started, or empty. Never `pkill -f uvicorn`: that
+# pattern also matches an unrelated checkout's dev server in another terminal.
+running_pid() {
+  local pid
+  [ -f "$LEM_PID_FILE" ] || return 1
+  pid="$(cat "$LEM_PID_FILE" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+wait_for_health() {
+  local waited=0
+  printf 'Waiting for the server'
+  while [ "$waited" -lt "$START_TIMEOUT" ]; do
+    if is_healthy; then
+      printf ' ready\n'
+      return 0
+    fi
+    printf '.'
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf ' timeout\n'
+  return 1
+}
+
+start_detached() {
+  mkdir -p "${LEM_PID_FILE%/*}" "${LEM_LOG_FILE%/*}"
+  [ -x "$LEM_LAUNCHER" ] || {
+    printf 'lem: launcher missing or not executable: %s\n' "$LEM_LAUNCHER" >&2
+    printf 'lem: re-run the installer.\n' >&2
+    return 1
+  }
+  LEM_PORT="$LEM_PORT" nohup "$LEM_LAUNCHER" >>"$LEM_LOG_FILE" 2>&1 &
+  printf '%s\n' "$!" >"$LEM_PID_FILE"
+}
+
+cmd_start() {
+  if is_healthy; then
+    printf 'Lem is already running on port %s\n' "$LEM_PORT"
+    return 0
+  fi
+
+  lock_acquire || return 1
+
+  # Re-check under the lock. Whoever we queued behind may have started the
+  # server already, and launching a second one here is exactly how an
+  # untracked process used to escape both stop and uninstall.
+  if is_healthy; then
+    printf 'Lem is already running on port %s\n' "$LEM_PORT"
+    lock_release
+    return 0
+  fi
+  local existing
+  if existing="$(running_pid)"; then
+    printf 'Lem is already starting (pid %s)\n' "$existing"
+    lock_release
+    return 0
+  fi
+
+  case "$LEM_SERVICE" in
+    systemd-user)
+      systemctl --user start "$LEM_SERVICE_NAME"
+      ;;
+    launchd)
+      launchctl load -w "$HOME/Library/LaunchAgents/$LEM_SERVICE_NAME.plist" 2>/dev/null || true
+      launchctl start "$LEM_SERVICE_NAME" 2>/dev/null || true
+      ;;
+    *)
+      start_detached
+      ;;
+  esac
+
+  if wait_for_health; then
+    lock_release
+    printf 'Lem is running: http://127.0.0.1:%s\n' "$LEM_PORT"
+    return 0
+  fi
+
+  lock_release
+  printf 'lem: the server did not become healthy in %ss\n' "$START_TIMEOUT" >&2
+  cmd_logs_tail 20 >&2 || true
+  return 1
+}
+
+cmd_stop() {
+  lock_acquire || return 1
+
+  case "$LEM_SERVICE" in
+    systemd-user)
+      systemctl --user stop "$LEM_SERVICE_NAME" || true
+      ;;
+    launchd)
+      launchctl stop "$LEM_SERVICE_NAME" 2>/dev/null || true
+      launchctl unload "$HOME/Library/LaunchAgents/$LEM_SERVICE_NAME.plist" 2>/dev/null || true
+      ;;
+  esac
+
+  local pid
+  if pid="$(running_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    local waited=0
+    while [ "$waited" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$LEM_PID_FILE"
+  lock_release
+
+  if is_healthy; then
+    printf 'lem: something is still answering on port %s\n' "$LEM_PORT" >&2
+    return 1
+  fi
+  printf 'Lem is stopped\n'
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start
+}
+
+cmd_status() {
+  printf 'Install     %s\n' "$LEM_HOME"
+  printf 'Platform    %s%s\n' "${LEM_PLATFORM:-unknown}" \
+    "$([ "${LEM_IS_WSL:-0}" = "1" ] && printf '/wsl2' || printf '')"
+  printf 'Service     %s%s\n' "$LEM_SERVICE" \
+    "$([ -n "$LEM_SERVICE_NAME" ] && printf ' (%s)' "$LEM_SERVICE_NAME" || printf '')"
+  printf 'Port        %s\n' "$LEM_PORT"
+
+  local pid
+  if pid="$(running_pid)"; then
+    printf 'Process     pid %s\n' "$pid"
+  fi
+
+  if is_healthy; then
+    printf 'Health      ok  %s\n' "$HEALTH_URL"
+    if have python3; then
+      curl -fsS -m 5 "$HEALTH_URL" | python3 -m json.tool 2>/dev/null || true
+    else
+      curl -fsS -m 5 "$HEALTH_URL" || true
+      printf '\n'
+    fi
+    return 0
+  fi
+
+  printf 'Health      not running\n'
+  return 1
+}
+
+cmd_logs_tail() {
+  local lines="$1"
+  if [ "$LEM_SERVICE" = "systemd-user" ] && have journalctl; then
+    journalctl --user -u "$LEM_SERVICE_NAME" -n "$lines" --no-pager 2>/dev/null && return 0
+  fi
+  [ -f "$LEM_LOG_FILE" ] || return 1
+  tail -n "$lines" "$LEM_LOG_FILE"
+}
+
+cmd_logs() {
+  if [ "$LEM_SERVICE" = "systemd-user" ] && have journalctl; then
+    exec journalctl --user -u "$LEM_SERVICE_NAME" -f
+  fi
+  if [ ! -f "$LEM_LOG_FILE" ]; then
+    printf 'lem: no log file at %s\n' "$LEM_LOG_FILE" >&2
+    return 1
+  fi
+  exec tail -f "$LEM_LOG_FILE"
+}
+
+cmd_help() {
+  cat <<EOF
+lem - the local AI launcher
+
+USAGE
+  lem <command>
+
+COMMANDS
+  start      Start the local server
+  stop       Stop the local server
+  restart    Stop, then start
+  status     Show install details and health
+  logs       Follow the server log
+  help       Show this help
+
+WHERE THINGS ARE
+  Install    $LEM_HOME
+  Config     $LEM_HOME/config/server.env   (LEM_HOST, LEM_PORT, ...)
+  Logs       $LEM_LOG_FILE
+  Health     $HEALTH_URL
+  API docs   http://127.0.0.1:$LEM_PORT/docs
+
+The server binds 127.0.0.1. LAN exposure is an explicit opt-in: see the
+comments in $LEM_HOME/config/server.env.
+EOF
+}
+
+case "${1:-help}" in
+  start)          cmd_start ;;
+  stop)           cmd_stop ;;
+  restart)        cmd_restart ;;
+  status)         cmd_status ;;
+  logs)           cmd_logs ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    printf 'lem: unknown command: %s\n' "$1" >&2
+    printf "lem: run 'lem help' for usage\n" >&2
+    exit 1
+    ;;
+esac

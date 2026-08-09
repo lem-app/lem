@@ -167,6 +167,33 @@ class TestDockerHostOverride:
         assert platform_config.get_docker_host_uri() == "unix:///var/run/docker.sock"
 
 
+class TestGetLemHome:
+    """The install prefix, which the installer may relocate."""
+
+    def test_defaults_to_dot_lem_under_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LEM_HOME", raising=False)
+
+        assert platform_config.get_lem_home() == Path.home() / ".lem"
+
+    def test_env_override_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A relocated install must not read its database out of ~/.lem."""
+        monkeypatch.setenv("LEM_HOME", str(tmp_path / "lem home"))
+
+        assert platform_config.get_lem_home() == tmp_path / "lem home"
+
+    def test_blank_override_falls_back_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LEM_HOME", "   ")
+
+        assert platform_config.get_lem_home() == Path.home() / ".lem"
+
+    def test_tilde_in_the_override_is_expanded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LEM_HOME", "~/elsewhere/lem")
+
+        assert platform_config.get_lem_home() == Path.home() / "elsewhere" / "lem"
+
+
 class TestModuleLevelConstants:
     """The precomputed constants the rest of the app imports."""
 
@@ -175,3 +202,9 @@ class TestModuleLevelConstants:
         assert platform_config.DOCKER_HOST.startswith(("unix://", "npipe://", "tcp://", "ssh://"))
         assert platform_config.HARBOR_SCRIPT == platform_config.HARBOR_DIR / "harbor.sh"
         assert platform_config.HARBOR_DIR == platform_config.LEM_HOME / "harbor"
+
+    def test_the_database_lives_under_the_same_prefix_as_harbor(self) -> None:
+        """db.py used to resolve its own ~/.lem, so the two could disagree."""
+        from app import db
+
+        assert db.DB_PATH == platform_config.LEM_HOME / "lem.db"
